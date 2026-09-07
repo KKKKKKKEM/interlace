@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, MutableMapping
+from collections.abc import Callable, Mapping, MutableMapping
+from copy import deepcopy
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any
 
 from .core import require_non_empty_string
@@ -31,6 +33,29 @@ class Event:
 Emit = Callable[[Event], None]
 
 
+def snapshot_options(options: Mapping[str, Any] | None) -> dict[str, Any]:
+    """复制执行配置，避免调用方在提交后修改配置。
+
+    Args:
+        options: 使用领域命名空间键的配置映射，None 表示空配置。
+
+    Returns:
+        与输入独立的深复制字典。
+
+    Raises:
+        TypeError: 配置不是映射，或配置值无法深复制。
+        ValueError: 配置键不是非空字符串。
+    """
+
+    if options is None:
+        return {}
+    if not isinstance(options, Mapping):
+        raise TypeError("options must be a mapping or None")
+    for key in options:
+        require_non_empty_string(key, "option key")
+    return deepcopy(dict(options))
+
+
 class Context:
     """向当前 Node 暴露事件、Slot 和协作式执行检查点。
 
@@ -43,6 +68,7 @@ class Context:
         _local: 按作用域和命名空间隔离的执行局部存储。
         _finalizers: 当前执行静止阶段的回调集合。
         _scope: 当前节点或插件的状态隔离作用域。
+        _options: 当前节点调用独立持有的执行配置，顶层只读。
     """
 
     __slots__ = (
@@ -53,6 +79,7 @@ class Context:
         "_local",
         "_scope",
         "_slot",
+        "_options",
     )
 
     def __init__(
@@ -65,6 +92,7 @@ class Context:
         local: MutableMapping[tuple[str, str], MutableMapping[str, Any]] | None = None,
         finalizers: list[Callable[[], None]] | None = None,
         scope: str = "",
+        options: Mapping[str, Any] | None = None,
     ) -> None:
         """绑定 Runtime 的内部事件接收函数。
 
@@ -76,6 +104,7 @@ class Context:
             local: 按节点和插件命名空间隔离的执行局部存储。
             finalizers: 静止阶段按注册顺序调用的回调集合。
             scope: 当前回调或状态所属的隔离作用域。
+            options: 本次执行配置；深复制后顶层只读，不随 emit 继承。
 
         Raises:
             TypeError: 参数类型或接口实现不符合当前契约。
@@ -92,8 +121,19 @@ class Context:
         self._local = {} if local is None else local
         self._finalizers = [] if finalizers is None else finalizers
         self._scope = scope
+        self._options = MappingProxyType(snapshot_options(options))
         if not callable(self._checkpoint) or not callable(self._is_cancelled):
             raise TypeError("context control callbacks must be callable")
+
+    @property
+    def options(self) -> Mapping[str, Any]:
+        """读取本次执行配置；嵌套值的修改仅影响当前节点调用。
+
+        Returns:
+            顶层只读的领域配置映射，不包含运行时资源。
+        """
+
+        return self._options
 
     @property
     def slot(self) -> Slot | None:

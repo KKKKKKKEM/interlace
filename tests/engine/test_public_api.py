@@ -92,4 +92,5 @@ def test_work_contains_only_transportable_execution_data() -> None:
         "trigger",
         "id",
         "limits",
+        "options",
     )

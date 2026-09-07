@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from typing import Any, Protocol, runtime_checkable
 
 from ..engine.core import Output
@@ -157,6 +157,7 @@ class WorkerRole(Protocol):
         max_steps: int = 0,
         timeout: float | None = None,
         output_buffer: int = 64,
+        options: Mapping[str, Any] | None = None,
     ) -> Execution:
         """提交 Graph 执行并返回统一 Execution 句柄。
 
@@ -167,6 +168,7 @@ class WorkerRole(Protocol):
             max_steps: 节点触发次数上限，0 表示不限制。
             timeout: 等待或执行时限，单位秒；None 表示不设置时限。
             output_buffer: 每个活跃输出流允许积压的输出条数。
+            options: 本次执行的领域配置，提交时深复制，不随跨图事件继承。
 
         Returns:
             本次操作得到的 Execution 实例。
@@ -182,6 +184,7 @@ class WorkerRole(Protocol):
         max_steps: int = 0,
         timeout: float | None = None,
         output_buffer: int = 64,
+        options: Mapping[str, Any] | None = None,
     ) -> Iterator[Output]:
         """启动 Graph 并返回同步终端输出流。
 
@@ -192,6 +195,7 @@ class WorkerRole(Protocol):
             max_steps: 节点触发次数上限，0 表示不限制。
             timeout: 等待或执行时限，单位秒；None 表示不设置时限。
             output_buffer: 每个活跃输出流允许积压的输出条数。
+            options: 本次执行的领域配置，提交时深复制，不随跨图事件继承。
 
         Returns:
             按产生顺序交付终端 Output 的迭代入口。
@@ -207,6 +211,7 @@ class WorkerRole(Protocol):
         max_steps: int = 0,
         timeout: float | None = None,
         output_buffer: int = 64,
+        options: Mapping[str, Any] | None = None,
     ) -> AsyncIterator[Output]:
         """启动 Graph 并返回异步终端输出流。
 
@@ -217,6 +222,7 @@ class WorkerRole(Protocol):
             max_steps: 节点触发次数上限，0 表示不限制。
             timeout: 等待或执行时限，单位秒；None 表示不设置时限。
             output_buffer: 每个活跃输出流允许积压的输出条数。
+            options: 本次执行的领域配置，提交时深复制，不随跨图事件继承。
 
         Returns:
             按产生顺序交付终端 Output 的迭代入口。

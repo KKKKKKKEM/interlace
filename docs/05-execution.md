@@ -5,6 +5,20 @@
 
 ## 注册与直接执行
 
+### 执行配置
+
+`Runtime.start/run/arun/iter/aiter` 接受 `options`，节点从 `context.options` 读取。
+例如 `runtime.run("parse.graph", data, options={"parser.strict": True})`。
+同样可以使用 `Context(emit, options={"parser.strict": True})` 手动调用节点。
+
+配置在提交前深复制，顶层映射只读；每次节点调用再次复制嵌套值，所以节点修改嵌套值不会影响其他节点或后续执行。
+键应使用领域命名空间；值必须可深复制，HTTP Client 等资源仍通过 Slot 或构造器注入。
+核心不解释领域选项，例如解析器的严格模式、爬虫的会话复用或模型推理参数。
+
+配置作用于整个 Graph execution，不沿 Output 改写，也不随 `Context.emit()` 继承；目标 execution 默认配置为空。
+任务适配器可以显式构造 `Work(..., options=...)`，并负责传输值的序列化。
+替代 GraphExecutor 必须接受 `options` 关键字参数并将配置传入节点 Context。
+
 ```python
 with Runtime() as runtime:
     runtime.register("parse.graph", graph)

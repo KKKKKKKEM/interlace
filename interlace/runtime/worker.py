@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 import inspect
 from collections import OrderedDict
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from functools import partial
 from threading import RLock
@@ -18,7 +18,7 @@ from ..engine.errors import (
     RuntimeClosedError,
     UnknownGraphError,
 )
-from ..engine.events import Event
+from ..engine.events import Event, snapshot_options
 from ..engine.execution import Execution, ExecutionLimits, ExecutionStatus
 from ..engine.executor import Engine
 from ..engine.graph import ExecutionPlan, Graph
@@ -278,6 +278,7 @@ class GraphWorker:
         max_steps: int = 0,
         timeout: float | None = None,
         output_buffer: int = 64,
+        options: Mapping[str, Any] | None = None,
     ) -> tuple[Output, ...]:
         """同步直接执行一个已注册 Graph。
 
@@ -285,6 +286,7 @@ class GraphWorker:
             graph: 目标 Graph 定义或其注册名称，以类型声明为准。
             inputs: 入口数据或按端口名称组织的输入映射。
             plan: 限定本次执行范围的计划，None 使用完整 Graph。
+            options: 当前执行配置的独立快照，不随跨图事件继承。
             max_steps: 节点触发次数上限，0 表示不限制。
             timeout: 等待或执行时限，单位秒；None 表示不设置时限。
             output_buffer: 每个活跃输出流允许积压的输出条数。
@@ -300,6 +302,7 @@ class GraphWorker:
             max_steps=max_steps,
             timeout=timeout,
             output_buffer=output_buffer,
+            options=options,
         ).result()
 
     def start(
@@ -311,6 +314,7 @@ class GraphWorker:
         max_steps: int = 0,
         timeout: float | None = None,
         output_buffer: int = 64,
+        options: Mapping[str, Any] | None = None,
     ) -> Execution:
         """在后台启动 Graph，并立即返回可等待和取消的 Execution。
 
@@ -318,6 +322,7 @@ class GraphWorker:
             graph: 目标 Graph 定义或其注册名称，以类型声明为准。
             inputs: 入口数据或按端口名称组织的输入映射。
             plan: 限定本次执行范围的计划，None 使用完整 Graph。
+            options: 当前执行配置的独立快照，不随跨图事件继承。
             max_steps: 节点触发次数上限，0 表示不限制。
             timeout: 等待或执行时限，单位秒；None 表示不设置时限。
             output_buffer: 每个活跃输出流允许积压的输出条数。
@@ -326,13 +331,14 @@ class GraphWorker:
             本次操作得到的 Execution 实例。
         """
 
+        prepared_options = snapshot_options(options)
         execution = self._new_execution(
             graph,
             max_steps=max_steps,
             timeout=timeout,
             output_buffer=output_buffer,
         )
-        self._submit_direct(execution, inputs, plan)
+        self._submit_direct(execution, inputs, plan, prepared_options)
         return execution
 
     def _submit_direct(
@@ -340,6 +346,7 @@ class GraphWorker:
         execution: Execution,
         inputs: Any,
         plan: ExecutionPlan | None,
+        options: Mapping[str, Any],
     ) -> None:
         """提交直接执行任务，并将其纳入空闲等待范围。
 
@@ -347,6 +354,7 @@ class GraphWorker:
             execution: 记录当前执行状态、控制限制及输出的句柄。
             inputs: 入口数据或按端口名称组织的输入映射。
             plan: 限定本次执行范围的计划，None 使用完整 Graph。
+            options: 当前执行配置的独立快照，不随跨图事件继承。
         """
 
         with self._lock:
@@ -356,6 +364,7 @@ class GraphWorker:
                     execution,
                     inputs,
                     plan,
+                    options,
                 )
             except BaseException as exc:
                 execution.fail(exc)
@@ -372,6 +381,7 @@ class GraphWorker:
         max_steps: int = 0,
         timeout: float | None = None,
         output_buffer: int = 64,
+        options: Mapping[str, Any] | None = None,
     ) -> tuple[Output, ...]:
         """在线程中直接执行 Graph，避免阻塞异步调用方。
 
@@ -379,6 +389,7 @@ class GraphWorker:
             graph: 目标 Graph 定义或其注册名称，以类型声明为准。
             inputs: 入口数据或按端口名称组织的输入映射。
             plan: 限定本次执行范围的计划，None 使用完整 Graph。
+            options: 当前执行配置的独立快照，不随跨图事件继承。
             max_steps: 节点触发次数上限，0 表示不限制。
             timeout: 等待或执行时限，单位秒；None 表示不设置时限。
             output_buffer: 每个活跃输出流允许积压的输出条数。
@@ -394,6 +405,7 @@ class GraphWorker:
             max_steps=max_steps,
             timeout=timeout,
             output_buffer=output_buffer,
+            options=options,
         )
         return await execution
 
@@ -406,6 +418,7 @@ class GraphWorker:
         max_steps: int = 0,
         timeout: float | None = None,
         output_buffer: int = 64,
+        options: Mapping[str, Any] | None = None,
     ) -> Iterator[Output]:
         """启动 Graph 并同步迭代 terminal Output。
 
@@ -413,6 +426,7 @@ class GraphWorker:
             graph: 目标 Graph 定义或其注册名称，以类型声明为准。
             inputs: 入口数据或按端口名称组织的输入映射。
             plan: 限定本次执行范围的计划，None 使用完整 Graph。
+            options: 当前执行配置的独立快照，不随跨图事件继承。
             max_steps: 节点触发次数上限，0 表示不限制。
             timeout: 等待或执行时限，单位秒；None 表示不设置时限。
             output_buffer: 每个活跃输出流允许积压的输出条数。
@@ -421,6 +435,7 @@ class GraphWorker:
             按产生顺序交付终端 Output 的迭代入口。
         """
 
+        prepared_options = snapshot_options(options)
         execution = self._new_execution(
             graph,
             max_steps=max_steps,
@@ -428,7 +443,7 @@ class GraphWorker:
             output_buffer=output_buffer,
         )
         stream = iter(execution)
-        self._submit_direct(execution, inputs, plan)
+        self._submit_direct(execution, inputs, plan, prepared_options)
         return stream
 
     def aiter(
@@ -440,6 +455,7 @@ class GraphWorker:
         max_steps: int = 0,
         timeout: float | None = None,
         output_buffer: int = 64,
+        options: Mapping[str, Any] | None = None,
     ) -> AsyncIterator[Output]:
         """启动 Graph 并异步迭代 terminal Output。
 
@@ -447,6 +463,7 @@ class GraphWorker:
             graph: 目标 Graph 定义或其注册名称，以类型声明为准。
             inputs: 入口数据或按端口名称组织的输入映射。
             plan: 限定本次执行范围的计划，None 使用完整 Graph。
+            options: 当前执行配置的独立快照，不随跨图事件继承。
             max_steps: 节点触发次数上限，0 表示不限制。
             timeout: 等待或执行时限，单位秒；None 表示不设置时限。
             output_buffer: 每个活跃输出流允许积压的输出条数。
@@ -455,6 +472,7 @@ class GraphWorker:
             按产生顺序交付终端 Output 的迭代入口。
         """
 
+        prepared_options = snapshot_options(options)
         execution = self._new_execution(
             graph,
             max_steps=max_steps,
@@ -462,7 +480,7 @@ class GraphWorker:
             output_buffer=output_buffer,
         )
         stream = execution.__aiter__()
-        self._submit_direct(execution, inputs, plan)
+        self._submit_direct(execution, inputs, plan, prepared_options)
         return stream
 
     def get_execution(self, execution_id: str) -> Execution:
@@ -786,6 +804,7 @@ class GraphWorker:
                     work.inputs,
                     emit,
                     slot=slot,
+                    options=work.options,
                 )
         except BaseException as exc:
             execution.fail(exc)
@@ -873,6 +892,7 @@ class GraphWorker:
         execution: Execution,
         inputs: Any,
         plan: ExecutionPlan | None,
+        options: Mapping[str, Any],
     ) -> None:
         """执行直接提交的 Graph，并完成执行记录的终态处理。
 
@@ -880,6 +900,7 @@ class GraphWorker:
             execution: 记录当前执行状态、控制限制及输出的句柄。
             inputs: 入口数据或按端口名称组织的输入映射。
             plan: 限定本次执行范围的计划，None 使用完整 Graph。
+            options: 当前执行配置的独立快照，不随跨图事件继承。
         """
 
         graph = self._get_graph(execution.graph)
@@ -889,6 +910,7 @@ class GraphWorker:
             inputs,
             self._emit,
             plan=plan,
+            options=options,
         )
 
     def _execute(
@@ -900,6 +922,7 @@ class GraphWorker:
         *,
         plan: ExecutionPlan | None = None,
         slot: Slot | None = None,
+        options: Mapping[str, Any] | None = None,
     ) -> None:
         """在执行宿主的控制边界内调用 Graph 执行器。
 
@@ -909,6 +932,7 @@ class GraphWorker:
             inputs: 入口数据或按端口名称组织的输入映射。
             emit: 发布跨图事件的回调。
             plan: 限定本次执行范围的计划，None 使用完整 Graph。
+            options: 当前执行配置的独立快照，不随跨图事件继承。
             slot: 当前逻辑执行链使用的本地执行槽。
 
         Raises:
@@ -938,6 +962,7 @@ class GraphWorker:
                 emit,
                 plan=plan,
                 slot=slot,
+                options=options,
                 execution=execution,
             )
             if inspect.isawaitable(result):

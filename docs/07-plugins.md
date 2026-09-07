@@ -174,7 +174,7 @@ TaskPublisher 的 `submit()` 正常返回即表示后端已接受 Work，同时�
     `bind(queue, handler, concurrency=..., slots=...)` 在调度根 Work 前通过 `slots.try_acquire()` 获取 lease。Work 只包含 Graph
     名、输入、领域 trigger、ID 和 limits；进程内 lease 只存在于 `Delivery.slot_lease`。支持 `LocalTaskPublisher` 的本地后端
     可以延续 lease；等待 Slot 的根 Work 不能占用 concurrency，交付完成或失败后必须释放 Delivery 持有的 lease。
-- GraphExecutor 接收注册名、冻结 Graph、入口输入、Event emitter、可选 ExecutionPlan，以及可选 `slot=` 和必需的
+- GraphExecutor 接收注册名、冻结 Graph、入口输入、Event emitter、可选 ExecutionPlan，以及可选 `slot=`、`options=` 和必需的
   `execution=`。GraphWorker 会把冻结后的 Node timeout 快照绑定到 Execution 并开始执行；替换执行器必须为每次
   Node firing 使用 `with execution.step(node_id): ...` 包住完整调用，并在调度边界调用
   `execution.checkpoint()`，从而保留步数、取消和 timeout 语义。终端输出逐项调用 `execution.publish_output(output)`，

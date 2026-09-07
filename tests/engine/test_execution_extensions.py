@@ -63,7 +63,16 @@ class SyncExecutor:
         self.closed = False
 
     def execute(
-        self, name, graph, inputs, emit, plan=None, *, slot=None, execution
+        self,
+        name,
+        graph,
+        inputs,
+        emit,
+        plan=None,
+        *,
+        slot=None,
+        options=None,
+        execution,
     ) -> Awaitable[None] | None:
         """执行当前测试 Graph，并通过 Execution 的公开接口交付输出。
 
@@ -74,6 +83,7 @@ class SyncExecutor:
             emit: 发布跨图事件的回调。
             plan: 限定本次执行范围的计划，None 使用完整 Graph。
             slot: 当前逻辑执行链使用的本地执行槽。
+            options: 当前执行的领域配置。
             execution: 记录当前执行状态、控制限制及输出的句柄。
 
         Raises:
@@ -107,7 +117,16 @@ class SyncExecutor:
 
 class AsyncExecutor(SyncExecutor):
     async def execute(
-        self, name, graph, inputs, emit, plan=None, *, slot=None, execution
+        self,
+        name,
+        graph,
+        inputs,
+        emit,
+        plan=None,
+        *,
+        slot=None,
+        options=None,
+        execution,
     ):
         """执行当前测试 Graph，并通过 Execution 的公开接口交付输出。
 
@@ -118,6 +137,7 @@ class AsyncExecutor(SyncExecutor):
             emit: 发布跨图事件的回调。
             plan: 限定本次执行范围的计划，None 使用完整 Graph。
             slot: 当前逻辑执行链使用的本地执行槽。
+            options: 当前执行的领域配置。
             execution: 记录当前执行状态、控制限制及输出的句柄。
 
         Raises:
@@ -216,7 +236,16 @@ def test_async_executor_cleanup_precedes_terminal_status(control):
 
     class Slow(AsyncExecutor):
         async def execute(
-            self, name, graph, inputs, emit, plan=None, *, slot=None, execution
+            self,
+            name,
+            graph,
+            inputs,
+            emit,
+            plan=None,
+            *,
+            slot=None,
+            options=None,
+            execution,
         ):
             """执行当前测试 Graph，并通过 Execution 的公开接口交付输出。
 
@@ -227,6 +256,7 @@ def test_async_executor_cleanup_precedes_terminal_status(control):
                 emit: 发布跨图事件的回调。
                 plan: 限定本次执行范围的计划，None 使用完整 Graph。
                 slot: 当前逻辑执行链使用的本地执行槽。
+                options: 当前执行的领域配置。
                 execution: 记录当前执行状态、控制限制及输出的句柄。
             """
 
@@ -599,7 +629,16 @@ def test_executor_cannot_return_a_second_result_channel():
 
     class Invalid(SyncExecutor):
         def execute(
-            self, name, graph, inputs, emit, plan=None, *, slot=None, execution
+            self,
+            name,
+            graph,
+            inputs,
+            emit,
+            plan=None,
+            *,
+            slot=None,
+            options=None,
+            execution,
         ):
             """执行当前测试 Graph，并通过 Execution 的公开接口交付输出。
 
@@ -610,6 +649,7 @@ def test_executor_cannot_return_a_second_result_channel():
                 emit: 发布跨图事件的回调。
                 plan: 限定本次执行范围的计划，None 使用完整 Graph。
                 slot: 当前逻辑执行链使用的本地执行槽。
+                options: 当前执行的领域配置。
                 execution: 记录当前执行状态、控制限制及输出的句柄。
 
             Returns:

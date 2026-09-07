@@ -91,6 +91,10 @@ Event、Context、Execution、ExecutionLimits、ExecutionStatus、Slot、SlotPoo
    execution-local `state()` 与静止阶段 `on_quiescence()`。
 2. 数据库、HTTP client、LLM provider、领域 Store 和 tracing 通过 Node 构造器或观察者注入。
 3. Node 不得获得 Runtime 内部工作请求、TaskBackend 或 executor。
+4. Context.options 提供当前 Graph execution 的配置，顶层只读，每次 Node firing 深复制嵌套值。
+   Runtime 的 start/run/arun/iter/aiter 接受 options 并在提交前深复制；Work.options 供任务适配器传递。
+   配置键使用领域命名空间，值必须可深复制，不保存 Client 等资源；核心不解释下载或模型推理等领域选项。
+   配置不沿 Output 改写、不随 emit 继承，跨图事件创建的新 execution 默认使用空配置。
 
 ## 第九条：同步与异步共享语义
 

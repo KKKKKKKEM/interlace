@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import AsyncIterator, Callable, Iterable, Iterator
+from collections.abc import AsyncIterator, Callable, Iterable, Iterator, Mapping
 from threading import RLock
 from typing import Any
 
@@ -234,6 +234,7 @@ class Runtime:
         max_steps: int = 0,
         timeout: float | None = None,
         output_buffer: int = 64,
+        options: Mapping[str, Any] | None = None,
     ) -> tuple[Output, ...]:
         """同步执行 Graph 并返回终端输出。
 
@@ -244,6 +245,7 @@ class Runtime:
             max_steps: 节点触发次数上限，0 表示不限制。
             timeout: 等待或执行时限，单位秒；None 表示不设置时限。
             output_buffer: 每个活跃输出流允许积压的输出条数。
+            options: 本次执行的领域配置，提交时深复制，不随跨图事件继承。
 
         Returns:
             符合声明端口契约的 Output 集合。
@@ -256,6 +258,7 @@ class Runtime:
             max_steps=max_steps,
             timeout=timeout,
             output_buffer=output_buffer,
+            options=options,
         ).result()
 
     def iter(
@@ -267,6 +270,7 @@ class Runtime:
         max_steps: int = 0,
         timeout: float | None = None,
         output_buffer: int = 64,
+        options: Mapping[str, Any] | None = None,
     ) -> Iterator[Output]:
         """启动 Graph 并返回同步终端输出流。
 
@@ -277,6 +281,7 @@ class Runtime:
             max_steps: 节点触发次数上限，0 表示不限制。
             timeout: 等待或执行时限，单位秒；None 表示不设置时限。
             output_buffer: 每个活跃输出流允许积压的输出条数。
+            options: 本次执行的领域配置，提交时深复制，不随跨图事件继承。
 
         Returns:
             按产生顺序交付终端 Output 的迭代入口。
@@ -289,6 +294,7 @@ class Runtime:
             max_steps=max_steps,
             timeout=timeout,
             output_buffer=output_buffer,
+            options=options,
         )
 
     def aiter(
@@ -300,6 +306,7 @@ class Runtime:
         max_steps: int = 0,
         timeout: float | None = None,
         output_buffer: int = 64,
+        options: Mapping[str, Any] | None = None,
     ) -> AsyncIterator[Output]:
         """启动 Graph 并返回异步终端输出流。
 
@@ -310,6 +317,7 @@ class Runtime:
             max_steps: 节点触发次数上限，0 表示不限制。
             timeout: 等待或执行时限，单位秒；None 表示不设置时限。
             output_buffer: 每个活跃输出流允许积压的输出条数。
+            options: 本次执行的领域配置，提交时深复制，不随跨图事件继承。
 
         Returns:
             按产生顺序交付终端 Output 的迭代入口。
@@ -322,6 +330,7 @@ class Runtime:
             max_steps=max_steps,
             timeout=timeout,
             output_buffer=output_buffer,
+            options=options,
         )
 
     def start(
@@ -333,6 +342,7 @@ class Runtime:
         max_steps: int = 0,
         timeout: float | None = None,
         output_buffer: int = 64,
+        options: Mapping[str, Any] | None = None,
     ) -> Execution:
         """提交 Graph 执行并立即返回统一 Execution 句柄。
 
@@ -343,6 +353,7 @@ class Runtime:
             max_steps: 节点触发次数上限，0 表示不限制。
             timeout: 等待或执行时限，单位秒；None 表示不设置时限。
             output_buffer: 每个活跃输出流允许积压的输出条数。
+            options: 本次执行的领域配置，提交时深复制，不随跨图事件继承。
 
         Returns:
             本次操作得到的 Execution 实例。
@@ -355,6 +366,7 @@ class Runtime:
             max_steps=max_steps,
             timeout=timeout,
             output_buffer=output_buffer,
+            options=options,
         )
 
     async def arun(
@@ -366,6 +378,7 @@ class Runtime:
         max_steps: int = 0,
         timeout: float | None = None,
         output_buffer: int = 64,
+        options: Mapping[str, Any] | None = None,
     ) -> tuple[Output, ...]:
         """异步执行 Graph 并等待完整终端输出。
 
@@ -376,6 +389,7 @@ class Runtime:
             max_steps: 节点触发次数上限，0 表示不限制。
             timeout: 等待或执行时限，单位秒；None 表示不设置时限。
             output_buffer: 每个活跃输出流允许积压的输出条数。
+            options: 本次执行的领域配置，提交时深复制，不随跨图事件继承。
 
         Returns:
             符合声明端口契约的 Output 集合。
@@ -388,6 +402,7 @@ class Runtime:
             max_steps=max_steps,
             timeout=timeout,
             output_buffer=output_buffer,
+            options=options,
         )
 
     def get_execution(self, execution_id: str) -> Execution:

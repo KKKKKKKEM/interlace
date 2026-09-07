@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import enum
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 from uuid import uuid4
 
 from ..engine.core import require_non_empty_string
-from ..engine.events import Event
+from ..engine.events import Event, snapshot_options
 from ..engine.execution import Execution, ExecutionLimits
 from ..engine.graph import ExecutionPlan, Graph
 from ..engine.hooks import HookHandle, HookPhase, NodeHook
@@ -28,6 +28,7 @@ class Work:
         trigger: 触发当前 Work 的领域事件。
         id: 当前对象的唯一标识。
         limits: 单次执行的步数与超时限制。
+        options: 当前工作独立持有的执行配置快照，传输方负责值的序列化。
     """
 
     graph: str
@@ -35,6 +36,7 @@ class Work:
     trigger: Event | None = field(default=None, compare=False, repr=False)
     id: str = field(default_factory=lambda: str(uuid4()), kw_only=True)
     limits: ExecutionLimits = field(default_factory=ExecutionLimits, kw_only=True)
+    options: Mapping[str, Any] = field(default_factory=dict, kw_only=True)
 
     def __post_init__(self) -> None:
         """校验构造字段并固定需要保持不变的数据。
@@ -47,6 +49,7 @@ class Work:
         require_non_empty_string(self.id, "work id")
         if not isinstance(self.limits, ExecutionLimits):
             raise TypeError("work limits must be ExecutionLimits")
+        object.__setattr__(self, "options", snapshot_options(self.options))
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,6 +296,7 @@ class GraphExecutor(Protocol):
         plan: ExecutionPlan | None = None,
         *,
         slot: Slot | None = None,
+        options: Mapping[str, Any] | None = None,
         execution: Execution,
     ) -> None | Awaitable[None]:
         """执行冻结 Graph，通过 execution.publish_output/apublish_output 交付结果。
@@ -304,6 +308,7 @@ class GraphExecutor(Protocol):
             emit: 发布跨图事件的回调。
             plan: 限定本次执行范围的计划，None 使用完整 Graph。
             slot: 当前逻辑执行链使用的本地执行槽。
+            options: 本次执行的配置快照，执行器必须传入各节点的 Context。
             execution: 记录当前执行状态、控制限制及输出的句柄。
 
         Returns:

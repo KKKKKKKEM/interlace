@@ -239,6 +239,7 @@ class RecordingExecutor:
         plan=None,
         *,
         slot=None,
+        options=None,
         execution,
     ) -> None:
         """执行当前测试 Graph，并通过 Execution 的公开接口交付输出。
@@ -250,6 +251,7 @@ class RecordingExecutor:
             emit: 发布跨图事件的回调。
             plan: 限定本次执行范围的计划，None 使用完整 Graph。
             slot: 当前逻辑执行链使用的本地执行槽。
+            options: 当前执行的领域配置。
             execution: 记录当前执行状态、控制限制及输出的句柄。
         """
 

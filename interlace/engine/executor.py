@@ -77,6 +77,7 @@ class Engine:
         plan: ExecutionPlan | None = None,
         *,
         slot: Slot | None = None,
+        options: Mapping[str, Any] | None = None,
         execution: Execution,
     ) -> None:
         """执行一张 Graph，通过统一 Execution 输出接口交付终端 Output。
@@ -88,6 +89,7 @@ class Engine:
             emit: 发布跨图事件的回调。
             plan: 限定本次执行范围的计划，None 使用完整 Graph。
             slot: 当前逻辑执行链使用的本地执行槽。
+            options: 本次执行的领域配置，各节点调用独立复制。
             execution: 记录当前执行状态、控制限制及输出的句柄。
 
         Raises:
@@ -118,7 +120,7 @@ class Engine:
             raise RuntimeError("execution must be running")
         prepared = self._coerce_inputs(graph, inputs)
         snapshot = self.hooks.snapshot(name)
-        self._run(name, graph, prepared, emit, snapshot, plan, slot, execution)
+        self._run(name, graph, prepared, emit, snapshot, plan, slot, execution, options)
 
     def close(self) -> None:
         """关闭 Hook 注册表和后台异步 Runner。"""
@@ -158,6 +160,7 @@ class Engine:
         plan: ExecutionPlan | None,
         slot: Slot | None,
         execution: Execution,
+        options: Mapping[str, Any] | None,
     ) -> None:
         """推进 Graph 的可执行节点，直至数据流静止或执行终止。
 
@@ -169,6 +172,7 @@ class Engine:
             hook_snapshot: 本次 Graph 执行固定使用的 Hook 注册快照。
             plan: 限定本次执行范围的计划，None 使用完整 Graph。
             slot: 当前逻辑执行链使用的本地执行槽。
+            options: 本次执行的领域配置，各节点调用独立复制。
             execution: 记录当前执行状态、控制限制及输出的句柄。
 
         Raises:
@@ -251,6 +255,7 @@ class Engine:
                 local=local_state,
                 finalizers=finalizers,
                 scope=node_id,
+                options=options,
             )
             self._observations.publish(
                 RuntimeEvent(
