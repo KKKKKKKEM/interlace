@@ -7,7 +7,7 @@ from typing import Any, cast
 
 import pytest
 
-from bricks import (
+from interlace import (
     AsyncNode,
     Context,
     ExecutionPlan,
@@ -18,7 +18,7 @@ from bricks import (
     Ports,
     Runtime,
 )
-from bricks.engine.errors import GraphFrozenError, GraphValidationError
+from interlace.engine.errors import GraphFrozenError, GraphValidationError
 
 
 class Source(Node):

@@ -671,15 +671,15 @@ class PluginHost:
         return tuple(ordered)
 
 
-CAP_EVENT_BUS = "bricks.runtime/event-bus"
-CAP_TASK_BACKEND = "bricks.runtime/task-backend"
-CAP_GRAPH_EXECUTOR = "bricks.runtime/graph-executor"
-CAP_EXECUTION_FACTORY = "bricks.runtime/execution-factory"
-CAP_EVENT_ROUTER = "bricks.runtime/event-router"
-CAP_GRAPH_WORKER = "bricks.runtime/graph-worker"
-CAP_INPUT_SELECTOR = "bricks.contribution/input-selector"
-CAP_NODE_HOOK = "bricks.contribution/node-hook"
-CAP_RUNTIME_OBSERVER = "bricks.contribution/runtime-observer"
+CAP_EVENT_BUS = "interlace.runtime/event-bus"
+CAP_TASK_BACKEND = "interlace.runtime/task-backend"
+CAP_GRAPH_EXECUTOR = "interlace.runtime/graph-executor"
+CAP_EXECUTION_FACTORY = "interlace.runtime/execution-factory"
+CAP_EVENT_ROUTER = "interlace.runtime/event-router"
+CAP_GRAPH_WORKER = "interlace.runtime/graph-worker"
+CAP_INPUT_SELECTOR = "interlace.contribution/input-selector"
+CAP_NODE_HOOK = "interlace.contribution/node-hook"
+CAP_RUNTIME_OBSERVER = "interlace.contribution/runtime-observer"
 
 
 class ContributionPlugin:

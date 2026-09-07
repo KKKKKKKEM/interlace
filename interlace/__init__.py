@@ -1,4 +1,4 @@
-"""Bricks 顶层公共 API。"""
+"""Interlace 顶层公共 API。"""
 
 from .engine import (
     AsyncNode,

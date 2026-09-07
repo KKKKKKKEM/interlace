@@ -1,4 +1,4 @@
-# Bricks Repository Instructions
+# Interlace Repository Instructions
 
 ## 执行要求
 
@@ -73,7 +73,7 @@ Event、Context、Execution、ExecutionLimits、ExecutionStatus、Slot、SlotPoo
 3. GraphExecutor 只负责执行冻结 Graph，通过 Execution 的公开输出接口交付结果；同步返回 None，异步返回
    Awaitable[None]。执行宿主管理 start/succeed/fail，不依靠整批返回值补发输出。
 4. EventBus、任务传输和 GraphExecutor 必须可以独立替换和组合，不得合并为万能 Backend。
-5. SPI 位于高级扩展层，不进入顶层 `bricks` API。
+5. SPI 位于高级扩展层，不进入顶层 `interlace` API。
 6. Runtime 和插件装配层只依赖公开角色或能力协议，不得使用默认内存实现的私有状态。
 7. RouterRole、WorkerRole 和 SlotProvider 按结构化协议替换，不要求继承默认实现。ExecutionFactory 可注入
    OutputStore 与 ExecutionNotifier，默认实现与第三方实现均经同一装配路径。
@@ -110,7 +110,7 @@ Event、Context、Execution、ExecutionLimits、ExecutionStatus、Slot、SlotPoo
 5. 等待 Slot 的根 Work 不得占用 Consumer 的执行线程，也不得阻塞已携带 Slot 的延续 Work。
 6. Slot、SlotPool 和进程内 lease 不跨进程序列化；Work 穿过进程或消息边界后开始新的本地 Slot 链，远程适配器不得
    宣称保留原进程的 Slot 连续性。
-7. 适配器通过 `bricks.spi.SlotProvider` 的公开申请和可用通知接口取得 `SlotLease`，通过 `Delivery.slot_lease` 传递；
+7. 适配器通过 `interlace.spi.SlotProvider` 的公开申请和可用通知接口取得 `SlotLease`，通过 `Delivery.slot_lease` 传递；
    lease 提供引用管理和串行 execution 能力，不暴露内部锁。每个接管的引用必须释放，执行期间的引用由 lease 保护。
 
 ## 第十一条：Execution 控制必须默认开放
@@ -169,9 +169,9 @@ Event、Context、Execution、ExecutionLimits、ExecutionStatus、Slot、SlotPoo
 
 ```bash
 uv run --with pytest pytest -q
-uv run --with mypy mypy bricks
-uv run --with ruff ruff check bricks tests examples
-uv run --with ruff ruff format --check bricks
+uv run --with mypy mypy interlace
+uv run --with ruff ruff check interlace tests examples
+uv run --with ruff ruff format --check interlace
 ```
 
 文档变更还应检查本地链接、Markdown 围栏和发生变化的 Mermaid 图。

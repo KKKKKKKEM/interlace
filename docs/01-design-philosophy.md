@@ -1,11 +1,11 @@
 # 第一章：设计哲学与心智模型
 
-本章先回答两个问题：Bricks 试图解决什么，以及为什么它选择现在这组概念。理解这两个问题后，后续 API 会更容易
+本章先回答两个问题：Interlace 试图解决什么，以及为什么它选择现在这组概念。理解这两个问题后，后续 API 会更容易
 记忆，因为它们都从同一套边界推导出来。
 
 ## 一句话定义
 
-Bricks 是一个 typed graph runtime：一张 Graph 描述一次局部计算，多张 Graph 通过领域 Event 连接成工作流。
+Interlace 是一个 typed graph runtime：一张 Graph 描述一次局部计算，多张 Graph 通过领域 Event 连接成工作流。
 
 ```mermaid
 flowchart LR
@@ -50,11 +50,11 @@ flowchart LR
 | 执行控制 | `Execution`、`Slot`、`SlotPool` | 工作如何等待、取消、限时和共享链路状态？ |
 | 系统装配 | `PluginHost`、capability、contribution | 基础设施和非本质策略如何替换？ |
 
-普通应用通常只使用前三层。插件和能力协议属于高级扩展接口，不进入顶层 `bricks` 词汇。
+普通应用通常只使用前三层。插件和能力协议属于高级扩展接口，不进入顶层 `interlace` 词汇。
 
 ## 微内核：哪些东西不能被插件改变
 
-以下语义共同定义了“什么是 Bricks Graph”，因此属于微内核：
+以下语义共同定义了“什么是 Interlace Graph”，因此属于微内核：
 
 - Ports 的类型约束；
 - Graph 的冻结、可达性和 Edge 校验；

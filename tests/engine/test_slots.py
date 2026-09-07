@@ -6,15 +6,15 @@ from threading import Event as ThreadEvent, Thread
 
 import pytest
 
-import bricks
-from bricks import SlotPool
-from bricks.spi import Delivery, SlotLease, Work
+import interlace
+from interlace import SlotPool
+from interlace.spi import Delivery, SlotLease, Work
 
 
 def test_slot_lease_is_an_extension_protocol_only() -> None:
     """验证 Slot lease 仅作为扩展协议暴露。"""
 
-    assert not hasattr(bricks, "SlotLease")
+    assert not hasattr(interlace, "SlotLease")
     pool = SlotPool(1)
     lease = pool.acquire(0)
     assert isinstance(lease, SlotLease)

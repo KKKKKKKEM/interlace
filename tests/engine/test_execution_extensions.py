@@ -9,11 +9,11 @@ from threading import Event as ThreadEvent
 
 import pytest
 
-from bricks import Context, Execution, ExecutionLimits, Graph, Node, Output, Runtime
-from bricks.engine.errors import ExecutionCancelledError, ExecutionTimeoutError
-from bricks.engine.execution_resources import LocalExecutionNotifier
-from bricks.plugins import CAP_EXECUTION_FACTORY, PluginDescriptor
-from bricks.runtime import LocalRuntimePlugin
+from interlace import Context, Execution, ExecutionLimits, Graph, Node, Output, Runtime
+from interlace.engine.errors import ExecutionCancelledError, ExecutionTimeoutError
+from interlace.engine.execution_resources import LocalExecutionNotifier
+from interlace.plugins import CAP_EXECUTION_FACTORY, PluginDescriptor
+from interlace.runtime import LocalRuntimePlugin
 
 
 class Produce(Node):

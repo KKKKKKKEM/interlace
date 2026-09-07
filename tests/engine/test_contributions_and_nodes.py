@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import pytest
 
-from bricks import Graph, Node, Output, Ports, Runtime
-from bricks.adapters import memory
-from bricks.engine.errors import GraphValidationError, IncompleteInputsError
-from bricks.engine.observation import RuntimeEventKind
-from bricks.engine.policies import PolicyRef
-from bricks.nodes import KeyedJoin, KeyedPair, KeyedValue
-from bricks.spi import (
+from interlace import Graph, Node, Output, Ports, Runtime
+from interlace.adapters import memory
+from interlace.engine.errors import GraphValidationError, IncompleteInputsError
+from interlace.engine.observation import RuntimeEventKind
+from interlace.engine.policies import PolicyRef
+from interlace.nodes import KeyedJoin, KeyedPair, KeyedValue
+from interlace.spi import (
     DeliveryResult,
     Work,
 )

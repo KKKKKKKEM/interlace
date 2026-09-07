@@ -347,7 +347,7 @@ class Graph:
             spec = self._node_specs[node_id]
             if (
                 node_id == self.entrypoint
-                or spec.input_policy.ref.name != "bricks.core/all"
+                or spec.input_policy.ref.name != "interlace.core/all"
             ):
                 continue
             missing = set(spec.input_ports) - incoming_ports[node_id]
@@ -511,7 +511,7 @@ class Graph:
         for node_id, spec in specs.items():
             if (
                 node_id == self.entrypoint
-                or spec.input_policy.ref.name != "bricks.core/all"
+                or spec.input_policy.ref.name != "interlace.core/all"
             ):
                 continue
             missing = set(spec.input_ports) - incoming_ports[node_id]

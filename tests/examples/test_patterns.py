@@ -14,7 +14,7 @@ from examples.output_stream import run as run_output_stream
 def test_linear_example() -> None:
     """验证线性数据流示例的文本转换结果。"""
 
-    assert run_linear("  bricks ") == "BRICKS"
+    assert run_linear("  interlace ") == "INTERLACE"
 
 
 def test_fan_in_example() -> None:
@@ -32,7 +32,7 @@ def test_event_routing_example() -> None:
 def test_async_node_example() -> None:
     """验证异步节点示例的执行结果。"""
 
-    assert run_async_node("bricks") == "BRICKS"
+    assert run_async_node("interlace") == "INTERLACE"
 
 
 def test_cycle_example() -> None:

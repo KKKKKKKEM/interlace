@@ -10,8 +10,8 @@
 注册能力；全部插件 setup 完成后才依赖顺序调用 `start()`，关闭时逆序调用 `stop()`：
 
 ```python
-from bricks import Runtime
-from bricks.plugins import ContributionPlugin, NodeHookContribution
+from interlace import Runtime
+from interlace.plugins import ContributionPlugin, NodeHookContribution
 
 contributions = ContributionPlugin(
     "acme/crawl",
@@ -68,8 +68,8 @@ flowchart TB
 只替换部分基础设施时，插件声明自己提供的 capability，Runtime 会补齐其余默认实现：
 
 ```python
-from bricks import Runtime
-from bricks.plugins import CAP_EVENT_BUS, PluginDescriptor
+from interlace import Runtime
+from interlace.plugins import CAP_EVENT_BUS, PluginDescriptor
 
 
 class RedisEventsPlugin:
@@ -98,8 +98,8 @@ runtime = Runtime(plugins=(RedisEventsPlugin(my_event_bus),))
 一次注入全部基础设施时，也可以直接配置内建装配插件：
 
 ```python
-from bricks import Runtime
-from bricks.runtime import LocalRuntimePlugin
+from interlace import Runtime
+from interlace.runtime import LocalRuntimePlugin
 
 local = LocalRuntimePlugin(
     events=my_event_bus,
@@ -114,8 +114,8 @@ runtime = Runtime(plugins=(local,))
 Router 与 Worker 需要独立部署或不由同一个进程插件管理时，仍可显式组装：
 
 ```python
-from bricks import Runtime
-from bricks.runtime import EventRouter, GraphWorker
+from interlace import Runtime
+from interlace.runtime import EventRouter, GraphWorker
 
 router = EventRouter(
     events=my_event_bus,
@@ -129,20 +129,20 @@ worker = GraphWorker(
 runtime = Runtime(router=router, worker=worker)
 ```
 
-`EventRouter`、`GraphWorker` 和底层协议是高级组合接口，不属于顶层 `bricks` 公共 API。应用侧的 Graph、Node、
+`EventRouter`、`GraphWorker` 和底层协议是高级组合接口，不属于顶层 `interlace` 公共 API。应用侧的 Graph、Node、
 Event 和 Runtime 门面用法不需要因此改变。`Runtime()` 仍会经 LocalRuntimePlugin 创建完整的默认内存组合。
 
-窄角色协议从 `bricks.spi` 导入，随包提供的本地实现从 `bricks.adapters` 导入：
+窄角色协议从 `interlace.spi` 导入，随包提供的本地实现从 `interlace.adapters` 导入：
 
 ```python
-from bricks.adapters import memory
-from bricks.spi import EventBus, GraphExecutor, TaskConsumer, TaskPublisher
+from interlace.adapters import memory
+from interlace.spi import EventBus, GraphExecutor, TaskConsumer, TaskPublisher
 
 events = memory.EventBus()
 tasks = memory.TaskBackend()
 ```
 
-`bricks.spi` 只定义角色和跨适配器数据模型；`bricks.adapters` 只放具体部署实现。`TaskBackend` 仅是
+`interlace.spi` 只定义角色和跨适配器数据模型；`interlace.adapters` 只放具体部署实现。`TaskBackend` 仅是
 `TaskPublisher` 与 `TaskConsumer` 的便利组合，不代表 EventBus 或 GraphExecutor。
 
 | 协议 | 负责什么 | 默认实现 |
@@ -232,7 +232,7 @@ ExecutionNotifier 提供单调版本 `version`、`notify()`、`wait(version, tim
 
 ## Slot 的公开资源接口
 
-适配器从 `bricks.spi` 导入 `SlotProvider` 和 `SlotLease` 协议。默认 SlotPool 和第三方资源池经过相同的结构化检查，
+适配器从 `interlace.spi` 导入 `SlotProvider` 和 `SlotLease` 协议。默认 SlotPool 和第三方资源池经过相同的结构化检查，
 适配器通过协议获取 lease，不构造内部 lease、不读取内部锁。
 
 | 接口 | 契约 |
@@ -251,7 +251,7 @@ ExecutionNotifier 提供单调版本 `version`、`notify()`、`wait(version, tim
 取得引用后，交付和释放遵循下面的所有权规则：
 
 ```python
-from bricks.spi import Delivery
+from interlace.spi import Delivery
 
 lease = slots.try_acquire()
 if lease is not None:
@@ -407,8 +407,8 @@ Graph，再调用 `graph.plan()`；自行组装 Runtime 时也可以显式将同
 Graph 注册后保持冻结，但默认 `Engine` 允许使用者给后续 Graph execution 动态挂载 Hook：
 
 ```python
-from bricks import Output
-from bricks.engine.hooks import NodeCall, NodeHook, ShortCircuit
+from interlace import Output
+from interlace.engine.hooks import NodeCall, NodeHook, ShortCircuit
 
 
 class RequestCache(NodeHook):

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 
-from bricks import AsyncNode, Graph, Output, Ports, Runtime
+from interlace import AsyncNode, Graph, Output, Ports, Runtime
 
 
 class DelayedUpper(AsyncNode):

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from bricks import Graph, InputPolicy, Node, Output, Ports, Runtime
+from interlace import Graph, InputPolicy, Node, Output, Ports, Runtime
 
 
 class Split(Node):

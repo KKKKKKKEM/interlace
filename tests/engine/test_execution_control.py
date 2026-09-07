@@ -9,7 +9,7 @@ from threading import Lock, Thread
 
 import pytest
 
-from bricks import (
+from interlace import (
     AsyncNode,
     Context,
     ExecutionLimits,
@@ -21,16 +21,16 @@ from bricks import (
     Runtime,
     SlotPool,
 )
-from bricks.engine.errors import (
-    BricksRuntimeError,
+from interlace.engine.errors import (
+    InterlaceRuntimeError,
     ExecutionCancelledError,
     ExecutionError,
     ExecutionTimeoutError,
     NodeTimeoutError,
     StepLimitExceededError,
 )
-from bricks.engine.hooks import NodeHook
-from bricks.runtime import GraphWorker
+from interlace.engine.hooks import NodeHook
+from interlace.runtime import GraphWorker
 
 
 @pytest.mark.parametrize("control", ["cancel", "timeout"])
@@ -1163,10 +1163,10 @@ def test_queued_unknown_graph_is_recorded_as_failed_execution() -> None:
     runtime.route("missing.requested", graph="missing.graph", queue="missing")
     runtime.emit("missing.requested", 1)
 
-    with pytest.raises(BricksRuntimeError, match="unknown registered graph"):
+    with pytest.raises(InterlaceRuntimeError, match="unknown registered graph"):
         runtime.wait_idle()
     execution = runtime.executions()[-1]
     assert execution.graph == "missing.graph"
     assert execution.status is ExecutionStatus.FAILED
-    assert isinstance(execution.error, BricksRuntimeError)
+    assert isinstance(execution.error, InterlaceRuntimeError)
     runtime.close()

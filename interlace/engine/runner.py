@@ -31,7 +31,7 @@ class LocalRunner:
         self._closed = False
         self._thread = Thread(
             target=self._run_loop,
-            name="bricks-async-runner",
+            name="interlace-async-runner",
             daemon=True,
         )
         self._thread.start()

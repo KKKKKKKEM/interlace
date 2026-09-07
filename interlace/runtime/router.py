@@ -10,7 +10,11 @@ from typing import Any
 
 from ..adapters import memory
 from ..engine.core import require_non_empty_string
-from ..engine.errors import BricksRuntimeError, EventDispatchError, RuntimeClosedError
+from ..engine.errors import (
+    InterlaceRuntimeError,
+    EventDispatchError,
+    RuntimeClosedError,
+)
 from ..engine.events import Event
 from ..engine.execution import ExecutionLimits
 from ..engine.observation import (
@@ -25,7 +29,7 @@ from ._utils import _close_components, _unique
 
 EventHandler = Callable[[Event], None]
 _LOCAL_LEASE: ContextVar[SlotLease | None] = ContextVar(
-    "bricks_local_event_lease",
+    "interlace_local_event_lease",
     default=None,
 )
 
@@ -162,7 +166,7 @@ class EventRouter:
         with self._lock:
             route = (event_type, graph, queue)
             if route in self._routes:
-                raise BricksRuntimeError(f"duplicate event route {route!r}")
+                raise InterlaceRuntimeError(f"duplicate event route {route!r}")
             self._events.subscribe(
                 event_type,
                 partial(self._submit, graph, queue, limits),

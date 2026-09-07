@@ -1,13 +1,13 @@
-"""Bricks 精简内核的公共错误。"""
+"""Interlace 精简内核的公共错误。"""
 
 from __future__ import annotations
 
 
-class BricksError(Exception):
-    """所有 Bricks 公共错误的基类。"""
+class InterlaceError(Exception):
+    """所有 Interlace 公共错误的基类。"""
 
 
-class GraphError(BricksError):
+class GraphError(InterlaceError):
     """Graph 定义、冻结或引用不合法。"""
 
 
@@ -19,15 +19,15 @@ class GraphValidationError(GraphError):
     """Graph 在冻结时未满足静态约束。"""
 
 
-class BricksRuntimeError(BricksError):
+class InterlaceRuntimeError(InterlaceError):
     """Runtime 注册、路由或生命周期操作失败。"""
 
 
-class UnknownGraphError(BricksRuntimeError):
+class UnknownGraphError(InterlaceRuntimeError):
     """Runtime 中不存在指定的 Graph 注册名。"""
 
 
-class ExecutionError(BricksRuntimeError):
+class ExecutionError(InterlaceRuntimeError):
     """一次 Graph 或 Node 执行失败。
 
     Attributes:
@@ -95,7 +95,7 @@ class PortValueTypeError(ExecutionError, TypeError):
     """实际端口值不满足 Ports 声明的类型。"""
 
 
-class EventDispatchError(BricksRuntimeError):
+class EventDispatchError(InterlaceRuntimeError):
     """事件订阅者或目标 Graph 执行失败。
 
     Attributes:
@@ -116,5 +116,5 @@ class EventDispatchError(BricksRuntimeError):
         self.cause = cause
 
 
-class RuntimeClosedError(BricksRuntimeError):
+class RuntimeClosedError(InterlaceRuntimeError):
     """调用方在 Runtime 关闭后继续提交工作。"""

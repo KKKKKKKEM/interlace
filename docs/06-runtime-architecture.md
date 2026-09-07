@@ -7,12 +7,12 @@
 
 | 层次 | 源码边界 | 对象 | 责任 |
 | --- | --- | --- | --- |
-| 用户模型 | `bricks.engine`，由 `bricks` 导出 | Ports、Node、Output、Edge、Graph、Event、Context、Execution、Slot | 描述业务计算与可观察执行状态 |
-| 用户门面 | `bricks.runtime`，由 `bricks` 导出 | Runtime | 注册 Graph，代理执行、事件、观察和控制入口 |
-| 装配宿主 | `bricks.plugins`、`bricks.runtime.plugin` | PluginHost、LocalRuntimePlugin | 解析插件依赖，注册 capability，管理统一生命周期 |
-| 运行角色 | `bricks.runtime` | EventRouter、GraphWorker | 分别处理 Event -> Work 与 Work -> Graph execution |
-| 能力端口 | `bricks.spi` | RouterRole、WorkerRole、EventBus、任务传输、GraphExecutor、SlotProvider、执行资源协议 | 隔离编排、传输、执行和资源实现 |
-| 默认适配器 | `bricks.adapters.memory`、`bricks.engine.executor` | EventBus、TaskBackend、Engine | 提供单进程内存运行时 |
+| 用户模型 | `interlace.engine`，由 `interlace` 导出 | Ports、Node、Output、Edge、Graph、Event、Context、Execution、Slot | 描述业务计算与可观察执行状态 |
+| 用户门面 | `interlace.runtime`，由 `interlace` 导出 | Runtime | 注册 Graph，代理执行、事件、观察和控制入口 |
+| 装配宿主 | `interlace.plugins`、`interlace.runtime.plugin` | PluginHost、LocalRuntimePlugin | 解析插件依赖，注册 capability，管理统一生命周期 |
+| 运行角色 | `interlace.runtime` | EventRouter、GraphWorker | 分别处理 Event -> Work 与 Work -> Graph execution |
+| 能力端口 | `interlace.spi` | RouterRole、WorkerRole、EventBus、任务传输、GraphExecutor、SlotProvider、执行资源协议 | 隔离编排、传输、执行和资源实现 |
+| 默认适配器 | `interlace.adapters.memory`、`interlace.engine.executor` | EventBus、TaskBackend、Engine | 提供单进程内存运行时 |
 
 Runtime 是面向应用的稳定门面，PluginHost 是系统装配根。普通应用不需要看到后四层。
 
@@ -21,7 +21,7 @@ Runtime 是面向应用的稳定门面，PluginHost 是系统装配根。普通�
 源码目录按照架构层次组织，而不是把所有运行时职责都放入 `engine`：
 
 ```text
-bricks/
+interlace/
 ├── __init__.py              # 宪法规定的顶层公共 API
 ├── engine/                  # Graph 执行微内核及受控内核扩展点
 │   ├── core.py              # Ports、Node、AsyncNode、Output、InputPolicy
@@ -49,8 +49,8 @@ bricks/
 └── nodes/                   # 可复用的非内核 Node，例如 KeyedJoin
 ```
 
-`bricks.engine` 不再充当高级 API 聚合入口。普通应用只从 `bricks` 导入；插件、SPI 和基础设施作者根据职责从
-`bricks.runtime`、`bricks.plugins`、`bricks.spi`、`bricks.adapters`、`bricks.nodes` 或具体 `bricks.engine.*` 模块导入。
+`interlace.engine` 不再充当高级 API 聚合入口。普通应用只从 `interlace` 导入；插件、SPI 和基础设施作者根据职责从
+`interlace.runtime`、`interlace.plugins`、`interlace.spi`、`interlace.adapters`、`interlace.nodes` 或具体 `interlace.engine.*` 模块导入。
 仓库不保留旧模块路径的兼容 re-export。
 
 ## 依赖方向
@@ -59,17 +59,17 @@ bricks/
 
 ```mermaid
 flowchart LR
-    Public[bricks 顶层 API] --> Engine[bricks.engine]
-    Public --> Runtime[bricks.runtime]
+    Public[interlace 顶层 API] --> Engine[interlace.engine]
+    Public --> Runtime[interlace.runtime]
     Runtime --> Engine
-    Runtime --> SPI[bricks.spi]
-    Runtime --> Plugins[bricks.plugins]
-    Runtime --> Adapters[bricks.adapters]
+    Runtime --> SPI[interlace.spi]
+    Runtime --> Plugins[interlace.plugins]
+    Runtime --> Adapters[interlace.adapters]
     SPI --> Engine
     Adapters --> SPI
     Adapters --> Engine
     Plugins --> Engine
-    Nodes[bricks.nodes] --> Engine
+    Nodes[interlace.nodes] --> Engine
 ```
 
 这里的关键约束是：
@@ -218,6 +218,6 @@ Router 和自己创建的底层组件。注入组件默认由调用方管理，`
 - Worker 不订阅源 Event；
 - GraphExecutor 不管理队列与 Graph 注册表；
 - 插件通过 capability 工作，不读取 Runtime 私有字段；
-- Work、Delivery 和窄角色协议位于 `bricks.spi`，不进入顶层 `bricks` API；默认内存实现位于 `bricks.adapters`。
+- Work、Delivery 和窄角色协议位于 `interlace.spi`，不进入顶层 `interlace` API；默认内存实现位于 `interlace.adapters`。
 
 [上一章：Execution、并发与失败](05-execution.md) · [下一章：插件、SPI 与适配器开发](07-plugins.md)

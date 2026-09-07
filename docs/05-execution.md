@@ -131,7 +131,7 @@ stateDiagram-v2
 共享逻辑执行槽：
 
 ```python
-from bricks import SlotPool
+from interlace import SlotPool
 
 slots = SlotPool(size=10)
 runtime.consume("requests", concurrency=20, slots=slots)

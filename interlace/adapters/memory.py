@@ -304,7 +304,7 @@ class TaskBackend:
                 self._owned_slot_pools.append(slots)
             executor = ThreadPoolExecutor(
                 max_workers=concurrency,
-                thread_name_prefix=f"bricks-{queue}",
+                thread_name_prefix=f"interlace-{queue}",
             )
             consumer = _Consumer(handler, concurrency, executor, slots)
             channel = self._channels.setdefault(queue, _Channel([], deque()))

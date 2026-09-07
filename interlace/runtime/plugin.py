@@ -49,7 +49,7 @@ class LocalRuntimePlugin:
     """
 
     descriptor = PluginDescriptor(
-        "bricks.core/local-runtime",
+        "interlace.core/local-runtime",
         "1.0.0",
         provides=(
             CAP_EVENT_BUS,
@@ -123,7 +123,7 @@ class LocalRuntimePlugin:
         if execution_factory is not None and CAP_EXECUTION_FACTORY not in provided:
             raise TypeError("execution_factory is externally provided")
         self.descriptor = PluginDescriptor(
-            "bricks.core/local-runtime",
+            "interlace.core/local-runtime",
             "1.0.0",
             requires_capabilities=tuple(sorted(infrastructure - provided)),
             provides=tuple(

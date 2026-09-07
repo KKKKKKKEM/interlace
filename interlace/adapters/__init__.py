@@ -1,4 +1,4 @@
-"""Bricks 随包提供的部署适配器。"""
+"""Interlace 随包提供的部署适配器。"""
 
 from . import memory
 

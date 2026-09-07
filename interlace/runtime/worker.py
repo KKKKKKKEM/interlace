@@ -13,7 +13,7 @@ from typing import Any
 
 from ..engine.core import Output, _validate_timeout, require_non_empty_string
 from ..engine.errors import (
-    BricksRuntimeError,
+    InterlaceRuntimeError,
     ExecutionError,
     RuntimeClosedError,
     UnknownGraphError,
@@ -135,7 +135,7 @@ class GraphWorker:
         self._owned_slot_pools: list[SlotPool] = []
         self._lock = RLock()
         self._direct_executor = ThreadPoolExecutor(
-            thread_name_prefix="bricks-direct",
+            thread_name_prefix="interlace-direct",
         )
         self._direct_pending: set[Future[None]] = set()
         self._executions: OrderedDict[str, Execution] = OrderedDict()
@@ -188,7 +188,7 @@ class GraphWorker:
             graph.freeze(self._policies)
         with self._lock:
             if name in self._graphs:
-                raise BricksRuntimeError(f"duplicate registered graph {name!r}")
+                raise InterlaceRuntimeError(f"duplicate registered graph {name!r}")
             pending = tuple(self._pending_hooks.get(name, ()))
             for _, _, node in pending:
                 if node is not None and node not in graph.nodes:
@@ -239,12 +239,12 @@ class GraphWorker:
             if configured is not None:
                 configured_concurrency, configured_slots = configured
                 if configured_concurrency != concurrency:
-                    raise BricksRuntimeError(
+                    raise InterlaceRuntimeError(
                         f"queue {queue!r} already uses local concurrency "
                         f"{configured_concurrency}"
                     )
                 if slots is not None and slots is not configured_slots:
-                    raise BricksRuntimeError(
+                    raise InterlaceRuntimeError(
                         f"queue {queue!r} already uses a different SlotPool"
                     )
                 return self
@@ -480,7 +480,9 @@ class GraphWorker:
             try:
                 return self._executions[execution_id]
             except KeyError as exc:
-                raise BricksRuntimeError(f"unknown execution {execution_id!r}") from exc
+                raise InterlaceRuntimeError(
+                    f"unknown execution {execution_id!r}"
+                ) from exc
 
     def executions(self) -> tuple[Execution, ...]:
         """返回当前进程保留的 Execution 快照。
@@ -773,7 +775,9 @@ class GraphWorker:
         try:
             graph = self._get_graph(work.graph)
             if lease is None:
-                raise BricksRuntimeError("TaskConsumer dispatched Work without a Slot")
+                raise InterlaceRuntimeError(
+                    "TaskConsumer dispatched Work without a Slot"
+                )
             with lease.execution() as slot:
                 emit = partial(self._emit_with_lease, lease)
                 self._execute(
@@ -981,7 +985,7 @@ class GraphWorker:
 
         with self._lock:
             if execution.id in self._executions:
-                raise BricksRuntimeError(f"duplicate execution {execution.id!r}")
+                raise InterlaceRuntimeError(f"duplicate execution {execution.id!r}")
             self._executions[execution.id] = execution
             self._trim_execution_history_locked()
 
@@ -1060,4 +1064,4 @@ def _reject_emit(event: Event) -> None:
     """
 
     del event
-    raise BricksRuntimeError("GraphWorker has no Event emitter")
+    raise InterlaceRuntimeError("GraphWorker has no Event emitter")

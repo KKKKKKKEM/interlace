@@ -43,8 +43,10 @@ jobs:
         with:
           python-version: "3.12"
       - name: Run Ruff
-        run: uv run --with ruff ruff check bricks tests examples
+        run: uv run --with ruff ruff check interlace tests examples
       - name: Run mypy
-        run: uv run --with mypy mypy bricks
+        run: uv run --with mypy mypy interlace
+      - name: Check formatting
+        run: uv run --with ruff ruff format --check interlace
       - name: Build distributions
         run: uv build

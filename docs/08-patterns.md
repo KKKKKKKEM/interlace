@@ -76,7 +76,7 @@ graph = (
 `ALL` 是按每个端口 FIFO 取值的 positional join，不会读取业务 key。乱序相关数据应使用官方可复用 Node：
 
 ```python
-from bricks.nodes import KeyedJoin, KeyedValue
+from interlace.nodes import KeyedJoin, KeyedValue
 
 join = KeyedJoin(max_pending=10_000)
 ```

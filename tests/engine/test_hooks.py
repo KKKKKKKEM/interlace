@@ -8,9 +8,9 @@ from threading import get_ident
 
 import pytest
 
-from bricks import AsyncNode, Graph, Node, Output, Ports, Runtime
-from bricks.engine.errors import HookExecutionError, InvalidOutputError
-from bricks.engine.hooks import (
+from interlace import AsyncNode, Graph, Node, Output, Ports, Runtime
+from interlace.engine.errors import HookExecutionError, InvalidOutputError
+from interlace.engine.hooks import (
     NodeCall,
     NodeHook,
     ShortCircuit,
@@ -784,8 +784,8 @@ def test_stop_graph_preserves_published_outputs_in_result_and_stream(
     )
     expected = (Output("before"), *stop_outputs)
     if mode == "engine":
-        from bricks import Execution
-        from bricks.engine.executor import Engine
+        from interlace import Execution
+        from interlace.engine.executor import Engine
 
         engine = Engine()
         try:

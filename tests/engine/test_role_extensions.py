@@ -7,12 +7,12 @@ import time
 
 import pytest
 
-from bricks import Graph, Node, Output, Runtime, Slot, SlotPool
-from bricks.adapters import memory
-from bricks.engine.observation import RuntimeEvent
-from bricks.plugins import CAP_EVENT_ROUTER, CAP_GRAPH_WORKER, PluginDescriptor
-from bricks.runtime import EventRouter, GraphWorker
-from bricks.spi import RouterRole, SlotProvider, WorkerRole
+from interlace import Graph, Node, Output, Runtime, Slot, SlotPool
+from interlace.adapters import memory
+from interlace.engine.observation import RuntimeEvent
+from interlace.plugins import CAP_EVENT_ROUTER, CAP_GRAPH_WORKER, PluginDescriptor
+from interlace.runtime import EventRouter, GraphWorker
+from interlace.spi import RouterRole, SlotProvider, WorkerRole
 
 
 class RouterWrapper:

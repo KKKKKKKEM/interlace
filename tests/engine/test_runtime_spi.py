@@ -12,12 +12,12 @@ from uuid import UUID
 
 import pytest
 
-from bricks import Event, Graph, InputPolicy, Node, Ports, Runtime
-from bricks.adapters import memory
-from bricks.engine.hooks import HookRegistry
-from bricks.engine.slots import SlotPool
-from bricks.runtime import EventRouter, GraphWorker
-from bricks.spi import (
+from interlace import Event, Graph, InputPolicy, Node, Ports, Runtime
+from interlace.adapters import memory
+from interlace.engine.hooks import HookRegistry
+from interlace.engine.slots import SlotPool
+from interlace.runtime import EventRouter, GraphWorker
+from interlace.spi import (
     Delivery,
     DeliveryOutcome,
     DeliveryResult,

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 
-from bricks import Graph, Node, Output, Ports, Runtime
+from interlace import Graph, Node, Output, Ports, Runtime
 
 
 class ProduceMany(Node):

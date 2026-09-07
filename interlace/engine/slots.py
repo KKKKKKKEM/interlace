@@ -18,7 +18,7 @@ _LOGGER = logging.getLogger(__name__)
 
 @runtime_checkable
 class SlotLease(Protocol):
-    """适配器持有的进程内 Slot 能力，由 SlotPool 分配并从 bricks.spi 导出。"""
+    """适配器持有的进程内 Slot 能力，由 SlotPool 分配并从 interlace.spi 导出。"""
 
     @property
     def slot(self) -> Slot:

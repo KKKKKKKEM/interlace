@@ -6,15 +6,15 @@ from dataclasses import fields
 
 import pytest
 
-import bricks
-from bricks import Event, Ports, adapters, engine, nodes, plugins, runtime, spi
-from bricks.spi import Work
+import interlace
+from interlace import Event, Ports, adapters, engine, nodes, plugins, runtime, spi
+from interlace.spi import Work
 
 
 def test_top_level_api_contains_only_core_vocabulary() -> None:
     """顶层只增加可控执行句柄，不暴露内部调度与 checkpoint DTO。"""
 
-    assert bricks.__all__ == [
+    assert interlace.__all__ == [
         "AsyncNode",
         "Context",
         "Edge",
@@ -37,7 +37,7 @@ def test_top_level_api_contains_only_core_vocabulary() -> None:
 def test_advanced_packages_expose_explicit_architecture_boundaries() -> None:
     """内核、编排、SPI、插件和默认适配器不再聚合到 engine。"""
 
-    assert engine.__all__ == [name for name in bricks.__all__ if name != "Runtime"]
+    assert engine.__all__ == [name for name in interlace.__all__ if name != "Runtime"]
     assert runtime.__all__ == [
         "EventRouter",
         "GraphWorker",

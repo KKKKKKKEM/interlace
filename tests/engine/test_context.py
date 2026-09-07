@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, MutableMapping
 from typing import Any
 
-from bricks import Context
+from interlace import Context
 
 
 def test_context_state_is_shared_by_scope_and_namespace() -> None:

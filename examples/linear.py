@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from bricks import Graph, Node, Output, Ports, Runtime
+from interlace import Graph, Node, Output, Ports, Runtime
 
 
 class Strip(Node):
@@ -57,7 +57,7 @@ class Upper(Node):
         return Output(inputs["text"].upper(), "result")
 
 
-def run(text: str = "  hello, bricks  ") -> str:
+def run(text: str = "  hello, interlace  ") -> str:
     """执行一条两节点的数据流，并返回未连接的终端输出。
 
     Args:

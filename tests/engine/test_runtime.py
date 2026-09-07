@@ -8,7 +8,7 @@ from threading import Lock, current_thread
 
 import pytest
 
-from bricks import (
+from interlace import (
     AsyncNode,
     Context,
     Event,
@@ -21,13 +21,13 @@ from bricks import (
     Slot,
     SlotPool,
 )
-from bricks.adapters import memory
-from bricks.engine.errors import (
+from interlace.adapters import memory
+from interlace.engine.errors import (
     IncompleteInputsError,
     InvalidOutputError,
     PortValueTypeError,
 )
-from bricks.runtime import GraphWorker
+from interlace.runtime import GraphWorker
 
 
 class Split(Node):
@@ -1186,8 +1186,8 @@ def test_slot_follows_work_across_consumers() -> None:
         ("source", "shared"),
         ("sink", "shared"),
     ]
-    assert seen[0][2].startswith("bricks-sources")
-    assert seen[1][2].startswith("bricks-sinks")
+    assert seen[0][2].startswith("interlace-sources")
+    assert seen[1][2].startswith("interlace-sinks")
     assert shared.available == 1
 
 

@@ -1,7 +1,20 @@
-# Bricks
+# Interlace
 
-Bricks 是一个 Python typed graph runtime：Graph 内以 `Output` 和 `Edge` 传递局部数据，Graph 间以
+Interlace 是一个可扩展的 Python 编排微内核：Graph 内以 `Output` 和 `Edge` 传递局部数据，Graph 间以
 `Event` 和 `Runtime` 连接领域工作流。
+
+核心实现通过公开协议替换，功能通过插件和领域节点扩展，Graph 与 Execution 的公共契约保持稳定。
+运行时没有第三方依赖；爬虫模型、下载器与下载节点由独立的 [Bricks](https://github.com/KKKKKKKEM/bricks) 提供。
+
+## 安装
+
+当前通过 Git 安装，尚未发布到 PyPI：
+
+```bash
+uv pip install "interlace @ git+https://github.com/KKKKKKKEM/interlace.git"
+```
+
+生产项目应将 Git 依赖固定到经过验证的提交。开发本仓库可使用 `uv sync`。
 
 ```text
 Node -- Output / Edge --> Node
@@ -19,7 +32,7 @@ Node firing 的时限由该 Node 的 `timeout` 属性声明。`start()` 返回�
 ## 最小示例
 
 ```python
-from bricks import Graph, Node, Output, Ports, Runtime
+from interlace import Graph, Node, Output, Ports, Runtime
 
 
 class Upper(Node):
@@ -36,7 +49,7 @@ graph = Graph(entrypoint="upper").add(upper=Upper())
 
 with Runtime() as runtime:
     runtime.register("upper.graph", graph)
-    print(runtime.run("upper.graph", "bricks"))
+    print(runtime.run("upper.graph", "interlace"))
 ```
 
 完整内容按一本手册组织，从[文档目录](docs/README.md)开始：

@@ -75,7 +75,7 @@ class BoundPolicy:
             绑定的是启动触发策略时返回 True。
         """
 
-        return self.ref.name == "bricks.core/on-start"
+        return self.ref.name == "interlace.core/on-start"
 
     def select(
         self,
@@ -196,9 +196,9 @@ class PolicyRegistry:
         """注册三种内建输入策略并初始化策略注册锁。"""
 
         self._selectors: dict[str, InputSelector] = {
-            "bricks.core/all": _AllSelector(),
-            "bricks.core/any": _AnySelector(),
-            "bricks.core/on-start": _OnStartSelector(),
+            "interlace.core/all": _AllSelector(),
+            "interlace.core/any": _AnySelector(),
+            "interlace.core/on-start": _OnStartSelector(),
         }
         self._lock = RLock()
 
@@ -240,9 +240,9 @@ class PolicyRegistry:
 
         if isinstance(policy, InputPolicy):
             names = {
-                InputPolicy.ALL: "bricks.core/all",
-                InputPolicy.ANY: "bricks.core/any",
-                InputPolicy.ON_START: "bricks.core/on-start",
+                InputPolicy.ALL: "interlace.core/all",
+                InputPolicy.ANY: "interlace.core/any",
+                InputPolicy.ON_START: "interlace.core/on-start",
             }
             ref = PolicyRef(names[policy])
         elif isinstance(policy, PolicyRef):

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from bricks import Graph, Node, Ports, Runtime
+from interlace import Graph, Node, Ports, Runtime
 
 
 class Publish(Node):

@@ -83,7 +83,7 @@ class KeyedJoin(Node):
             符合声明端口契约的 Output。
         """
 
-        state = context.state("bricks.keyed-join")
+        state = context.state("interlace.keyed-join")
         buffers = state.setdefault("buffers", {"left": {}, "right": {}})
         pending = state.setdefault("pending", 0)
         if not state.get("finalizer_registered"):

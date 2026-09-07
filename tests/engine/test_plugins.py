@@ -6,13 +6,13 @@ from threading import enumerate as enumerate_threads
 
 import pytest
 
-from bricks import Graph, Node, Output, Ports, Runtime
-from bricks.adapters import memory
-from bricks.engine.executor import Engine
-from bricks.engine.hooks import NodeCall
-from bricks.engine.observation import RuntimeEvent
-from bricks.engine.policies import PolicyRef
-from bricks.plugins import (
+from interlace import Graph, Node, Output, Ports, Runtime
+from interlace.adapters import memory
+from interlace.engine.executor import Engine
+from interlace.engine.hooks import NodeCall
+from interlace.engine.observation import RuntimeEvent
+from interlace.engine.policies import PolicyRef
+from interlace.plugins import (
     CAP_EVENT_BUS,
     CAP_EVENT_ROUTER,
     CAP_GRAPH_EXECUTOR,
@@ -26,7 +26,7 @@ from bricks.plugins import (
     PluginDescriptor,
     PluginHost,
 )
-from bricks.runtime import LocalRuntimePlugin
+from interlace.runtime import LocalRuntimePlugin
 
 
 def test_multiple_plugins_can_contribute_each_extension_kind() -> None:
@@ -164,7 +164,7 @@ def test_failed_runtime_construction_does_not_leave_runner_threads(stage) -> Non
     before = {
         thread.ident
         for thread in enumerate_threads()
-        if thread.name == "bricks-async-runner"
+        if thread.name == "interlace-async-runner"
     }
     for _ in range(3):
         with pytest.raises(
@@ -175,7 +175,7 @@ def test_failed_runtime_construction_does_not_leave_runner_threads(stage) -> Non
     after = {
         thread.ident
         for thread in enumerate_threads()
-        if thread.name == "bricks-async-runner"
+        if thread.name == "interlace-async-runner"
     }
     assert after == before
 
@@ -207,8 +207,8 @@ def test_builtin_setup_rolls_back_partially_created_components(monkeypatch) -> N
         raise RuntimeError("task construction failed")
 
     monkeypatch.setattr(bus, "close", close)
-    monkeypatch.setattr("bricks.runtime.plugin.memory.EventBus", lambda: bus)
-    monkeypatch.setattr("bricks.runtime.plugin.memory.TaskBackend", broken_tasks)
+    monkeypatch.setattr("interlace.runtime.plugin.memory.EventBus", lambda: bus)
+    monkeypatch.setattr("interlace.runtime.plugin.memory.TaskBackend", broken_tasks)
     with pytest.raises(RuntimeError, match="task construction failed"):
         Runtime()
     assert closed == [True]
@@ -719,7 +719,7 @@ def test_runtime_installs_extension_contributions_before_graph_freeze() -> None:
         assert runtime.run("work.graph", "hello") == (Output("HELLO", "value"),)
         assert runtime.plugin_host is not None
         assert {item.id for item in runtime.plugin_host.descriptors} == {
-            "bricks.core/local-runtime",
+            "interlace.core/local-runtime",
             "example/plugin",
         }
 
@@ -742,9 +742,9 @@ def test_custom_infrastructure_uses_the_same_local_plugin_path() -> None:
 
     with Runtime(plugins=(local,)) as runtime:
         assert runtime.plugin_host is not None
-        assert runtime.plugin_host.require("bricks.runtime/event-bus") is events
-        assert runtime.plugin_host.require("bricks.runtime/task-backend") is tasks
-        assert runtime.plugin_host.require("bricks.runtime/graph-executor") is executor
+        assert runtime.plugin_host.require("interlace.runtime/event-bus") is events
+        assert runtime.plugin_host.require("interlace.runtime/task-backend") is tasks
+        assert runtime.plugin_host.require("interlace.runtime/graph-executor") is executor
 
     # 注入资源仍由调用方持有，与旧的角色构造器所有权约定一致。
     assert not events._closed

@@ -5,11 +5,11 @@ from contextlib import contextmanager
 
 import pytest
 
-from bricks import Event, Graph, Node, Runtime, SlotPool
-from bricks.adapters import memory
-from bricks.adapters.memory import EventBus
-from bricks.runtime import EventRouter, GraphWorker
-from bricks.spi import Delivery, DeliveryOutcome, SlotLease
+from interlace import Event, Graph, Node, Runtime, SlotPool
+from interlace.adapters import memory
+from interlace.adapters.memory import EventBus
+from interlace.runtime import EventRouter, GraphWorker
+from interlace.spi import Delivery, DeliveryOutcome, SlotLease
 
 
 def test_accepted_delivery_dispatch_failure_releases_only_transferred_reference(
