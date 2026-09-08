@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import asyncio
 
-from interlace import AsyncNode, Graph, Output, Ports, Runtime
+from interlace import Graph, Node, Output, Ports, Runtime
 
 
-class DelayedUpper(AsyncNode):
+class DelayedUpper(Node):
     """异步等待后将输入文本转为大写的示例节点。
 
     Attributes:

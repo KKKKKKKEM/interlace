@@ -12,6 +12,7 @@ from ..engine.core import require_non_empty_string
 from ..engine.hooks import HookPhase, NodeHook
 from ..engine.observation import RuntimeObserver
 from ..engine.policies import InputSelector
+from ..spi.roles import RouterRole, WorkerRole
 
 _VERSION = re.compile(r"^[0-9]+(?:\.[0-9]+){0,2}(?:[-+][A-Za-z0-9.-]+)?$")
 
@@ -34,7 +35,7 @@ class PluginDescriptor:
     version: str
     requires: tuple[str, ...] = ()
     provides: tuple[str, ...] = ()
-    api_version: str = "1"
+    api_version: str = "2"
     requires_capabilities: tuple[str, ...] = ()
     contributes: tuple[str, ...] = ()
 
@@ -312,11 +313,12 @@ class PluginHost:
         _contributions: 按能力类别组织的具名贡献。
         _contexts: 按插件身份保存的受控装配上下文。
         _started: 已接管生命周期、需要逆序关闭的插件集合。
+        _contribution_detachers: 标准贡献安装后的注销函数，按逆序执行。
         _frozen: 是否已完成冻结，冻结后不再接受定义修改。
         _closed: 当前组件是否已停止接受新工作。
     """
 
-    API_VERSION = "1"
+    API_VERSION = "2"
 
     def __init__(self, plugins: Iterable[Plugin]) -> None:
         """校验插件依赖并初始化能力、贡献和生命周期记录。
@@ -333,6 +335,7 @@ class PluginHost:
             for descriptor, _ in self._plugins
         }
         self._started: list[tuple[PluginDescriptor, Plugin]] = []
+        self._contribution_detachers: list[Callable[[], None]] = []
         self._frozen = False
         self._closed = False
 
@@ -384,6 +387,7 @@ class PluginHost:
                         f"{sorted(missing)!r}"
                     )
             self._frozen = True
+            self._install_runtime_contributions()
             for descriptor, plugin in self._started:
                 plugin.start(self._contexts[descriptor.id])
         except BaseException:
@@ -560,6 +564,13 @@ class PluginHost:
         """
 
         failure: BaseException | None = None
+        for detach in reversed(self._contribution_detachers):
+            try:
+                detach()
+            except BaseException as exc:  # noqa: BLE001
+                if failure is None:
+                    failure = exc
+        self._contribution_detachers.clear()
         for descriptor, plugin in reversed(self._started):
             try:
                 plugin.stop(self._contexts[descriptor.id])
@@ -568,6 +579,50 @@ class PluginHost:
                     failure = exc
         self._started.clear()
         return failure
+
+    def _install_runtime_contributions(self) -> None:
+        """通过公开角色安装标准贡献，使所有角色实现遵循相同装配路径。
+
+        Raises:
+            LookupError: 标准贡献需要的角色 capability 缺失。
+            TypeError: 角色实现不满足公开协议，或贡献值不符合角色契约。
+        """
+
+        selectors = self.contributions(CAP_INPUT_SELECTOR)
+        hooks = self.contributions(CAP_NODE_HOOK)
+        observers = self.contributions(CAP_RUNTIME_OBSERVER)
+        if not (selectors or hooks or observers):
+            return
+        worker = self.require(CAP_GRAPH_WORKER)
+        if not isinstance(worker, WorkerRole):
+            raise TypeError("worker must implement WorkerRole")
+        for contribution in selectors:
+            self._contribution_detachers.append(
+                worker.register_policy(contribution.name, contribution.value)
+            )
+        for contribution in hooks:
+            value = contribution.value
+            configured = (
+                value
+                if isinstance(value, NodeHookContribution)
+                else NodeHookContribution(value)
+            )
+            self._contribution_detachers.append(
+                worker.contribute_hook(
+                    configured.hook,
+                    phase=configured.phase,
+                    graph=configured.graph,
+                    node=configured.node,
+                )
+            )
+        if observers:
+            router = self.require(CAP_EVENT_ROUTER)
+            if not isinstance(router, RouterRole):
+                raise TypeError("router must implement RouterRole")
+            for contribution in observers:
+                for role in (router, worker):
+                    handle = role.observe_runtime(contribution.value)
+                    self._contribution_detachers.append(handle.detach)
 
     @staticmethod
     def _normalize(

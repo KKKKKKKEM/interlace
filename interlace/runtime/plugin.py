@@ -15,11 +15,7 @@ from ..plugins import (
     CAP_EXECUTION_FACTORY,
     CAP_GRAPH_EXECUTOR,
     CAP_GRAPH_WORKER,
-    CAP_INPUT_SELECTOR,
-    CAP_NODE_HOOK,
-    CAP_RUNTIME_OBSERVER,
     CAP_TASK_BACKEND,
-    NodeHookContribution,
     PluginContext,
     PluginDescriptor,
 )
@@ -235,23 +231,7 @@ class LocalRuntimePlugin:
             context: 当前调用的执行或插件上下文。
         """
 
-        assert self.worker is not None
-        for contribution in context.contributions(CAP_INPUT_SELECTOR):
-            self.worker.register_policy(contribution.name, contribution.value)
-        for contribution in context.contributions(CAP_NODE_HOOK):
-            value = contribution.value
-            if isinstance(value, NodeHookContribution):
-                self.worker.contribute_hook(
-                    value.hook,
-                    phase=value.phase,
-                    graph=value.graph,
-                    node=value.node,
-                )
-            else:
-                self.worker.attach(value)
-        for contribution in context.contributions(CAP_RUNTIME_OBSERVER):
-            self._router_observations.attach(contribution.value)
-            self._worker_observations.attach(contribution.value)
+        del context
 
     def stop(self, context: PluginContext) -> None:
         """停止插件并释放其拥有的资源。

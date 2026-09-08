@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from threading import RLock
 from types import MappingProxyType
@@ -202,12 +202,15 @@ class PolicyRegistry:
         }
         self._lock = RLock()
 
-    def register(self, name: str, selector: InputSelector) -> None:
+    def register(self, name: str, selector: InputSelector) -> Callable[[], None]:
         """注册具名输入选择器，拒绝重复名称和缺失命名空间。
 
         Args:
             name: 注册或查找使用的名称。
             selector: 仅依据端口和 token 数量选择输入的实现。
+
+        Returns:
+            仅撤销本次注册的幂等函数，不改变 Graph 已绑定的选择器快照。
 
         Raises:
             TypeError: 参数类型或接口实现不符合当前契约。
@@ -223,6 +226,18 @@ class PolicyRegistry:
             if name in self._selectors:
                 raise ValueError(f"input policy {name!r} is already registered")
             self._selectors[name] = selector
+        detached = False
+
+        def detach() -> None:
+            """撤销当前具名注册，重复调用不影响后续同名注册。"""
+
+            nonlocal detached
+            with self._lock:
+                if not detached:
+                    del self._selectors[name]
+                    detached = True
+
+        return detach
 
     def bind(self, policy: InputPolicy | PolicyRef) -> BoundPolicy:
         """将输入策略引用绑定为包含实现快照的 BoundPolicy。

@@ -6,8 +6,8 @@
 ## 统一插件宿主
 
 需要向 Runtime 注册 selector、Hook 或 Observer 时，优先声明 contribution 插件。插件通过 `PluginDescriptor`
-声明身份、版本、依赖和 capability，并在 `setup()` 中
-注册能力；全部插件 setup 完成后才依赖顺序调用 `start()`，关闭时逆序调用 `stop()`：
+声明身份、版本、依赖和 capability，并在 `setup()` 中注册能力。全部插件 setup 完成后，宿主通过公开角色安装
+标准贡献，再按依赖顺序调用 `start()`；关闭时先注销贡献，再逆序调用 `stop()`：
 
 ```python
 from interlace import Runtime
@@ -39,7 +39,8 @@ InputSelector、NodeHook 和 RuntimeObserver 都属于后者，`ContributionPlug
 向同一种 capability 贡献不同名称的实现，同名贡献会被拒绝。`provide()` 与 `contribute()` 必须分别兑现对应的声明，
 同一 capability 不能同时作为单例和聚合能力。
 插件 ID 和 contribution 名必须带命名空间。`PluginDescriptor.api_version` 声明所需的插件 SPI 主版本，当前为
-`"1"`。`requires` 声明插件 ID 依赖，`requires_capabilities` 声明单例 capability 依赖；两者都参与拓扑排序。需要
+`"2"`。订阅和消费者绑定返回可注销函数，Hook 出口逐项接收 Output；插件必须实现当前签名，宿主拒绝其他 SPI
+主版本。`requires` 声明插件 ID 依赖，`requires_capabilities` 声明单例 capability 依赖；两者都参与拓扑排序。需要
 依赖贡献插件的生命周期时使用 `requires`，读取聚合结果使用 `context.contributions()`。缺失或
 循环依赖、API 不兼容、能力冲突或 descriptor 声明未兑现都会在 Runtime 构造期间失败。
 
@@ -59,8 +60,10 @@ flowchart TB
     Infra -->|provide selected capability| CoreCaps[EventBus / TaskBackend / GraphExecutor]
     Local -->|fill missing capabilities| CoreCaps
     Feature -->|contribute| Contributions[Selectors / Hooks / Observers]
-    CoreCaps --> Runtime[Runtime 稳定门面]
-    Contributions --> Runtime
+    CoreCaps --> Roles[RouterRole / WorkerRole]
+    Contributions --> Host
+    Host -->|install contributions| Roles
+    Roles --> Runtime[Runtime 稳定门面]
 ```
 
 ### 自定义基础设施
@@ -169,11 +172,14 @@ TaskPublisher 的 `submit()` 正常返回即表示后端已接受 Work，同时�
 
 - EventBus 的 `subscribe(event_type, handler, subscription=...)` 需要支持精确类型和 `"*"` 通配订阅。同名
     subscription 的多个实例竞争消费，不同 subscription 各自收到一份；省略 subscription 的观察者相互独立。
-    Event 始终只有 `type` 和 `payload`，EventBus 不接触 Slot 或 lease。
+    返回的 `Callable[[], None]` 必须幂等且只注销本次注册；同一个 handler 的其他注册保持有效。注销后不再选择
+    该注册，已经选中的投递仍然完成。Event 始终只有 `type` 和 `payload`，EventBus 不接触 Slot 或 lease。
 - TaskPublisher 把 Work 提交到命名 queue，`submit()` 正常返回表示后端已经接受；同一进程内 TaskConsumer 的
     `bind(queue, handler, concurrency=..., slots=...)` 在调度根 Work 前通过 `slots.try_acquire()` 获取 lease。Work 只包含 Graph
     名、输入、领域 trigger、ID、limits 和 options；进程内 lease 只存在于 `Delivery.slot_lease`。支持 `LocalTaskPublisher` 的本地后端
     可以延续 lease；等待 Slot 的根 Work 不能占用 concurrency，交付完成或失败后必须释放 Delivery 持有的 lease。
+    `bind()` 返回幂等的 `Callable[[], None]`：按适配器声明的排空范围结束本次绑定，等待交付完成最终 lease 清理，
+    再释放该绑定的资源；不得注销同一 queue 的其他消费者。绑定失败需要移除本次注册并清理已经创建的资源。
 - GraphExecutor 接收注册名、冻结 Graph、入口输入、Event emitter、可选 ExecutionPlan，以及可选 `slot=`、`options=` 和必需的
   `execution=`。GraphWorker 会把冻结后的 Node timeout 快照绑定到 Execution 并开始执行；替换执行器必须为每次
   Node firing 使用 `with execution.step(node_id): ...` 包住完整调用，并在调度边界调用
@@ -189,7 +195,14 @@ Runtime 不依赖默认内存实现的私有字段。
 
 `RouterRole`、`WorkerRole` 是结构化协议，替换角色无需继承 EventRouter 或 GraphWorker。显式装配时仍需提供完整
 角色组合；可以只替换其中一个角色的实现，另一个使用默认类。插件装配时使用 `CAP_EVENT_ROUTER` 和
-`CAP_GRAPH_WORKER` 提供角色。自定义角色插件负责通过公开角色接口安装自己的贡献并管理关闭顺序。
+`CAP_GRAPH_WORKER` 提供角色。PluginHost 通过公开角色统一安装标准贡献，完整替代角色无需重复编写安装逻辑；
+自定义角色插件仍负责自己提供的角色及底层组件的生命周期。即使只直接使用 PluginHost，标准贡献也必须有相应角色
+消费，缺少角色时不能仅登记贡献后成功启动。
+
+WorkerRole 的 `register_policy()` 接收具名 selector；`contribute_hook()` 接收固定插件 Hook；二者均返回独立幂等的
+`Callable[[], None]`。selector 注销不能改变 Graph 已绑定的实现快照。Hook 在目标 Graph 尚未注册时可以延迟绑定，
+返回的注销函数必须在绑定前后都有效。`observe_runtime()` 返回可独立卸载的观察句柄。Host 保存三类贡献的注销能力，
+在关闭和启动回滚时统一清理。
 
 WorkerRole 的基本执行入口是 `start()`，同步 `Runtime.run()` 和异步 `Runtime.arun()` 分别等待它返回的同一个
 Execution。`iter()`、`aiter()` 必须先建立输出订阅再启动执行，保证首批输出也受到背压约束。替换 Worker 仍须在注册时
@@ -323,8 +336,10 @@ queue 消费配置时，才需要显式调用 `route()` 与 `consume()`。
 
 ## 组件生命周期
 
-插件模式下，PluginHost 按依赖顺序调用所有插件的 `setup()`，再按相同顺序调用 `start()`；任一阶段失败都会逆序
-调用已进入 setup 的插件 `stop()`。`Runtime.close()` 排空工作后关闭 PluginHost，宿主再逆序停止插件。
+插件模式下，PluginHost 按依赖顺序调用所有插件的 `setup()`，安装标准 selector、Hook 和 Observer 后，再按相同
+顺序调用 `start()`。标准贡献通过公开 RouterRole、WorkerRole 安装，因此默认角色与替代角色共享同一流程。
+任何阶段失败都会先逆序注销已经安装的 selector、Hook 和 Observer，再逆序调用已进入 setup 的插件 `stop()`。
+`Runtime.close()` 排空工作后关闭 PluginHost，使用相同的贡献清理和插件停止流程。
 
 插件构造器只保存配置，线程、连接等资源应在 `setup()` 中创建。LocalRuntimePlugin 同样在 `setup()` 中创建默认
 传输和 Engine，因此依赖校验失败不会启动后台线程；setup 中途失败时，已创建的资源也会通过 `stop()` 回收。
@@ -335,14 +350,17 @@ sequenceDiagram
     participant H as PluginHost
     participant A as Plugin A
     participant B as Plugin B（依赖 A）
+    participant Roles as RouterRole / WorkerRole
 
     R->>H: 构造
     H->>A: setup(context)
     H->>B: setup(context)
+    H->>Roles: install selectors / hooks / observers
     H->>A: start()
     H->>B: start()
     R->>R: wait_idle()
     R->>H: close()
+    H->>Roles: detach contributions in reverse order
     H->>B: stop()
     H->>A: stop()
 ```
@@ -353,6 +371,17 @@ LocalRuntimePlugin 自己创建的 `memory.EventBus`、`memory.TaskBackend` 和 
 EventRouter 和 GraphWorker 只自动关闭自己创建的默认组件。注入的 EventBus、TaskPublisher、TaskConsumer 和
 GraphExecutor 默认由调用方管理，这使多个角色可以安全共享客户端或连接池。若注入组件明确由某个角色独占，
 可对该角色传 `close_injected=True`。同一共享组件不要同时交给两个角色管理。
+
+无论底层组件由谁拥有，角色都必须注销自身建立的注册。EventRouter 保存每次 `subscribe()` 返回的注销函数，
+GraphWorker 保存每次 `bind()` 返回的注销函数；角色退出后，共享传输保留其他角色的订阅和消费者。
+注销消费者时，handler 返回只代表业务处理结束，消费端仍须等待交付所持 lease 完成释放，才能关闭相应资源。
+其他消费者仍使用同一 SlotProvider 时，必须保留它们需要的可用通知。
+
+默认内存后端区分从未消费和已经退订的通道：从未绑定消费者时可以先提交 Work；最后一个成功绑定的消费者注销时，
+先排空该通道已接受的队列和在途交付，包括同通道续作及 lease 清理，再原子地完成退订。此后 `submit()` 和
+`submit_local()` 拒绝新 Work，直到新的消费者成功绑定；失败绑定不会把原本允许排队的通道改成退订状态。
+如果外部 Event 恰好在 Worker 完成退订、Router 尚未关闭的间隙触发旧 route，任务提交会明确失败，不会留下无人处理
+的排队 Work。远程适配器应单独说明其退订与队列接收语义。
 
 `Runtime(router=..., worker=...)` 显式拥有两个传入角色，`Runtime.close()` 会依次关闭 Worker 和 Router；
 角色底层注入组件是否被关闭仍由各自的 `close_injected` 决定。插件模式与显式角色模式不能在同一个 Runtime
@@ -402,6 +431,10 @@ observer 抛出的异常会被隔离，因此日志、Tracing 和指标插件不
 Graph，再调用 `graph.plan()`；自行组装 Runtime 时也可以显式将同一 `PolicyRegistry` 交给 GraphWorker 和
 `graph.plan(..., policies=registry)`。
 
+高级接口 `PolicyRegistry.register()` 和 `WorkerRole.register_policy()` 返回本次注册的幂等注销函数。
+注销后，新 Graph 冻结时无法再解析该名称，已冻结 Graph 继续使用原快照；旧注销函数也不会影响后来建立的同名注册。
+Runtime 门面的 `register_policy()` 仍返回 Runtime 以支持链式组合，固定插件贡献的注销由 PluginHost 管理。
+
 ## 动态 Node Hook
 
 Graph 注册后保持冻结，但默认 `Engine` 允许使用者给后续 Graph execution 动态挂载 Hook：
@@ -418,9 +451,9 @@ class RequestCache(NodeHook):
             raise ShortCircuit(Output(response, "response"))
         return call
 
-    async def exit(self, call, outputs):
-        await cache.put(call.inputs["request"], outputs[0].value)
-        return outputs
+    async def exit(self, call, output):
+        await cache.put(call.inputs["request"], output.value)
+        return output
 
 
 handle = runtime.attach(
@@ -431,15 +464,22 @@ handle = runtime.attach(
 handle.detach()
 ```
 
-`enter()` 转换 Node 输入，`exit()` 转换结果，`error()` 可以返回结果来恢复普通异常。三者都可以是同步或异步方法；
+`enter()` 转换 Node 输入，`exit(call, output)` 逐项转换结果，`error()` 可以返回结果来恢复普通异常。三者都可以是同步或异步方法；
 Engine 把 awaitable 提交给常驻后台 event loop，并在执行 Graph 的 worker 中等待结果。Hook 无需、也不能手动推进
 Node 执行：`enter()` 正常返回后 Engine 默认执行 Node。
+
+出口 Hook 只接收 Engine 已读取的单项 Output，可返回单项 Output、惰性 Iterable[Output] 或 None，分别表示转换、
+展开或丢弃。没有输出时不调用出口 Hook。Engine 独占源迭代器的推进与关闭，因此异步 Hook 不会把同步 Node
+的迭代搬入事件循环。整批聚合由领域 Node 实现；不要在核心 Hook 边界收集全量输出。
+
+生成器的普通业务异常同样交给 `error()`，保留原始异常类型；恢复结果继续经过当前及外层出口 Hook，已交付的前缀
+不会重新执行或撤回。取消和超时直接传播。`node.finished` 在输出转换、校验和清理结束后发布，非法输出会报告失败。
 
 单阶段转换不需要定义 class：
 
 ```python
-def normalize(call, outputs):
-    return tuple(Output(clean(item.value), item.port) for item in outputs)
+def normalize(call, output):
+    return Output(clean(output.value), output.port)
 
 
 handle = runtime.attach(
@@ -454,7 +494,7 @@ handle = runtime.attach(
 指定 Graph，或者指定 Graph 内的 Node；Node 范围必须同时给出 Graph 名。
 
 固定 Hook 可以通过 `ContributionPlugin` 的具名 `NodeHookContribution` 安装。插件 Hook 可在目标 Graph 注册前声明，
-LocalRuntimePlugin 会延迟绑定，并在 Graph 注册时校验目标 Node；运行期 `runtime.attach()` 仍要求目标 Graph 已注册，
+PluginHost 通过 WorkerRole 安装贡献，GraphWorker 会延迟绑定，并在 Graph 注册时校验目标 Node；运行期 `runtime.attach()` 仍要求目标 Graph 已注册，
 并返回可卸载句柄。
 
 Hook 通过两个信号显式改变流程：
@@ -465,7 +505,7 @@ Hook 通过两个信号显式改变流程：
   terminal Output 后，按相同顺序发布到输出流并返回完整结果。已发布的数据不会被替换，空参数也会保留此前输出。
   当前 Graph 没有 graph-level output schema，因此对这些附加输出只校验它们是 `Output`。
 
-Hook 按注册顺序进入、逆序退出。短路后，已经进入的 Hook 仍会执行 `exit()`；终止 Graph 则不会继续执行剩余
+Hook 按注册顺序进入，每项输出按逆序经过出口转换。短路后，已经进入的 Hook 仍会对短路输出执行 `exit()`；终止 Graph 则不会继续执行剩余
 生命周期。每次 Graph execution 在开始时固定 Hook 快照，所以 `attach()`/`detach()` 不会改变已经在途的执行，
 但会作用于下一次执行。`detach()` 是幂等的，也不会等待旧快照结束。
 

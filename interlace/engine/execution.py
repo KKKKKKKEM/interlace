@@ -7,11 +7,12 @@ import enum
 import itertools
 import math
 import time
-from collections.abc import AsyncIterator, Iterator, Mapping
+from collections.abc import AsyncIterator, Generator, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from threading import RLock
+from typing import Any
 from uuid import uuid4
 
 from .core import Output, _validate_timeout, require_non_empty_string
@@ -481,7 +482,7 @@ class Execution:
             assert outputs is not None
             return outputs
 
-    def __await__(self):
+    def __await__(self) -> Generator[Any, None, tuple[Output, ...]]:
         """异步等待最终结果；取消等待方会协作式取消 execution。
 
         Returns:

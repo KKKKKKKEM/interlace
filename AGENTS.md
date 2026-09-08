@@ -26,7 +26,7 @@
 顶层 API 固定为：
 
 ```text
-Ports、Node、AsyncNode、InputPolicy、Output、Edge、Graph、ExecutionPlan、
+Ports、Node、InputPolicy、Output、Edge、Graph、ExecutionPlan、
 Event、Context、Execution、ExecutionLimits、ExecutionStatus、Slot、SlotPool、Runtime
 ```
 
@@ -46,6 +46,7 @@ Event、Context、Execution、ExecutionLimits、ExecutionStatus、Slot、SlotPoo
 4. Node ID 属于 Graph binding，Node 不保存某次 execution 状态。
 5. Graph 内循环由 Output 沿回边继续传值，并在不再产生可执行数据时自然结束。
 6. 无下游 Edge 的 Output 由 `Runtime.run()` 返回。
+7. ExecutionPlan 只以冻结 Graph 和所选 Node ID 为构造输入；入口、Edge 和执行索引必须由同一次校验派生。
 
 ## 第四条：Event 是最小事实
 
@@ -68,8 +69,9 @@ Event、Context、Execution、ExecutionLimits、ExecutionStatus、Slot、SlotPoo
 
 ## 第六条：可替换性通过窄协议获得
 
-1. EventBus 只负责 Event 发布、订阅和投递生命周期。
+1. EventBus 只负责 Event 发布、订阅和投递生命周期；subscribe 返回独立、幂等的注销函数。
 2. TaskPublisher 负责工作投递，TaskConsumer 负责命名执行通道、本地并发和消费；TaskBackend 是两者的组合。
+   bind 返回独立、幂等的注销函数；注册失败必须回收本次资源，注销和空闲等待必须包含在途交付的 lease 清理。
 3. GraphExecutor 只负责执行冻结 Graph，通过 Execution 的公开输出接口交付结果；同步返回 None，异步返回
    Awaitable[None]。执行宿主管理 start/succeed/fail，不依靠整批返回值补发输出。
 4. EventBus、任务传输和 GraphExecutor 必须可以独立替换和组合，不得合并为万能 Backend。
@@ -98,10 +100,11 @@ Event、Context、Execution、ExecutionLimits、ExecutionStatus、Slot、SlotPoo
 
 ## 第九条：同步与异步共享语义
 
-1. 同步行为继承 Node，需要 await 的行为继承 AsyncNode。
-2. Graph.freeze() 校验 Node 类目与 execute 风格一致。
+1. 所有节点行为统一继承 Node，execute 可以使用 def 或 async def 声明。
+2. execute 返回 Output、Iterable[Output]、None 或得到这些结果的 Awaitable；执行器统一等待 Awaitable，
+   对最终结果应用同一输出校验和执行控制。异步生成器不属于节点返回契约。
 3. queue concurrency 限制完整 Graph execution，而不是单个 Node。
-4. 同步和异步 Node 共享同一 InputPolicy、Output、Edge 和 Event 语义。
+4. 所有 Node 共享同一 InputPolicy、Output、Edge 和 Event 语义。
 5. Node 默认必须无状态且可重入；跨 Work execution 状态放入 Slot，不得隐式存放在共享 Node 实例中。
 
 ## 第十条：Slot 跟随逻辑执行链
@@ -136,6 +139,8 @@ Event、Context、Execution、ExecutionLimits、ExecutionStatus、Slot、SlotPoo
 3. Graph 冻结时绑定 selector 实现快照；缺失 contribution 必须在冻结阶段失败。
 4. TaskConsumer 以 DeliveryResult 明确表达 ACK、RETRY 或 REJECT；broker lease、重投递和死信实现留给 backend。
 5. keyed join、窗口和领域状态属于扩展 Node，不进入 Engine 的固定调度语义。
+6. Engine 逐项推进 Node 输出；NodeHook.exit 逐项接收 Output，可返回 Output、Iterable[Output] 或 None。
+   Hook 不接管 Node 源迭代器；迭代阶段的控制边界、取消、超时、清理与直接调用一致。
 
 ## 第十三条：公共行为必须可验证
 
@@ -155,6 +160,7 @@ Event、Context、Execution、ExecutionLimits、ExecutionStatus、Slot、SlotPoo
    并按逆序 stop。
 4. 单例 capability 冲突、缺失依赖、循环依赖、SPI 不兼容和未兑现的 capability 声明必须在 Runtime 可用前失败。
 5. 输入策略、Node Hook 和 Runtime Observer 使用统一贡献通道，但仍保留各自的强类型和权限边界。
+   PluginHost 在全部 setup 后、start 前通过公开角色安装标准贡献，关闭和回滚时注销已安装的 selector、Hook 与 Observer。
 6. 插件不得访问 Runtime 私有状态；新增扩展类型优先成为 capability，不得继续增加互不相干的全局注册表。
 
 ## 第十五条：Pythonic 实现与中文注释

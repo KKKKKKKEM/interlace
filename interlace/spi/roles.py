@@ -276,7 +276,7 @@ class WorkerRole(Protocol):
         phase: HookPhase | str | None = None,
         graph: str | None = None,
         node: str | None = None,
-    ) -> HookHandle | None:
+    ) -> Callable[[], None]:
         """通过执行器公开扩展能力贡献节点 Hook。
 
         Args:
@@ -286,11 +286,11 @@ class WorkerRole(Protocol):
             node: 节点实例或作用域中的节点 ID，以接口类型为准。
 
         Returns:
-            用于卸载本次注册的句柄。
+            幂等注销函数；目标 Graph 注册前后均能撤销本次贡献。
         """
         ...
 
-    def register_policy(self, name: str, selector: InputSelector) -> object:
+    def register_policy(self, name: str, selector: InputSelector) -> Callable[[], None]:
         """注册带命名空间的输入选择策略。
 
         Args:
@@ -298,7 +298,7 @@ class WorkerRole(Protocol):
             selector: 仅依据端口和 token 数量选择输入的实现。
 
         Returns:
-            实现自行选择的组合结果，调用方不依赖其具体类型。
+            仅撤销本次注册的幂等函数，已冻结的选择器快照保持有效。
         """
         ...
 

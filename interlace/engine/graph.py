@@ -5,13 +5,11 @@ from __future__ import annotations
 import math
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
-from inspect import iscoroutinefunction
+from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import overload
 
 from .core import (
-    AsyncNode,
     InputPolicy,
     Node,
     Ports,
@@ -68,18 +66,101 @@ class ExecutionPlan:
     """一张冻结 Graph 的单次执行子图。
 
     Attributes:
-        graph: 关联的 Graph 定义或注册名称。
-        entrypoint: 接收外部输入的入口节点 ID。
-        nodes: 按绑定 ID 组织的节点实例。
-        edges: 当前定义或计划包含的有向边。
-        _outgoing: 按源节点组织的下游边索引。
+        graph: 计划所属的已冻结 Graph 定义。
+        nodes: 复制并冻结的待执行节点 ID 集合。
+        entrypoint: 从所属 Graph 派生的唯一入口节点 ID。
+        edges: 从节点集合派生、保持原始顺序的 Graph 有向边。
+        _outgoing: 从派生边建立的只读下游索引。
     """
 
     graph: Graph
-    entrypoint: str
     nodes: frozenset[str]
-    edges: tuple[Edge, ...]
-    _outgoing: Mapping[tuple[str, str], tuple[Edge, ...]]
+    entrypoint: str = field(init=False)
+    edges: tuple[Edge, ...] = field(init=False)
+    _outgoing: Mapping[tuple[str, str], tuple[Edge, ...]] = field(
+        init=False, repr=False
+    )
+
+    def __init__(self, graph: Graph, nodes: Iterable[str]) -> None:
+        """校验所选节点形成严格子图，并从冻结 Graph 派生全部执行元数据。
+
+        Args:
+            graph: 已通过类型、策略和可达性校验的冻结 Graph。
+            nodes: 待执行节点 ID；复制为不可变集合后保存。
+
+        Raises:
+            TypeError: Graph 类型或节点 ID 集合不符合契约。
+            GraphValidationError: Graph 未冻结，或节点选择缺失入口、不可达或缺少 ALL 输入。
+        """
+
+        if not isinstance(graph, Graph):
+            raise TypeError("execution plan graph must be a Graph")
+        if not graph.frozen:
+            raise GraphValidationError("execution plan requires a frozen Graph")
+        if isinstance(nodes, (str, bytes)):
+            raise TypeError("plan nodes must be an iterable of node IDs")
+        try:
+            selected = frozenset(nodes)
+        except TypeError as exc:
+            raise TypeError("plan nodes must be an iterable of node IDs") from exc
+        if not selected:
+            raise GraphValidationError("execution plan must contain at least one node")
+        if any(
+            not isinstance(node_id, str) or not node_id.strip() for node_id in selected
+        ):
+            raise TypeError("plan node IDs must be non-empty strings")
+        unknown = selected - set(graph.nodes)
+        if unknown:
+            raise GraphValidationError(
+                f"execution plan references unknown nodes: {sorted(unknown)!r}"
+            )
+        if graph.entrypoint not in selected:
+            raise GraphValidationError(
+                f"execution plan must contain graph entrypoint {graph.entrypoint!r}"
+            )
+
+        edges = tuple(
+            edge
+            for edge in graph.edges
+            if edge.source in selected and edge.target in selected
+        )
+        adjacency: dict[str, set[str]] = defaultdict(set)
+        incoming_ports: dict[str, set[str]] = defaultdict(set)
+        outgoing: dict[tuple[str, str], list[Edge]] = defaultdict(list)
+        for edge in edges:
+            adjacency[edge.source].add(edge.target)
+            incoming_ports[edge.target].add(edge.target_port)
+            outgoing[(edge.source, edge.source_port)].append(edge)
+
+        unreachable = selected - graph._reachable(adjacency)
+        if unreachable:
+            raise GraphValidationError(
+                "execution plan nodes are unreachable from entrypoint using original "
+                f"edges: {sorted(unreachable)!r}"
+            )
+        for node_id in selected:
+            spec = graph.spec_for(node_id)
+            if (
+                node_id == graph.entrypoint
+                or spec.input_policy.ref.name != "interlace.core/all"
+            ):
+                continue
+            missing = set(spec.input_ports) - incoming_ports[node_id]
+            if missing:
+                raise GraphValidationError(
+                    f"execution plan leaves ALL node {node_id!r} without inputs: "
+                    f"{sorted(missing)!r}"
+                )
+
+        object.__setattr__(self, "graph", graph)
+        object.__setattr__(self, "nodes", selected)
+        object.__setattr__(self, "entrypoint", graph.entrypoint)
+        object.__setattr__(self, "edges", edges)
+        object.__setattr__(
+            self,
+            "_outgoing",
+            MappingProxyType({key: tuple(value) for key, value in outgoing.items()}),
+        )
 
     def outgoing_for(self, node_id: str, port: str) -> tuple[Edge, ...]:
         """返回计划内指定 output port 的有序下游连接。
@@ -300,70 +381,9 @@ class Graph:
             TypeError: 参数类型或接口实现不符合当前契约。
         """
 
-        if isinstance(include, (str, bytes)):
-            raise TypeError("plan include must be an iterable of node IDs")
-        try:
-            selected = frozenset(include)
-        except TypeError as exc:
-            raise TypeError("plan include must be an iterable of node IDs") from exc
-        if not selected:
-            raise GraphValidationError("execution plan must contain at least one node")
-        if any(not isinstance(node_id, str) or not node_id for node_id in selected):
-            raise TypeError("plan node IDs must be non-empty strings")
         if not self._frozen:
             self.freeze(policies)
-
-        unknown = selected - set(self._nodes)
-        if unknown:
-            raise GraphValidationError(
-                f"execution plan references unknown nodes: {sorted(unknown)!r}"
-            )
-        if self.entrypoint not in selected:
-            raise GraphValidationError(
-                f"execution plan must contain graph entrypoint {self.entrypoint!r}"
-            )
-
-        edges = tuple(
-            edge
-            for edge in self._edges
-            if edge.source in selected and edge.target in selected
-        )
-        adjacency: dict[str, set[str]] = defaultdict(set)
-        incoming_ports: dict[str, set[str]] = defaultdict(set)
-        outgoing: dict[tuple[str, str], list[Edge]] = defaultdict(list)
-        for edge in edges:
-            adjacency[edge.source].add(edge.target)
-            incoming_ports[edge.target].add(edge.target_port)
-            outgoing[(edge.source, edge.source_port)].append(edge)
-
-        reachable = self._reachable(adjacency)
-        unreachable = selected - reachable
-        if unreachable:
-            raise GraphValidationError(
-                "execution plan nodes are unreachable from entrypoint using original "
-                f"edges: {sorted(unreachable)!r}"
-            )
-        for node_id in selected:
-            spec = self._node_specs[node_id]
-            if (
-                node_id == self.entrypoint
-                or spec.input_policy.ref.name != "interlace.core/all"
-            ):
-                continue
-            missing = set(spec.input_ports) - incoming_ports[node_id]
-            if missing:
-                raise GraphValidationError(
-                    f"execution plan leaves ALL node {node_id!r} without inputs: "
-                    f"{sorted(missing)!r}"
-                )
-
-        return ExecutionPlan(
-            self,
-            self.entrypoint,
-            selected,
-            edges,
-            MappingProxyType({key: tuple(value) for key, value in outgoing.items()}),
-        )
+        return ExecutionPlan(self, include)
 
     def freeze(self, policies: PolicyRegistry | None = None) -> Graph:
         """校验并冻结 Graph。
@@ -467,7 +487,6 @@ class Graph:
                     raise GraphValidationError(
                         f"node {node_id!r} timeout must be finite and greater than zero"
                     )
-            self._validate_execute_style(node_id, node)
             try:
                 bound_policy = policies.bind(policy)
             except (TypeError, ValueError) as exc:
@@ -521,26 +540,6 @@ class Graph:
                     f"{sorted(missing)!r}"
                 )
         self._node_specs = specs
-
-    @staticmethod
-    def _validate_execute_style(node_id: str, node: Node) -> None:
-        """保证 Node 类型与 execute 的同步风格一致。
-
-        Args:
-            node_id: 用于错误定位的 Node ID。
-            node: 等待校验的 Node。
-
-        Raises:
-            GraphValidationError: Graph 定义不符合冻结或执行约束。
-        """
-
-        execute = type(node).execute
-        asynchronous = iscoroutinefunction(execute)
-        if isinstance(node, AsyncNode) != asynchronous:
-            expected = "async" if isinstance(node, AsyncNode) else "sync"
-            raise GraphValidationError(
-                f"node {node_id!r} must implement {expected} execute()"
-            )
 
     @staticmethod
     def _validate_policy(

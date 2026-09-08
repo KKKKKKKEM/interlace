@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Mapping
 from typing import Any, cast
 from threading import Lock, current_thread
 
 import pytest
 
 from interlace import (
-    AsyncNode,
     Context,
     Event,
     Graph,
@@ -27,7 +27,8 @@ from interlace.engine.errors import (
     InvalidOutputError,
     PortValueTypeError,
 )
-from interlace.runtime import GraphWorker
+from interlace.runtime import GraphWorker, LocalRuntimePlugin
+from interlace.spi import Work
 
 
 class Split(Node):
@@ -681,7 +682,7 @@ def test_runtime_classifies_invalid_node_results(node: str) -> None:
             del inputs, context
             return cast(Any, 1)  # 验证同步 Node 的非法返回值。
 
-    class InvalidAsync(AsyncNode):
+    class InvalidAsync(Node):
         """当前契约测试使用的 InvalidAsync 替代实现。
 
         Attributes:
@@ -1000,7 +1001,7 @@ def test_queue_concurrency_limits_graph_executions() -> None:
     maximum = 0
     lock = Lock()
 
-    class Slow(AsyncNode):
+    class Slow(Node):
         """当前契约测试使用的 Slow 替代实现。
 
         Attributes:
@@ -1199,7 +1200,7 @@ def test_default_slot_pool_matches_consumer_concurrency() -> None:
     maximum = 0
     lock = Lock()
 
-    class Capture(AsyncNode):
+    class Capture(Node):
         """当前契约测试使用的 Capture 替代实现。
 
         Attributes:
@@ -1532,7 +1533,7 @@ def test_shared_pool_works_when_consumer_and_slot_sizes_differ() -> None:
     maximum = 0
     lock = Lock()
 
-    class Slow(AsyncNode):
+    class Slow(Node):
         """当前契约测试使用的 Slow 替代实现。
 
         Attributes:
@@ -1757,3 +1758,162 @@ def test_runtime_reports_incomplete_join() -> None:
         runtime.register("incomplete.graph", graph)
         with pytest.raises(IncompleteInputsError):
             runtime.run("incomplete.graph", 1)
+
+
+def test_mixed_node_styles_preserve_outputs_events_options_and_slot() -> None:
+    """同图混合同步和异步方法，共享数据流和 Slot，并保留跨图配置隔离。"""
+
+    seen_slots: list[Slot] = []
+    seen_options: list[dict[str, Any]] = []
+
+    def record(stage: str, context: Context) -> None:
+        """记录节点上下文，并验证本次 firing 的配置是独立副本。
+
+        Args:
+            stage: 当前节点在逻辑执行链中的名称。
+            context: 当前节点得到的配置和 Slot 上下文。
+        """
+
+        assert context.options == {"pipeline.rules": ["initial"]}
+        assert context.slot is not None
+        seen_options.append({"pipeline.rules": list(context.options["pipeline.rules"])})
+        context.options["pipeline.rules"].append(stage)
+        context.slot.setdefault("stages", []).append(stage)
+        seen_slots.append(context.slot)
+
+    class Immediate(Node):
+        """执行混合图第一步的同步节点。"""
+
+        input_ports = Ports(value=int)  # 当前图的整数入口。
+        output_ports = Ports(value=int)  # 发往异步节点的整数输出。
+
+        def execute(self, inputs: Mapping[str, Any], context: Context) -> Output:
+            """记录同步阶段并沿 Edge 传递加一结果。
+
+            Args:
+                inputs: value 端口的当前整数。
+                context: 当前 execution 的隔离配置和共享 Slot。
+
+            Returns:
+                加一后的整数输出。
+            """
+
+            record("sync", context)
+            return Output(inputs["value"] + 1, "value")
+
+    class Asynchronous(Node):
+        """通过协程方法执行混合图第二步的节点。"""
+
+        input_ports = Ports(value=int)  # 上游同步节点的整数结果。
+        output_ports = Ports(value=int)  # 发往 Awaitable 节点的整数输出。
+
+        async def execute(self, inputs: Mapping[str, Any], context: Context) -> Output:
+            """等待后记录异步阶段，并继续使用相同数据流契约。
+
+            Args:
+                inputs: value 端口的上游整数。
+                context: 当前 execution 的隔离配置和共享 Slot。
+
+            Returns:
+                扩大两倍后的整数输出。
+            """
+
+            await asyncio.sleep(0)
+            record("async", context)
+            return Output(inputs["value"] * 2, "value")
+
+    class Deferred(Node):
+        """由同步方法返回协程，完成原图输出并发布跨图事件。"""
+
+        input_ports = Ports(value=int)  # 上游协程节点的整数结果。
+        output_ports = Ports(value=int)  # 无下游 Edge 的原图终端结果。
+
+        def execute(
+            self, inputs: Mapping[str, Any], context: Context
+        ) -> Awaitable[Output]:
+            """构造由 Engine 等待的本次异步处理协程。
+
+            Args:
+                inputs: value 端口的上游整数。
+                context: 当前 execution 的隔离配置和共享 Slot。
+
+            Returns:
+                发布事件并返回终端输出的协程。
+            """
+
+            async def complete() -> Output:
+                """在 Awaitable 完成前显式发布独立的跨图事实。
+
+                Returns:
+                    原图最终的加一输出。
+                """
+
+                await asyncio.sleep(0)
+                record("awaitable", context)
+                value = inputs["value"] + 1
+                context.emit("mixed.completed", value)
+                return Output(value, "value")
+
+            return complete()
+
+    class FollowUp(Node):
+        """在第二张图中验证事件输入、空配置和同一个 Slot。"""
+
+        input_ports = Ports(value=int)  # 已接受跨图事件的整数 payload。
+        output_ports = Ports(value=int)  # 第二张图独立产生的终端结果。
+
+        async def execute(self, inputs: Mapping[str, Any], context: Context) -> Output:
+            """继续原 Slot 逻辑链，但使用新的 execution 配置。
+
+            Args:
+                inputs: value 端口接收的事件 payload。
+                context: 目标图自己的配置和延续自源图的 Slot。
+
+            Returns:
+                原样交付的事件输入。
+            """
+
+            await asyncio.sleep(0)
+            assert context.options == {}
+            assert context.slot is not None
+            assert context.slot["stages"] == ["sync", "async", "awaitable"]
+            context.slot["stages"].append("target")
+            seen_slots.append(context.slot)
+            return Output(inputs["value"], "value")
+
+    graph = (
+        Graph(entrypoint="first")
+        .add(first=Immediate(), second=Asynchronous(), third=Deferred())
+        .connect("first", "second", source_port="value", target_port="value")
+        .connect("second", "third", source_port="value", target_port="value")
+    )
+    tasks = memory.TaskBackend()
+    slots = SlotPool(1)
+    options = {"pipeline.rules": ["initial"]}
+    work = Work("mixed", 3, options=options)
+    options["pipeline.rules"].append("caller change")
+    try:
+        with Runtime(plugins=[LocalRuntimePlugin(tasks=tasks)]) as runtime:
+            runtime.register("mixed", graph)
+            runtime.register("follow", Graph(entrypoint="node").add(node=FollowUp()))
+            runtime.consume("source", slots=slots)
+            runtime.on("mixed.completed", graph="follow", queue="target", slots=slots)
+            tasks.submit("source", work)
+            runtime.wait_idle(2)
+            source = next(
+                item for item in runtime.executions() if item.graph == "mixed"
+            )
+            target = next(
+                item for item in runtime.executions() if item.graph == "follow"
+            )
+            assert source.result() == target.result() == (Output(9, "value"),)
+            assert source.steps == 3
+            assert target.steps == 1
+            assert slots.available == 1
+    finally:
+        tasks.close()
+        slots.close()
+
+    assert seen_options == [{"pipeline.rules": ["initial"]}] * 3
+    assert len(seen_slots) == 4
+    assert all(slot is seen_slots[0] for slot in seen_slots)

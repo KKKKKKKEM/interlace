@@ -1,6 +1,7 @@
 """独立本地适配器仅使用公共 Slot 能力的契约测试。"""
 
 from collections import deque
+from collections.abc import Callable
 from contextlib import contextmanager
 
 import pytest
@@ -169,7 +170,7 @@ class PumpTasks:
 
         return not self.queued
 
-    def bind(self, queue, handler, *, concurrency, slots=None):
+    def bind(self, queue, handler, *, concurrency, slots=None) -> Callable[[], None]:
         """绑定消费通道及其处理器和本地并发配置。
 
         Args:
@@ -177,12 +178,26 @@ class PumpTasks:
             handler: 接收事件或投递的处理函数。
             concurrency: 当前消费者允许并行执行的完整 Graph 数量。
             slots: 提供本地执行槽的资源池能力。
+
+        Returns:
+            注销本次消费者及其资源通知的幂等函数。
         """
 
         assert concurrency == 1
         assert slots is not None
-        self.consumers[queue] = (handler, slots)
-        self.detachers.append(slots.subscribe_available(self.available))
+        registration = (handler, slots)
+        self.consumers[queue] = registration
+        detach = slots.subscribe_available(self.available)
+        self.detachers.append(detach)
+
+        def unbind() -> None:
+            """移除本次消费者及资源通知。"""
+
+            if self.consumers.get(queue) is registration:
+                del self.consumers[queue]
+                detach()
+
+        return unbind
 
     def available(self):
         """返回当前可申请的执行槽数量。"""

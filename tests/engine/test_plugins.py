@@ -10,8 +10,8 @@ from interlace import Graph, Node, Output, Ports, Runtime
 from interlace.adapters import memory
 from interlace.engine.executor import Engine
 from interlace.engine.hooks import NodeCall
-from interlace.engine.observation import RuntimeEvent
-from interlace.engine.policies import PolicyRef
+from interlace.engine.observation import ObservationHub, RuntimeEvent, RuntimeEventKind
+from interlace.engine.policies import PolicyRef, PolicyRegistry
 from interlace.plugins import (
     CAP_EVENT_BUS,
     CAP_EVENT_ROUTER,
@@ -26,7 +26,7 @@ from interlace.plugins import (
     PluginDescriptor,
     PluginHost,
 )
-from interlace.runtime import LocalRuntimePlugin
+from interlace.runtime import EventRouter, GraphWorker, LocalRuntimePlugin
 
 
 def test_multiple_plugins_can_contribute_each_extension_kind() -> None:
@@ -363,8 +363,13 @@ def test_host_rejects_missing_cycle_and_capability_conflict() -> None:
         PluginHost((first, second)).start()
 
 
-def test_host_rejects_incompatible_plugin_api() -> None:
-    """验证宿主拒绝不兼容的插件 SPI 版本。"""
+@pytest.mark.parametrize("api_version", ["1", "3"])
+def test_host_rejects_incompatible_plugin_api(api_version: str) -> None:
+    """验证宿主同时拒绝旧版和未来的插件 SPI。
+
+    Args:
+        api_version: 当前宿主不支持的 SPI 主版本。
+    """
 
     class FuturePlugin:
         """当前契约测试使用的 FuturePlugin 替代实现。
@@ -373,7 +378,9 @@ def test_host_rejects_incompatible_plugin_api() -> None:
             descriptor: 插件身份、依赖和能力声明。
         """
 
-        descriptor = PluginDescriptor("example/future", "1.0.0", api_version="2")
+        descriptor = PluginDescriptor(
+            "example/incompatible", "1.0.0", api_version=api_version
+        )
 
         def setup(self, context):
             """在插件装配阶段登记声明的能力或贡献。
@@ -402,7 +409,7 @@ def test_host_rejects_incompatible_plugin_api() -> None:
 
             del context
 
-    with pytest.raises(ValueError, match="requires API 2"):
+    with pytest.raises(ValueError, match=f"requires API {api_version}"):
         PluginHost((FuturePlugin(),))
 
 
@@ -699,9 +706,7 @@ def test_runtime_installs_extension_contributions_before_graph_freeze() -> None:
         selectors={"example.plugin/any": AnySelector()},
         hooks={
             "example.plugin/uppercase": NodeHookContribution(
-                lambda call, outputs: tuple(
-                    Output(item.value.upper(), item.port) for item in outputs
-                ),
+                lambda call, output: Output(output.value.upper(), output.port),
                 phase="exit",
                 graph="work.graph",
                 node="target",
@@ -732,6 +737,209 @@ def test_default_runtime_is_composed_by_the_builtin_plugin() -> None:
         assert runtime.plugin_host.descriptors == (LocalRuntimePlugin.descriptor,)
 
 
+@pytest.mark.parametrize("scoped", [False, True])
+@pytest.mark.parametrize("fail_start", [False, True])
+def test_host_releases_contributed_hooks_from_injected_executor(
+    scoped: bool, fail_start: bool
+) -> None:
+    """验证关闭与启动回滚都会卸载注入执行器上的即时及延迟 Hook。
+
+    Args:
+        scoped: 是否在 Graph 注册前贡献指定节点的延迟 Hook。
+        fail_start: 是否在绑定 Hook 后模拟插件启动失败。
+    """
+
+    executor = Engine()
+    contributions = ContributionPlugin(
+        "example/hooks",
+        hooks={
+            "example/uppercase": NodeHookContribution(
+                lambda call, output: Output(output.value.upper(), output.port),
+                phase="exit",
+                graph="work" if scoped else None,
+                node="node" if scoped else None,
+            )
+        },
+    )
+
+    class RegisterGraph(RecordingPlugin):
+        """在启动期间触发延迟 Hook 绑定的测试插件。"""
+
+        def start(self, context) -> None:
+            """注册 Graph 以触发延迟 Hook，然后按用例决定是否失败。
+
+            Args:
+                context: 宿主提供的能力注册上下文。
+
+            Raises:
+                RuntimeError: 当前用例要求模拟启动失败。
+            """
+
+            worker = context.require(CAP_GRAPH_WORKER)
+            worker.register("work", Graph(entrypoint="node").add(node=Source()))
+            if fail_start:
+                raise RuntimeError("after hook binding")
+
+    plugins = (
+        LocalRuntimePlugin(executor=executor),
+        contributions,
+        RegisterGraph("example/register", []),
+    )
+    try:
+        if fail_start:
+            with pytest.raises(RuntimeError, match="after hook binding"):
+                Runtime(plugins=plugins)
+        else:
+            with Runtime(plugins=plugins) as runtime:
+                assert runtime.run("work", "hello") == (Output("HELLO", "value"),)
+        with Runtime(plugins=(LocalRuntimePlugin(executor=executor),)) as runtime:
+            runtime.register("work", Graph(entrypoint="node").add(node=Source()))
+            assert runtime.run("work", "hello") == (Output("hello", "value"),)
+    finally:
+        executor.close()
+
+
+def test_standard_contributions_require_runtime_roles() -> None:
+    """验证独立宿主不会静默接受缺少消费角色的标准贡献。"""
+
+    plugin = ContributionPlugin(
+        "example/observer", observers={"example/trace": lambda event: None}
+    )
+    with pytest.raises(LookupError, match="graph-worker.*unavailable"):
+        PluginHost((plugin,)).start()
+
+
+def test_host_releases_selectors_from_shared_policy_registry() -> None:
+    """验证启动回滚和正常关闭均移除共享注册表中的本次 selector 贡献。"""
+
+    policies = PolicyRegistry()
+    tasks = memory.TaskBackend()
+
+    class Roles(RecordingPlugin):
+        """通过闭包提供每轮独立角色和共享 selector 注册表。"""
+
+        def setup(self, context) -> None:
+            """提供本轮角色，selector 由宿主随后统一安装。
+
+            Args:
+                context: 宿主提供的 capability 注册上下文。
+            """
+
+            context.provide(CAP_EVENT_ROUTER, router)
+            context.provide(CAP_GRAPH_WORKER, worker)
+
+        def start(self, context) -> None:
+            """冻结依赖贡献的 Graph，并按用例要求模拟启动失败。
+
+            Args:
+                context: 宿主提供的 capability 注册上下文。
+
+            Raises:
+                RuntimeError: 当前轮次要求模拟启动失败。
+            """
+
+            del context
+            worker.register("work", Graph(entrypoint="node").add(node=Target()))
+            if fail_start:
+                raise RuntimeError("selector consumer failed")
+
+        def stop(self, context) -> None:
+            """关闭本轮创建的角色，保留调用方共享资源。
+
+            Args:
+                context: 宿主提供的 capability 注册上下文。
+            """
+
+            del context
+            worker.close()
+            router.close()
+
+    try:
+        for fail_start in (True, False):
+            router = EventRouter(publisher=tasks)
+            worker = GraphWorker(consumer=tasks, policies=policies)
+            roles = Roles("example/roles", [])
+            roles.descriptor = PluginDescriptor(
+                "example/roles", "1", provides=(CAP_EVENT_ROUTER, CAP_GRAPH_WORKER)
+            )
+            plugin = ContributionPlugin(
+                "example/policy", selectors={"example.plugin/any": AnySelector()}
+            )
+            if fail_start:
+                with pytest.raises(RuntimeError, match="selector consumer failed"):
+                    Runtime(plugins=(roles, plugin))
+            else:
+                with Runtime(plugins=(roles, plugin)) as runtime:
+                    assert runtime.run("work", "hello") == (Output("hello", "value"),)
+            with pytest.raises(ValueError, match="not registered"):
+                policies.bind(PolicyRef("example.plugin/any"))
+    finally:
+        tasks.close()
+
+
+def test_selector_detach_preserves_frozen_graph_and_later_registration() -> None:
+    """验证旧注销函数不删除后续同名注册，已冻结 Graph 保留选择器快照。"""
+
+    policies = PolicyRegistry()
+    selector = AnySelector()
+    detach = policies.register("example.plugin/any", selector)
+    graph = Graph(entrypoint="node").add(node=Target()).freeze(policies)
+    detach()
+    with pytest.raises(ValueError, match="not registered"):
+        policies.bind(PolicyRef("example.plugin/any"))
+    replacement = policies.register("example.plugin/any", selector)
+    detach()
+    assert policies.bind(PolicyRef("example.plugin/any")).selector is selector
+    replacement()
+    replacement()
+    with Runtime() as runtime:
+        runtime.register("work", graph)
+        assert runtime.run("work", "hello") == (Output("hello", "value"),)
+
+
+def test_contribution_installation_failure_removes_observer_registrations() -> None:
+    """验证中途安装贡献失败时撤销已经安装到调用方观察中心的注册。"""
+
+    observed: list[RuntimeEvent] = []
+    router_hub, worker_hub = ObservationHub(), ObservationHub()
+    tasks = memory.TaskBackend()
+    router = EventRouter(publisher=tasks, observations=router_hub)
+    worker = GraphWorker(consumer=tasks, observations=worker_hub)
+
+    class Roles(RecordingPlugin):
+        """向宿主提供调用方创建的两个角色。"""
+
+        def setup(self, context) -> None:
+            """提供使用独立观察中心的角色。
+
+            Args:
+                context: 宿主提供的能力注册上下文。
+            """
+
+            context.provide(CAP_EVENT_ROUTER, router)
+            context.provide(CAP_GRAPH_WORKER, worker)
+
+    roles = Roles("example/roles", [])
+    roles.descriptor = PluginDescriptor(
+        "example/roles", "1", provides=(CAP_EVENT_ROUTER, CAP_GRAPH_WORKER)
+    )
+    contributions = ContributionPlugin(
+        "example/observers",
+        observers={"example/first": observed.append, "example/invalid": object()},
+    )
+    try:
+        with pytest.raises(TypeError, match="runtime observer must be callable"):
+            Runtime(plugins=(roles, contributions))
+        event = RuntimeEvent(RuntimeEventKind.EVENT_PUBLISHED, event_type="example")
+        router_hub.publish(event)
+        worker_hub.publish(event)
+        assert observed == []
+    finally:
+        worker.close()
+        router.close()
+        tasks.close()
+
+
 def test_custom_infrastructure_uses_the_same_local_plugin_path() -> None:
     """验证自定义底层能力使用相同的默认插件装配路径。"""
 
@@ -744,7 +952,9 @@ def test_custom_infrastructure_uses_the_same_local_plugin_path() -> None:
         assert runtime.plugin_host is not None
         assert runtime.plugin_host.require("interlace.runtime/event-bus") is events
         assert runtime.plugin_host.require("interlace.runtime/task-backend") is tasks
-        assert runtime.plugin_host.require("interlace.runtime/graph-executor") is executor
+        assert (
+            runtime.plugin_host.require("interlace.runtime/graph-executor") is executor
+        )
 
     # 注入资源仍由调用方持有，与旧的角色构造器所有权约定一致。
     assert not events._closed

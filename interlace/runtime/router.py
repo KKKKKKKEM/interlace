@@ -44,6 +44,7 @@ class EventRouter:
         _close_injected: 是否负责关闭调用方注入的底层组件。
         _observations: 当前组件的只读生命周期事件分发中心。
         _routes: 已注册的事件到 Graph 路由关系。
+        _subscriptions: 当前角色拥有的事件订阅注销函数。
         _lock: 保护当前组件共享状态的进程内互斥锁。
         _closed: 当前组件是否已停止接受新工作。
     """
@@ -80,6 +81,7 @@ class EventRouter:
         self._close_injected = close_injected
         self._observations = ObservationHub() if observations is None else observations
         self._routes: set[tuple[str, str, str]] = set()
+        self._subscriptions: list[Callable[[], None]] = []
         self._lock = RLock()
         self._closed = False
 
@@ -111,7 +113,9 @@ class EventRouter:
         event_type = require_non_empty_string(event_type, "subscription event type")
         if not callable(handler):
             raise TypeError("event handler must be callable")
-        self._events.subscribe(event_type, handler)
+        with self._lock:
+            self._ensure_open()
+            self._subscriptions.append(self._events.subscribe(event_type, handler))
         return self
 
     def observe_runtime(self, observer: RuntimeObserver) -> ObserverHandle:
@@ -164,14 +168,16 @@ class EventRouter:
         else:
             subscription = require_non_empty_string(subscription, "route subscription")
         with self._lock:
+            self._ensure_open()
             route = (event_type, graph, queue)
             if route in self._routes:
                 raise InterlaceRuntimeError(f"duplicate event route {route!r}")
-            self._events.subscribe(
+            unsubscribe = self._events.subscribe(
                 event_type,
                 partial(self._submit, graph, queue, limits),
                 subscription=subscription,
             )
+            self._subscriptions.append(unsubscribe)
             self._routes.add(route)
         return self
 
@@ -250,13 +256,21 @@ class EventRouter:
         with self._lock:
             if self._closed:
                 return
+            self._closed = True
+            subscriptions = tuple(reversed(self._subscriptions))
+            self._subscriptions.clear()
         failure: BaseException | None = None
+        for unsubscribe in subscriptions:
+            try:
+                unsubscribe()
+            except Exception as exc:  # noqa: BLE001
+                if failure is None:
+                    failure = exc
         try:
             self.wait_idle()
         except Exception as exc:  # noqa: BLE001
-            failure = exc
-        with self._lock:
-            self._closed = True
+            if failure is None:
+                failure = exc
         components = (
             _unique(self._events, self._publisher)
             if self._close_injected
@@ -266,7 +280,7 @@ class EventRouter:
         if failure is not None:
             raise failure
 
-    def __enter__(self):
+    def __enter__(self) -> EventRouter:
         """进入资源作用域并返回当前句柄。
 
         Returns:

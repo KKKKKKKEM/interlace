@@ -3,7 +3,15 @@
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Callable, Iterable, Iterator, Mapping, MutableMapping
+from collections.abc import (
+    Callable,
+    Generator,
+    Iterable,
+    Iterator,
+    Mapping,
+    MutableMapping,
+)
+from contextlib import closing, contextmanager
 from types import MappingProxyType
 from typing import Any
 
@@ -29,7 +37,6 @@ from .hooks import (
     HookRegistry,
     NodeCall,
     NodeHook,
-    Outputs,
     ShortCircuit,
     StopGraph,
 )
@@ -270,16 +277,53 @@ class Engine:
             try:
                 with execution.step(node_id):
                     try:
-                        outputs = self._call_node(
-                            graph_name,
-                            node_id,
-                            node,
-                            MappingProxyType(consumed),
-                            context,
-                            hooks_by_node[node_id],
-                            spec.input_ports,
-                            execution,
-                        )
+                        with closing(
+                            self._call_node(
+                                graph_name,
+                                node_id,
+                                node,
+                                MappingProxyType(consumed),
+                                context,
+                                hooks_by_node[node_id],
+                                spec.input_ports,
+                                execution,
+                            )
+                        ) as outputs:
+                            for output in outputs:
+                                declared = spec.output_ports
+                                if output.port not in declared:
+                                    raise InvalidOutputError(
+                                        f"node {node_id!r} produced unknown port {output.port!r}",
+                                        graph=graph_name,
+                                        node=node_id,
+                                    )
+                                expected = declared[output.port]
+                                if not isinstance(output.value, expected):
+                                    raise PortValueTypeError(
+                                        f"node {node_id!r} output {output.port!r} expected "
+                                        f"{expected.__name__}, got {type(output.value).__name__}",
+                                        graph=graph_name,
+                                        node=node_id,
+                                    )
+                                edges = outgoing_for(node_id, output.port)
+                                if not edges:
+                                    execution.publish_output(output)
+                                    continue
+                                for edge in edges:
+                                    target_type = specs[edge.target].input_ports[
+                                        edge.target_port
+                                    ]
+                                    if not isinstance(output.value, target_type):
+                                        raise PortValueTypeError(
+                                            f"edge target {edge.target}.{edge.target_port} "
+                                            f"expected {target_type.__name__}",
+                                            graph=graph_name,
+                                            node=node_id,
+                                        )
+                                    queues[edge.target][edge.target_port].append(
+                                        output.value
+                                    )
+                                    schedule_if_ready(edge.target)
                     except ShortCircuit as exc:
                         raise HookExecutionError(
                             "ShortCircuit is only valid during hook enter",
@@ -287,11 +331,15 @@ class Engine:
                             node=node_id,
                         ) from exc
             except StopGraph as signal:
-                outputs = self._coerce_outputs(
-                    signal.outputs, graph_name, None, "StopGraph"
-                )
-                for output in outputs:
-                    execution.publish_output(output)
+                try:
+                    with self._coerce_outputs(
+                        signal.outputs, graph_name, None, "StopGraph", execution
+                    ) as stopped:
+                        for output in stopped:
+                            execution.publish_output(output)
+                except BaseException as exc:
+                    node_error = exc
+                    raise
                 return
             except BaseException as exc:
                 node_error = exc
@@ -310,38 +358,6 @@ class Engine:
                         attributes={"step": execution.steps},
                     )
                 )
-            for output in outputs:
-                declared = spec.output_ports
-                if output.port not in declared:
-                    raise InvalidOutputError(
-                        f"node {node_id!r} produced unknown port {output.port!r}",
-                        graph=graph_name,
-                        node=node_id,
-                    )
-                expected = declared[output.port]
-                if not isinstance(output.value, expected):
-                    raise PortValueTypeError(
-                        f"node {node_id!r} output {output.port!r} expected "
-                        f"{expected.__name__}, got {type(output.value).__name__}",
-                        graph=graph_name,
-                        node=node_id,
-                    )
-                edges = outgoing_for(node_id, output.port)
-                if not edges:
-                    execution.publish_output(output)
-                    continue
-                for edge in edges:
-                    target_type = specs[edge.target].input_ports[edge.target_port]
-                    if not isinstance(output.value, target_type):
-                        raise PortValueTypeError(
-                            f"edge target {edge.target}.{edge.target_port} "
-                            f"expected {target_type.__name__}",
-                            graph=graph_name,
-                            node=node_id,
-                        )
-                    queues[edge.target][edge.target_port].append(output.value)
-                    schedule_if_ready(edge.target)
-
             # 每轮只消费一组输入，避免活跃循环使其他节点长期无法执行。
             schedule_if_ready(node_id)
 
@@ -370,8 +386,8 @@ class Engine:
         hooks: tuple[NodeHook, ...],
         input_ports: Mapping[str, type[Any]],
         execution: Execution,
-    ) -> tuple[Output, ...]:
-        """在 Hook 生命周期内调用 Node，并保留原始异常供 error 处理。
+    ) -> Generator[Output, None, None]:
+        """在 Hook 输出管道内惰性读取 Node，并按作用域清理迭代器。
 
         Args:
             graph_name: 执行或观测记录中的 Graph 注册名称。
@@ -383,8 +399,8 @@ class Engine:
             input_ports: 节点声明的输入端口集合。
             execution: 记录当前执行状态、控制限制及输出的句柄。
 
-        Returns:
-            符合声明端口契约的 Output 集合。
+        Yields:
+            经 Hook 转换并逐项读取的 Output。
 
         Raises:
             ExecutionError: Graph 或节点执行未能完成。
@@ -392,15 +408,55 @@ class Engine:
 
         original = NodeCall(graph_name, node_id, node, inputs, context)
 
-        def invoke(index: int, call: NodeCall) -> Outputs:
+        def produce(value: object, source: str) -> Generator[Output, None, None]:
+            """按需读取并及时关闭当前输出流，不保留已经耗尽的流。
+
+            Args:
+                value: 待规范化的节点或 Hook 返回值。
+                source: 用于错误归属的来源名称。
+
+            Yields:
+                当前源逐项产生的合法 Output。
+            """
+
+            with self._coerce_outputs(
+                value, graph_name, node_id, source, execution
+            ) as outputs:
+                yield from outputs
+
+        def recover(
+            outputs: Generator[Output, None, None], hook: NodeHook, call: NodeCall
+        ) -> Generator[Output, None, None]:
+            """将内层迭代失败交给当前 Hook，已经交付的前缀不重放。
+
+            Args:
+                outputs: 内层输出流。
+                hook: 当前作用域的错误处理 Hook。
+                call: 当前 Hook 已接受的调用参数。
+
+            Yields:
+                内层输出或普通异常恢复后的输出。
+            """
+
+            with closing(outputs):
+                try:
+                    yield from outputs
+                except ExecutionControlError:
+                    raise
+                except Exception as error:
+                    yield from produce(
+                        self._resolve(hook.error(call, error), execution), "Hook"
+                    )
+
+        def invoke(index: int, call: NodeCall) -> Generator[Output, None, None]:
             """在输入与控制约束下调用当前节点的执行方法。
 
             Args:
                 index: 条目的索引或切片。
                 call: Hook 当前处理的节点调用记录。
 
-            Returns:
-                符合声明端口契约的 Output。
+            Yields:
+                内层输出经过当前 Hook 逐项转换的结果。
 
             Raises:
                 HookExecutionError: Hook 的调用或返回结果违反约束。
@@ -409,45 +465,37 @@ class Engine:
             if index == len(hooks):
                 try:
                     result = self._resolve(
-                        node.execute(call.inputs, context),
-                        execution,
+                        node.execute(call.inputs, context), execution
                     )
+                    yield from produce(result, "Node")
                 except (ShortCircuit, StopGraph) as signal:
                     raise HookExecutionError(
                         f"{type(signal).__name__} can only be raised by a hook",
                         graph=graph_name,
                         node=node_id,
                     ) from signal
-                return self._coerce_outputs(result, graph_name, node_id, "Node")
+                return
 
             hook = hooks[index]
             try:
                 entered = self._resolve(hook.enter(call), execution)
             except ShortCircuit as signal:
-                outputs = self._coerce_outputs(
-                    signal.outputs, graph_name, node_id, "ShortCircuit"
+                entered = call
+                guarded = produce(signal.outputs, "ShortCircuit")
+            else:
+                entered = self._validate_hook_call(
+                    original, entered, input_ports, graph_name, node_id
                 )
-                return self._resolve_hook_outputs(
-                    hook.exit(call, outputs), graph_name, node_id, execution
-                )
-
-            entered = self._validate_hook_call(
-                original, entered, input_ports, graph_name, node_id
-            )
-            try:
-                outputs = invoke(index + 1, entered)
-            except ExecutionControlError:
-                raise
-            except Exception as error:  # noqa: BLE001
-                outputs = self._resolve_hook_outputs(
-                    hook.error(entered, error), graph_name, node_id, execution
-                )
-            return self._resolve_hook_outputs(
-                hook.exit(entered, outputs), graph_name, node_id, execution
-            )
+                inner = invoke(index + 1, entered)
+                guarded = recover(inner, hook, entered)
+            with closing(guarded):
+                for output in guarded:
+                    yield from produce(
+                        self._resolve(hook.exit(entered, output), execution), "Hook"
+                    )
 
         try:
-            return invoke(0, original)
+            yield from invoke(0, original)
         except ExecutionError:
             raise
         except (ShortCircuit, StopGraph):
@@ -458,28 +506,6 @@ class Engine:
                 graph=graph_name,
                 node=node_id,
             ) from exc
-
-    def _resolve_hook_outputs(
-        self,
-        value: object,
-        graph_name: str,
-        node_id: str,
-        execution: Execution,
-    ) -> Outputs:
-        """解析 Hook 输出并校验输出类型和端口契约。
-
-        Args:
-            value: 当前节点或 Hook 产生的待解析返回值。
-            graph_name: 执行或观测记录中的 Graph 注册名称。
-            node_id: Graph 内绑定的节点 ID。
-            execution: 记录当前执行状态、控制限制及输出的句柄。
-
-        Returns:
-            符合声明端口契约的 Output。
-        """
-
-        resolved = self._resolve(value, execution)
-        return self._coerce_outputs(resolved, graph_name, node_id, "Hook")
 
     def _resolve(self, value: object, execution: Execution) -> object:
         """通过调用运行器解析同步值或等待异步结果。
@@ -499,44 +525,74 @@ class Engine:
         )
 
     @staticmethod
+    @contextmanager
     def _coerce_outputs(
         result: object,
         graph_name: str,
         node_id: str | None,
         source: str,
-    ) -> Outputs:
-        """规范化节点返回值，拒绝不符合 Output 契约的内容。
+        execution: Execution,
+    ) -> Iterator[Iterator[Output]]:
+        """接管输出源并提供受控迭代器，退出时关闭源而无需耗尽它。
 
         Args:
             result: 待解析或校验的节点执行结果。
             graph_name: 执行或观测记录中的 Graph 注册名称。
             node_id: Graph 内绑定的节点 ID。
             source: 源节点、原始对象或待转换数据。
+            execution: 提供取消、整图和节点时限检查的执行句柄。
 
-        Returns:
-            符合声明端口契约的 Output。
+        Yields:
+            每次只读取一项、检查取消和类型的迭代器。
 
         Raises:
-            ExecutionError: Graph 或节点执行未能完成。
             InvalidOutputError: 节点输出不符合 Output 契约。
         """
 
         try:
-            return tuple(Engine._iter_outputs(result))
-        except ExecutionError:
-            raise
+            iterator = Engine._iter_outputs(result)
         except TypeError as exc:
             raise InvalidOutputError(
                 f"{source} returned invalid output: {exc}",
                 graph=graph_name,
                 node=node_id,
             ) from exc
-        except Exception as exc:
-            raise ExecutionError(
-                f"{source} failed while producing output: {exc}",
-                graph=graph_name,
-                node=node_id,
-            ) from exc
+
+        def checked() -> Generator[Output, None, None]:
+            """在每次推进前后检查控制条件，并拒绝非法输出对象。
+
+            Yields:
+                当前源下一项合法 Output。
+
+            Raises:
+                InvalidOutputError: 源迭代器产生了非 Output 对象。
+            """
+
+            while True:
+                execution.checkpoint()
+                try:
+                    output = next(iterator)
+                except StopIteration:
+                    return
+                execution.checkpoint()
+                if not isinstance(output, Output):
+                    raise InvalidOutputError(
+                        f"{source} output iterable must contain only Output",
+                        graph=graph_name,
+                        node=node_id,
+                    )
+                yield output
+
+        stream = checked()
+        try:
+            yield stream
+        finally:
+            try:
+                stream.close()
+            finally:
+                close = getattr(iterator, "close", None)
+                if close is not None:
+                    close()
 
     @staticmethod
     def _validate_hook_call(
@@ -598,8 +654,8 @@ class Engine:
         return modified
 
     @staticmethod
-    def _iter_outputs(result: object) -> Iterator[Output]:
-        """把 Node 返回值规范化为按顺序校验的 Output 迭代器。
+    def _iter_outputs(result: object) -> Iterator[object]:
+        """取得返回值的原始迭代器，逐项校验由消费边界负责。
 
         Args:
             result: 待解析或校验的节点执行结果。
@@ -620,22 +676,7 @@ class Engine:
         ):
             raise TypeError("Node must return Output, Iterable[Output], or None")
 
-        def validated() -> Iterator[Output]:
-            """逐项校验输出类型和端口后继续交付。
-
-            Yields:
-                按原始顺序通过 Output 类型校验的节点输出。
-
-            Raises:
-                TypeError: 参数类型或接口实现不符合当前契约。
-            """
-
-            for output in result:
-                if not isinstance(output, Output):
-                    raise TypeError("Node output iterable must contain only Output")
-                yield output
-
-        return validated()
+        return iter(result)
 
     @staticmethod
     def _coerce_inputs(graph: Graph, value: Any) -> Mapping[str, Any]:

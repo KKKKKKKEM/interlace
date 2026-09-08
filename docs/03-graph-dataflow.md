@@ -23,18 +23,26 @@ class Parse(Node):
         return Output(len(inputs["raw"]), port="length")
 ```
 
-`execute(inputs, context)` 的 `inputs` 是只读 Mapping。返回值只能是：
+所有节点统一继承 `Node`，`execute(inputs, context)` 可以使用普通 `def` 或 `async def`，`inputs` 是只读
+Mapping。执行结果只能是：
 
 - 单个 `Output(value, port="...")`；
 - 一个只包含 `Output` 的 iterable；
 - `None`。
 
+普通 `def` 也可以返回一个 Awaitable，Engine 会等待它完成后处理上述三种结果；`async def` 遵循相同约定。
+异步生成器和 `AsyncIterable[Output]` 不属于返回契约。批量结果用普通 iterable 表达，也可以先等待异步操作完成，
+再返回该 iterable。
+
 输出的端口必须声明在 `output_ports` 中，值也必须满足声明类型。未连接到 Edge 的合法输出会成为本次
 `Runtime.run()` 的终端输出。
 
-同步工作继承 `Node`；需要 await 的工作继承 `AsyncNode` 并把 `execute` 写为 `async def`。`timeout` 是单次
-Node firing 的可选秒数限制，默认 `None` 表示不限时。冻结时会校验继承类别、方法风格和 timeout，并固定这些
-执行元数据。
+Iterable 由 Engine 逐项推进；terminal Output 可在生成器结束前交付，输出背压会暂停继续推进。生成器的迭代、
+输出校验和关闭都属于本次 firing，使用同一取消和超时约束；返回迭代器带有 `close()` 时，结束、失败或取消都会关闭它。
+
+`timeout` 是单次 Node firing 的可选秒数限制，默认 `None` 表示不限时。冻结时校验 Node 是否实现了可调用的
+`execute`，拒绝异步生成器方法，并校验和固定端口、输入策略与 timeout。同步调用、Awaitable 等待和输出迭代
+都属于同一次 firing，不改变 InputPolicy、Output、Edge 和 Event 的语义。
 
 ## Graph 与 Edge
 
@@ -124,6 +132,9 @@ runtime.run("document.graph", payload, plan=fast)
 `plan()` 会在需要时先冻结 Graph。计划只保留两端都被选择的原有 Edge，不会跨过未选择 Node 自动补边；入口不在
 计划内、所选 Node 不可达，或 `ALL` Node 缺少输入端口时，创建计划会立即失败。计划绑定创建它的 Graph 实例，
 创建后不可变，可以安全复用，也可以在并发 execution 中使用不同计划。没有传 `plan` 时仍执行完整 Graph。
+
+高级调用也可以使用 `ExecutionPlan(frozen_graph, nodes)`。构造只接受所属 Graph 与节点 ID 集合，入口、Edge 和
+索引由同一校验过程派生；`dataclasses.replace(plan, nodes=...)` 会重新执行完整校验，不能独立覆盖派生字段。
 
 ## 输入触发策略
 

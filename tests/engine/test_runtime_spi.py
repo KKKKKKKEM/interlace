@@ -84,17 +84,38 @@ class RecordingBus:
         handler: EventHandler,
         *,
         subscription: str | None = None,
-    ) -> None:
+    ) -> Callable[[], None]:
         """注册事件订阅，同名订阅组中的处理器竞争消费。
 
         Args:
             event_type: 用于订阅或路由匹配的事件类型。
             handler: 接收事件或投递的处理函数。
             subscription: 竞争消费组名称，None 创建独立订阅。
+
+        Returns:
+            注销本次独立订阅的幂等函数。
         """
 
         del subscription
-        self.handlers[event_type].append(handler)
+
+        def registered(event: Event) -> None:
+            """为本次订阅保留独立回调身份。
+
+            Args:
+                event: 当前投递的事件。
+            """
+
+            handler(event)
+
+        self.handlers[event_type].append(registered)
+
+        def unsubscribe() -> None:
+            """仅移除本次订阅。"""
+
+            if registered in self.handlers[event_type]:
+                self.handlers[event_type].remove(registered)
+
+        return unsubscribe
 
     def publish(self, event: Event) -> None:
         """发布事件并推进对应的投递或观察流程。
@@ -157,7 +178,7 @@ class RecordingTasks:
         *,
         concurrency: int,
         slots: SlotProvider | None = None,
-    ) -> None:
+    ) -> Callable[[], None]:
         """绑定消费通道及其处理器和本地并发配置。
 
         Args:
@@ -165,6 +186,9 @@ class RecordingTasks:
             handler: 接收事件或投递的处理函数。
             concurrency: 当前消费者允许并行执行的完整 Graph 数量。
             slots: 提供本地执行槽的资源池能力。
+
+        Returns:
+            注销本次绑定的幂等函数。
         """
 
         if slots is None:
@@ -189,6 +213,14 @@ class RecordingTasks:
                 lease.release()
 
         self.handlers[queue] = handle
+
+        def unbind() -> None:
+            """只移除当前绑定，不影响后来替换的消费者。"""
+
+            if self.handlers.get(queue) is handle:
+                del self.handlers[queue]
+
+        return unbind
 
     def submit(self, queue: str, work: Work) -> None:
         """向命名执行通道提交工作。

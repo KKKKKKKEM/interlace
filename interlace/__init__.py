@@ -1,7 +1,6 @@
 """Interlace 顶层公共 API。"""
 
 from .engine import (
-    AsyncNode,
     Context,
     Edge,
     Event,
@@ -20,7 +19,6 @@ from .engine import (
 from .runtime import Runtime
 
 __all__ = [
-    "AsyncNode",
     "Context",
     "Edge",
     "Event",

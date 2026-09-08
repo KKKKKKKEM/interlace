@@ -558,7 +558,7 @@ class Runtime:
         if failure is not None:
             raise failure
 
-    def __enter__(self):
+    def __enter__(self) -> Runtime:
         """进入资源作用域并返回当前句柄。
 
         Returns:

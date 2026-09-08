@@ -10,7 +10,14 @@ import pytest
 from interlace import Graph, Node, Output, Runtime, Slot, SlotPool
 from interlace.adapters import memory
 from interlace.engine.observation import RuntimeEvent
-from interlace.plugins import CAP_EVENT_ROUTER, CAP_GRAPH_WORKER, PluginDescriptor
+from interlace.engine.policies import PolicyRef
+from interlace.plugins import (
+    CAP_EVENT_ROUTER,
+    CAP_GRAPH_WORKER,
+    ContributionPlugin,
+    NodeHookContribution,
+    PluginDescriptor,
+)
 from interlace.runtime import EventRouter, GraphWorker
 from interlace.spi import RouterRole, SlotProvider, WorkerRole
 
@@ -402,6 +409,129 @@ def test_roles_can_be_independently_decorated_and_composed_without_inheritance(
     if wrapped in ("worker", "both"):
         assert isinstance(selected_worker, WorkerWrapper)
         assert selected_worker.closed
+
+
+def test_role_plugins_install_contributions_before_start() -> None:
+    """验证替代角色在插件启动前取得 selector、延迟 Hook 和观察者贡献。"""
+
+    tasks = memory.TaskBackend()
+    router = RouterWrapper(EventRouter(publisher=tasks))
+    worker = WorkerWrapper(GraphWorker(consumer=tasks, emit=router.publish))
+    observed: list[RuntimeEvent] = []
+
+    class Selector:
+        """仅依赖可用 token 数量的测试选择器。"""
+
+        def select(self, ports, available, config):
+            """按声明顺序选择第一个有数据的端口。
+
+            Args:
+                ports: 当前节点的输入端口名称。
+                available: 各端口可用的 token 数量。
+                config: 当前策略的冻结配置。
+
+            Returns:
+                待消费的单个端口；无可用端口时返回 None。
+            """
+
+            del config
+            return next(((port,) for port in ports if available[port]), None)
+
+    class SelectedEcho(Echo):
+        """使用插件输入策略的测试节点。
+
+        Attributes:
+            input_policy: 由贡献插件提供的具名选择策略。
+        """
+
+        input_policy = PolicyRef("example/first")
+
+    class Roles:
+        """提供非继承角色，并在启动时注册依赖贡献的 Graph。
+
+        Attributes:
+            descriptor: 当前插件提供的角色 capability。
+        """
+
+        descriptor = PluginDescriptor(
+            "example/roles", "1", provides=(CAP_EVENT_ROUTER, CAP_GRAPH_WORKER)
+        )
+
+        def setup(self, context):
+            """提供本次测试使用的公开角色。
+
+            Args:
+                context: 宿主提供的能力注册上下文。
+            """
+
+            context.provide(CAP_EVENT_ROUTER, router)
+            context.provide(CAP_GRAPH_WORKER, worker)
+
+        def start(self, context):
+            """在启动阶段验证 selector 已经能够冻结 Graph。
+
+            Args:
+                context: 宿主提供的能力注册上下文。
+            """
+
+            del context
+            worker.register("echo", Graph(entrypoint="node").add(node=SelectedEcho()))
+
+        def stop(self, context):
+            """关闭当前插件拥有的角色。
+
+            Args:
+                context: 宿主提供的能力注册上下文。
+            """
+
+            del context
+            worker.close()
+            router.close()
+
+    contributions = ContributionPlugin(
+        "example/features",
+        selectors={"example/first": Selector()},
+        hooks={
+            "example/double": NodeHookContribution(
+                lambda call, output: Output(output.value * 2, output.port),
+                phase="exit",
+                graph="echo",
+                node="node",
+            )
+        },
+        observers={"example/trace": observed.append},
+    )
+    try:
+        with Runtime(plugins=(Roles(), contributions)) as runtime:
+            assert runtime.run("echo", 3) == (Output(6),)
+            runtime.emit("example/observed", 1)
+        assert observed
+        assert any(event.event_type == "example/observed" for event in observed)
+    finally:
+        tasks.close()
+        worker.close()
+        router.close()
+
+
+def test_deferred_hook_can_be_detached_before_graph_registration() -> None:
+    """验证提前注销延迟 Hook 后注册同名 Graph 不会重新激活该 Hook。"""
+
+    tasks = memory.TaskBackend()
+    worker = GraphWorker(consumer=tasks)
+    try:
+        detach = worker.contribute_hook(
+            lambda call, output: Output(output.value * 2),
+            phase="exit",
+            graph="echo",
+            node="node",
+        )
+        detach()
+        detach()
+        worker.register("echo", Graph(entrypoint="node").add(node=Echo()))
+        assert worker.start("echo", 3).result() == (Output(3),)
+    finally:
+        worker.close()
+        tasks.close()
 
 
 class ResourceLease:

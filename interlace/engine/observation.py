@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import enum
+import itertools
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -91,26 +92,26 @@ class ObserverHandle:
     Attributes:
         __slots__: 实例允许保存的字段名称，限制动态增加属性。
         _hub: 当前观察者注册所属的分发中心。
-        _observer: 当前句柄对应的观察者。
+        _registration_id: 当前句柄独立拥有的观察注册编号。
     """
 
-    __slots__ = ("_hub", "_observer")
+    __slots__ = ("_hub", "_registration_id")
 
-    def __init__(self, hub: ObservationHub, observer: RuntimeObserver) -> None:
-        """绑定观察者及其所属分发中心，供后续卸载。
+    def __init__(self, hub: ObservationHub, registration_id: int) -> None:
+        """绑定独立观察注册及其所属分发中心，供后续卸载。
 
         Args:
             hub: 分发只读事件的观察中心。
-            observer: 接收只读生命周期事件的观察者。
+            registration_id: 当前句柄负责卸载的唯一注册编号。
         """
 
         self._hub = hub
-        self._observer = observer
+        self._registration_id = registration_id
 
     def detach(self) -> None:
-        """解除当前句柄对应的注册关系。"""
+        """幂等解除当前注册，不影响相同回调的其他注册。"""
 
-        self._hub._detach(self._observer)
+        self._hub._detach(self._registration_id)
 
 
 class CompositeObserverHandle:
@@ -143,14 +144,16 @@ class ObservationHub:
     """线程安全地分发只读事件；观察者失败不会影响业务执行。
 
     Attributes:
-        _observers: 按注册顺序排列的运行时观察者快照。
+        _observers: 按注册顺序排列的注册编号与运行时观察者快照。
+        _counter: 分配独立注册编号的单调递增计数器。
         _lock: 保护当前组件共享状态的进程内互斥锁。
     """
 
     def __init__(self) -> None:
         """创建线程安全的观察者快照与注册锁。"""
 
-        self._observers: tuple[RuntimeObserver, ...] = ()
+        self._observers: tuple[tuple[int, RuntimeObserver], ...] = ()
+        self._counter = itertools.count()
         self._lock = RLock()
 
     def attach(self, observer: RuntimeObserver) -> ObserverHandle:
@@ -169,8 +172,9 @@ class ObservationHub:
         if not callable(observer):
             raise TypeError("runtime observer must be callable")
         with self._lock:
-            self._observers = (*self._observers, observer)
-        return ObserverHandle(self, observer)
+            registration_id = next(self._counter)
+            self._observers = (*self._observers, (registration_id, observer))
+        return ObserverHandle(self, registration_id)
 
     def publish(self, event: RuntimeEvent) -> None:
         """分发只读生命周期事件，记录观察者错误但不改变业务结果。
@@ -181,7 +185,7 @@ class ObservationHub:
 
         with self._lock:
             observers = self._observers
-        for observer in observers:
+        for _, observer in observers:
             try:
                 observer(event)
             except Exception:
@@ -190,14 +194,14 @@ class ObservationHub:
                     event.kind.value,
                 )
 
-    def _detach(self, observer: RuntimeObserver) -> None:
+    def _detach(self, registration_id: int) -> None:
         """从当前注册集合中移除指定注册项。
 
         Args:
-            observer: 接收只读生命周期事件的观察者。
+            registration_id: 需要移除的唯一观察注册编号。
         """
 
         with self._lock:
             self._observers = tuple(
-                item for item in self._observers if item is not observer
+                item for item in self._observers if item[0] != registration_id
             )

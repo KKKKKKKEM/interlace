@@ -40,8 +40,8 @@ class EventBus:
     def __init__(self) -> None:
         """创建独立订阅表、轮询游标和事件分发计数。"""
 
-        self._handlers: dict[str, dict[str, list[EventHandler]]] = defaultdict(
-            lambda: defaultdict(list)
+        self._handlers: dict[str, dict[str, dict[object, EventHandler]]] = defaultdict(
+            lambda: defaultdict(dict)
         )
         self._anonymous = 0
         self._next_handler: dict[tuple[str, str], int] = defaultdict(int)
@@ -66,13 +66,16 @@ class EventBus:
         handler: EventHandler,
         *,
         subscription: str | None = None,
-    ) -> None:
+    ) -> Callable[[], None]:
         """注册事件订阅，同名订阅组中的处理器竞争消费。
 
         Args:
             event_type: 用于订阅或路由匹配的事件类型。
             handler: 接收事件或投递的处理函数。
             subscription: 竞争消费组名称，None 创建独立订阅。
+
+        Returns:
+            仅注销本次注册的幂等函数，不撤回已被选中的投递。
 
         Raises:
             RuntimeError: 当前生命周期状态或操作顺序不允许此操作。
@@ -95,7 +98,24 @@ class EventBus:
                 subscription = require_non_empty_string(
                     subscription, "event subscription"
                 )
-            self._handlers[event_type][subscription].append(handler)
+            registrations = self._handlers[event_type][subscription]
+            registration = object()
+            registrations[registration] = handler
+
+        def unsubscribe() -> None:
+            """移除本次注册，保留同一回调的其他独立注册。"""
+
+            with self._condition:
+                if registration not in registrations:
+                    return
+                del registrations[registration]
+                if not registrations:
+                    del self._handlers[event_type][subscription]
+                    self._next_handler.pop((event_type, subscription), None)
+                    if not self._handlers[event_type]:
+                        del self._handlers[event_type]
+
+        return unsubscribe
 
     def publish(self, event: Event) -> None:
         """发布事件并推进对应的投递或观察流程。
@@ -173,11 +193,11 @@ class EventBus:
             key = (event_type, subscription)
             index = self._next_handler[key] % len(handlers)
             self._next_handler[key] += 1
-            selected.append(handlers[index])
+            selected.append(tuple(handlers.values())[index])
         return tuple(selected)
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, eq=False)
 class _Consumer:
     """单个内存消费者的线程池、资源池与并发计数。
 
@@ -186,14 +206,18 @@ class _Consumer:
         concurrency: 当前消费者的完整 Graph 执行并发上限。
         executor: 当前消费者拥有的线程池执行器。
         slots: 消费者申请根执行链资源所用的 SlotProvider。
-        active: 当前消费者正在执行的 Graph 数量。
+        active: 当前消费者正在执行或清理引用的交付数量。
+        queue: 当前绑定所属的命名通道。
+        bound: 是否仍允许给本次绑定分配新交付。
     """
 
     handler: WorkHandler
     concurrency: int
     executor: ThreadPoolExecutor
     slots: SlotProvider
+    queue: str
     active: int = 0
+    bound: bool = True
 
 
 @dataclass(slots=True)
@@ -204,11 +228,15 @@ class _Channel:
         consumers: 通道内按注册顺序排列的消费者。
         queued: 等待执行的投递队列。
         next_consumer: 下一次消费者轮询的起始游标。
+        active: 当前通道尚未完成引用清理的交付数量，包含正在注销的消费者。
+        accepting: 是否接受新工作；最后消费者注销后关闭，重新绑定时恢复。
     """
 
     consumers: list[_Consumer]
     queued: deque[Delivery]
     next_consumer: int = 0
+    active: int = 0
+    accepting: bool = True
 
 
 class TaskBackend:
@@ -272,7 +300,7 @@ class TaskBackend:
         *,
         concurrency: int,
         slots: SlotProvider | None = None,
-    ) -> None:
+    ) -> Callable[[], None]:
         """绑定消费通道及其处理器和本地并发配置。
 
         Args:
@@ -280,6 +308,9 @@ class TaskBackend:
             handler: 接收事件或投递的处理函数。
             concurrency: 当前消费者允许并行执行的完整 Graph 数量。
             slots: 提供本地执行槽的资源池能力。
+
+        Returns:
+            注销本次绑定的幂等函数；最后消费者先排空通道，再停止接收，重新绑定后恢复。
 
         Raises:
             RuntimeError: 当前生命周期状态或操作顺序不允许此操作。
@@ -296,21 +327,86 @@ class TaskBackend:
             raise ValueError("queue concurrency must be at least 1")
         if slots is not None and not isinstance(slots, SlotProvider):
             raise TypeError("slots must implement SlotProvider or be None")
+        failure: BaseException | None = None
         with self._condition:
             if self._closed:
                 raise RuntimeError("task backend is closed")
             if slots is None:
                 slots = SlotPool(concurrency)
-                self._owned_slot_pools.append(slots)
+                owned_slots = slots
+            else:
+                owned_slots = None
             executor = ThreadPoolExecutor(
                 max_workers=concurrency,
                 thread_name_prefix=f"interlace-{queue}",
             )
-            consumer = _Consumer(handler, concurrency, executor, slots)
+            consumer = _Consumer(handler, concurrency, executor, slots, queue)
+            try:
+                self._subscribe_slots(slots)
+            except BaseException:
+                executor.shutdown(wait=True)
+                if owned_slots is not None:
+                    owned_slots.close()
+                raise
+            if owned_slots is not None:
+                self._owned_slot_pools.append(owned_slots)
             channel = self._channels.setdefault(queue, _Channel([], deque()))
+            accepting = channel.accepting
+            channel.accepting = True
             channel.consumers.append(consumer)
-            self._subscribe_slots(slots)
-            self._drain_channel(channel)
+            try:
+                self._drain_channel(channel)
+            except BaseException as exc:
+                # 已分配的交付可以完成，但失败绑定不得再接收后续工作。
+                channel.consumers.remove(consumer)
+                consumer.bound = False
+                channel.accepting = accepting
+                failure = exc
+            self._condition.notify_all()
+
+        if failure is not None:
+            try:
+                self._unbind(consumer)
+            finally:
+                raise failure
+        return partial(self._unbind, consumer)
+
+    def _unbind(self, consumer: _Consumer) -> None:
+        """排空最后消费者的通道，或移除当前绑定并等待在途清理，再释放专属资源。
+
+        Args:
+            consumer: 需要注销的独立消费者注册。
+        """
+
+        with self._condition:
+            if consumer.bound:
+                channel = self._channels[consumer.queue]
+                while (
+                    consumer.bound
+                    and len(channel.consumers) == 1
+                    and (channel.active or channel.queued)
+                ):
+                    self._condition.wait()
+                if consumer.bound:
+                    consumer.bound = False
+                    channel.consumers.remove(consumer)
+                    if not channel.consumers:
+                        channel.accepting = False
+            while consumer.active:
+                self._condition.wait()
+        consumer.executor.shutdown(wait=True)
+        with self._condition:
+            if not any(
+                other.slots is consumer.slots
+                for channel in self._channels.values()
+                for other in channel.consumers
+            ):
+                subscription = self._slot_subscriptions.pop(id(consumer.slots), None)
+                if subscription is not None:
+                    subscription[1]()
+            if consumer.slots in self._owned_slot_pools:
+                self._owned_slot_pools.remove(consumer.slots)
+                consumer.slots.close()
             self._condition.notify_all()
 
     def submit(self, queue: str, work: Work) -> None:
@@ -332,6 +428,8 @@ class TaskBackend:
             if self._closed:
                 raise RuntimeError("task backend is closed")
             channel = self._channels.setdefault(queue, _Channel([], deque()))
+            if not channel.accepting:
+                raise RuntimeError(f"task queue {queue!r} has no active consumers")
             channel.queued.append(Delivery(work))
             self._drain_channel(channel)
 
@@ -355,6 +453,8 @@ class TaskBackend:
             if self._closed:
                 raise RuntimeError("task backend is closed")
             channel = self._channels.setdefault(queue, _Channel([], deque()))
+            if not channel.accepting:
+                raise RuntimeError(f"task queue {queue!r} has no active consumers")
             channel.queued.append(Delivery(work, slot_lease=lease))
             self._drain_channel(channel)
 
@@ -425,8 +525,6 @@ class TaskBackend:
         failure = future.exception()
         result = None if failure is not None else future.result()
         with self._condition:
-            self._pending.discard(future)
-            consumer.active -= 1
             if failure is not None:
                 self._failures.append(failure)
             elif not isinstance(result, DeliveryResult):
@@ -444,11 +542,7 @@ class TaskBackend:
                 else:
                     if delivery.slot_lease is not None:
                         delivery.slot_lease.retain()
-                    channel = next(
-                        channel
-                        for channel in self._channels.values()
-                        if consumer in channel.consumers
-                    )
+                    channel = self._channels[consumer.queue]
                     channel.queued.appendleft(
                         Delivery(
                             delivery.work,
@@ -458,11 +552,19 @@ class TaskBackend:
                     )
             elif result.outcome is DeliveryOutcome.REJECT and result.error is not None:
                 self._failures.append(result.error)
-        if delivery.slot_lease is not None:
-            delivery.slot_lease.release()
-        with self._condition:
-            self._drain_all()
-            self._condition.notify_all()
+        try:
+            if delivery.slot_lease is not None:
+                delivery.slot_lease.release()
+        except BaseException as exc:
+            with self._condition:
+                self._failures.append(exc)
+        finally:
+            with self._condition:
+                self._pending.discard(future)
+                consumer.active -= 1
+                self._channels[consumer.queue].active -= 1
+                self._drain_all()
+                self._condition.notify_all()
 
     def _dispatch(self, consumer: _Consumer, delivery: Delivery) -> None:
         """将已取得执行资源的投递交给消费者线程池。
@@ -473,10 +575,12 @@ class TaskBackend:
         """
 
         consumer.active += 1
+        self._channels[consumer.queue].active += 1
         try:
             future = consumer.executor.submit(consumer.handler, delivery)
         except BaseException as exc:
             consumer.active -= 1
+            self._channels[consumer.queue].active -= 1
             self._failures.append(exc)
             if delivery.slot_lease is not None:
                 delivery.slot_lease.release()

@@ -9,7 +9,7 @@
 | --- | --- | --- | --- |
 | 用户模型 | `interlace.engine`，由 `interlace` 导出 | Ports、Node、Output、Edge、Graph、Event、Context、Execution、Slot | 描述业务计算与可观察执行状态 |
 | 用户门面 | `interlace.runtime`，由 `interlace` 导出 | Runtime | 注册 Graph，代理执行、事件、观察和控制入口 |
-| 装配宿主 | `interlace.plugins`、`interlace.runtime.plugin` | PluginHost、LocalRuntimePlugin | 解析插件依赖，注册 capability，管理统一生命周期 |
+| 装配宿主 | `interlace.plugins`、`interlace.runtime.plugin` | PluginHost、LocalRuntimePlugin | 解析插件依赖，注册 capability，安装标准贡献并管理生命周期 |
 | 运行角色 | `interlace.runtime` | EventRouter、GraphWorker | 分别处理 Event -> Work 与 Work -> Graph execution |
 | 能力端口 | `interlace.spi` | RouterRole、WorkerRole、EventBus、任务传输、GraphExecutor、SlotProvider、执行资源协议 | 隔离编排、传输、执行和资源实现 |
 | 默认适配器 | `interlace.adapters.memory`、`interlace.engine.executor` | EventBus、TaskBackend、Engine | 提供单进程内存运行时 |
@@ -24,7 +24,7 @@ Runtime 是面向应用的稳定门面，PluginHost 是系统装配根。普通�
 interlace/
 ├── __init__.py              # 宪法规定的顶层公共 API
 ├── engine/                  # Graph 执行微内核及受控内核扩展点
-│   ├── core.py              # Ports、Node、AsyncNode、Output、InputPolicy
+│   ├── core.py              # Ports、Node、Output、InputPolicy
 │   ├── graph.py             # Edge、Graph、ExecutionPlan 与冻结校验
 │   ├── execution.py         # Execution 句柄、限制与状态
 │   ├── execution_resources.py # 输出存储与等待通知协议及默认实现
@@ -69,6 +69,7 @@ flowchart LR
     Adapters --> SPI
     Adapters --> Engine
     Plugins --> Engine
+    Plugins --> SPI
     Nodes[interlace.nodes] --> Engine
 ```
 
@@ -77,7 +78,7 @@ flowchart LR
 - `engine` 不依赖 `runtime`、`plugins`、`spi`、`adapters` 或可复用 `nodes`；
 - `spi` 只引用协议签名所需的 Graph、Event、Execution、Hook 和 Slot 模型；
 - `adapters` 实现 SPI，可以引用搬运 Event/Work 所需的最小内核类型；
-- `plugins` 管理装配元数据与生命周期，不读取 Runtime 私有状态；
+- `plugins` 管理装配元数据与生命周期，通过 SPI 的公开角色安装标准贡献，不读取 Runtime 私有状态；
 - `runtime` 可以依赖前述各层并完成组合，但不得把部署算法重新实现到门面中；
 - `nodes` 只放可复用的非内核 Node，只依赖内核公共语义，不能成为 Runtime 的隐式前置条件。
 
@@ -99,11 +100,20 @@ flowchart TB
     Contributions --> Selectors[InputSelector contributions]
     Contributions --> Hooks[NodeHook contributions]
     Contributions --> Observers[RuntimeObserver contributions]
+    Selectors --> Host
+    Hooks --> Host
+    Observers --> Host
+    Host -->|install through WorkerRole| Worker
+    Host -->|install through RouterRole| Router
 ```
 
 `Runtime()` 根据已声明 capability 让 LocalRuntimePlugin 逐项补齐缺失的 EventBus、TaskBackend、GraphExecutor 和 ExecutionFactory，
 再组装 Router 与 Worker。内建实现和应用插件使用相同的依赖解析、capability 注册、启动和停止流程。显式
 `Runtime(router=..., worker=...)` 用于 Router/Worker 独立部署，此模式不创建 PluginHost。
+
+全部插件完成 `setup()` 后，PluginHost 先通过 `RouterRole`、`WorkerRole` 安装 selector、Hook 和 Observer，
+再按依赖顺序调用 `start()`。因此插件在启动阶段注册 Graph 时，标准贡献已经可用。提供完整替代角色的插件同样经过
+这条安装路径；缺少贡献所需的角色会在启动前失败。LocalRuntimePlugin 只负责提供默认能力与角色，不单独安装贡献。
 
 ## 直接执行路径
 
@@ -129,6 +139,9 @@ ExecutionFactory 为直接执行和队列 Work 创建同一类句柄，可注入
 GraphExecutor 同步执行后返回 None，也可以返回 Awaitable[None]。默认 GraphWorker 会等待异步执行及其取消清理
 真正结束，仍占用该次 execution 的消费并发；需要其他调度方式时可替换 WorkerRole。两种执行器都通过统一输出接口
 交付结果，Worker 不再根据最终返回值补发输出或强制读取完整 tuple。
+
+Node 使用同一个基类声明行为。Engine 调用 `execute()` 后检查实际返回值：Awaitable 由运行器等待，完成后再按
+Output、普通 iterable 或 None 处理。普通 `def` 和 `async def` 共享这条路径；异步生成器不在 Node 返回契约内。
 
 ## 事件执行路径
 
@@ -204,10 +217,21 @@ Slot 回到池中。同一个 Slot 使用 execution lock 保证 Graph 不会并�
 
 ## 生命周期与所有权
 
-插件模式下，Runtime 先 `wait_idle()`，再关闭 PluginHost。宿主逆序停止插件；LocalRuntimePlugin 依次关闭 Worker、
-Router 和自己创建的底层组件。注入组件默认由调用方管理，`close_injected=True` 才转移所有权。
+插件模式下，Runtime 排空工作后关闭 PluginHost。宿主先逆序注销已安装的 selector、Hook 和 Observer，再逆序停止已进入
+`setup()` 的插件；贡献安装或 `start()` 中途失败也按同一清理流程回滚。延迟 Hook 在目标 Graph 注册前后均可注销，
+注入执行器不会因宿主退出而留下本次贡献。LocalRuntimePlugin 关闭它提供的角色和自己创建的底层组件。
+注入组件默认由调用方管理，`close_injected=True` 才转移所有权。
+selector 注销只影响后续 Graph 冻结，已经绑定的 Graph 保留原选择器快照；共享 PolicyRegistry 可供后续装配继续使用。
 
 显式 Router/Worker 模式下，Runtime 直接关闭两个角色，各角色再按自己的所有权配置处理底层组件。
+
+组件所有权与注册所有权分别管理。`EventBus.subscribe()`、`TaskConsumer.bind()` 返回仅撤销本次注册的幂等函数；
+Router 保存并注销自己的 Event 订阅，Worker 保存并注销自己的消费绑定。共享传输可以继续供其他角色使用。
+消费注销需要等待已分配交付完成最终 lease 释放，再回收该绑定的线程资源和不再使用的 Slot 可用通知。
+
+默认内存通道的最后一个消费者注销前，还会排空该通道已经接受的排队和在途 Work，包括产生的同通道续作，然后
+原子地移除消费者并停止该通道接收新 Work。退订后的 `submit()`、`submit_local()` 明确抛错，重新成功绑定消费者后
+恢复接收；从未绑定消费者的通道仍允许先排队。这个边界避免 Router 与 Worker 关闭的间隙留下无人处理的新 Work。
 
 ## 架构边界
 

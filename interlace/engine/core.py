@@ -189,7 +189,10 @@ class Output:
 
 
 class Node(ABC):
-    """默认在 Runtime 同步 worker 中执行的图节点。
+    """统一声明同步或异步行为的图节点。
+
+    execute 可使用 def 或 async def。默认执行器在 Graph 工作线程调用普通方法，
+    将返回的 Awaitable 交给后台事件循环等待，再逐项处理最终输出。
 
     Attributes:
         input_ports: 节点声明的输入端口及其类型。
@@ -209,32 +212,13 @@ class Node(ABC):
         inputs: Mapping[str, Any],
         context: Context,
     ) -> Output | Iterable[Output] | Awaitable[Output | Iterable[Output] | None] | None:
-        """执行一次节点行为。
+        """执行一次节点行为，直接返回结果或返回可等待的结果。
 
         Args:
             inputs: 入口数据或按端口名称组织的输入映射。
             context: 当前调用的执行或插件上下文。
 
         Returns:
-            符合声明端口契约的 Output 集合。
-        """
-
-
-class AsyncNode(Node):
-    """显式在 asyncio 环境中执行的异步图节点。"""
-
-    @abstractmethod
-    async def execute(
-        self,
-        inputs: Mapping[str, Any],
-        context: Context,
-    ) -> Output | Iterable[Output] | None:
-        """异步执行一次节点行为。
-
-        Args:
-            inputs: 入口数据或按端口名称组织的输入映射。
-            context: 当前调用的执行或插件上下文。
-
-        Returns:
-            符合声明端口契约的 Output 集合。
+            Output、惰性 Iterable[Output]、None，或得到这些结果的 Awaitable。
+            每项输出必须符合声明端口契约；不接受异步生成器。
         """

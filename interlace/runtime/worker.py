@@ -7,6 +7,7 @@ import inspect
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor, wait
+from dataclasses import dataclass
 from functools import partial
 from threading import RLock
 from typing import Any
@@ -48,6 +49,23 @@ from ..spi import (
 from ._utils import _close_components, _remaining, _unique
 
 
+@dataclass(eq=False, slots=True)
+class _HookContribution:
+    """保存延迟 Hook 与实际执行器注册之间的生命周期关系。
+
+    Attributes:
+        hook: 节点 Hook 对象或单阶段回调。
+        phase: 函数 Hook 对应阶段。
+        node: 目标 Graph 内的节点 ID，None 作用于整张 Graph。
+        handle: 已绑定的执行器句柄，尚未绑定或已注销时为 None。
+    """
+
+    hook: NodeHook | Callable[..., object]
+    phase: HookPhase | str | None
+    node: str | None
+    handle: HookHandle | None = None
+
+
 class GraphWorker:
     """注册 Graph、消费队列 Work，并执行完整 Graph。
 
@@ -64,6 +82,7 @@ class GraphWorker:
         _policies: 当前角色使用的输入策略注册能力。
         _graphs: 已冻结并注册的 Graph 定义。
         _queues: 当前 Worker 已绑定的消费通道。
+        _bindings: 当前角色拥有的消费者绑定注销函数。
         _owned_slot_pools: 由当前组件创建并负责关闭的 Slot 池。
         _lock: 保护当前组件共享状态的进程内互斥锁。
         _direct_executor: 承载直接执行任务的线程池。
@@ -132,6 +151,7 @@ class GraphWorker:
         self._policies = PolicyRegistry() if policies is None else policies
         self._graphs: dict[str, Graph] = {}
         self._queues: dict[str, tuple[int, SlotProvider]] = {}
+        self._bindings: list[Callable[[], None]] = []
         self._owned_slot_pools: list[SlotPool] = []
         self._lock = RLock()
         self._direct_executor = ThreadPoolExecutor(
@@ -139,14 +159,7 @@ class GraphWorker:
         )
         self._direct_pending: set[Future[None]] = set()
         self._executions: OrderedDict[str, Execution] = OrderedDict()
-        self._pending_hooks: dict[
-            str,
-            list[
-                tuple[
-                    NodeHook | Callable[..., object], HookPhase | str | None, str | None
-                ]
-            ],
-        ] = {}
+        self._pending_hooks: dict[str, list[_HookContribution]] = {}
         self._history_limit = 1000
         self._closed = False
 
@@ -190,18 +203,32 @@ class GraphWorker:
             if name in self._graphs:
                 raise InterlaceRuntimeError(f"duplicate registered graph {name!r}")
             pending = tuple(self._pending_hooks.get(name, ()))
-            for _, _, node in pending:
-                if node is not None and node not in graph.nodes:
-                    raise ValueError(f"graph {name!r} has no node {node!r}")
+            for contribution in pending:
+                if (
+                    contribution.node is not None
+                    and contribution.node not in graph.nodes
+                ):
+                    raise ValueError(
+                        f"graph {name!r} has no node {contribution.node!r}"
+                    )
+            attached: list[_HookContribution] = []
+            try:
+                for contribution in pending:
+                    contribution.handle = self._attach_executor_hook(
+                        contribution.hook,
+                        phase=contribution.phase,
+                        graph=name,
+                        node=contribution.node,
+                    )
+                    attached.append(contribution)
+            except BaseException:
+                for contribution in reversed(attached):
+                    assert contribution.handle is not None
+                    contribution.handle.detach()
+                    contribution.handle = None
+                raise
             self._graphs[name] = graph
             self._pending_hooks.pop(name, None)
-        for hook, phase, node in pending:
-            self._attach_executor_hook(
-                hook,
-                phase=phase,
-                graph=name,
-                node=node,
-            )
         return self
 
     def consume(
@@ -235,6 +262,7 @@ class GraphWorker:
         if slots is not None and not isinstance(slots, SlotProvider):
             raise TypeError("slots must implement SlotProvider or be None")
         with self._lock:
+            self._ensure_open()
             configured = self._queues.get(queue)
             if configured is not None:
                 configured_concurrency, configured_slots = configured
@@ -254,7 +282,7 @@ class GraphWorker:
             else:
                 owned_slots = None
             try:
-                self._consumer.bind(
+                unbind = self._consumer.bind(
                     queue,
                     self._execute_delivery,
                     concurrency=concurrency,
@@ -266,6 +294,7 @@ class GraphWorker:
                 raise
             if owned_slots is not None:
                 self._owned_slot_pools.append(owned_slots)
+            self._bindings.append(unbind)
             self._queues[queue] = (concurrency, slots)
         return self
 
@@ -557,7 +586,7 @@ class GraphWorker:
         phase: HookPhase | str | None = None,
         graph: str | None = None,
         node: str | None = None,
-    ) -> HookHandle | None:
+    ) -> Callable[[], None]:
         """安装插件 Hook；目标 Graph 尚未注册时延迟绑定。
 
         Args:
@@ -567,30 +596,52 @@ class GraphWorker:
             node: 节点实例或作用域中的节点 ID，以接口类型为准。
 
         Returns:
-            用于卸载本次注册的句柄。
+            幂等注销函数，目标 Graph 注册前后均可撤销本次贡献。
 
         Raises:
             ValueError: 参数值或字段组合不合法。
         """
 
         self._ensure_open()
-        if graph is None:
-            if node is not None:
-                raise ValueError("node-scoped hook requires graph")
-            return self._attach_executor_hook(hook, phase=phase)
-        graph = require_non_empty_string(graph, "hook graph")
-        with self._lock:
-            registered = self._graphs.get(graph)
-            if registered is None:
-                if node is not None:
-                    node = require_non_empty_string(node, "hook node")
-                self._pending_hooks.setdefault(graph, []).append((hook, phase, node))
-                return None
+        if graph is None and node is not None:
+            raise ValueError("node-scoped hook requires graph")
+        if graph is not None:
+            graph = require_non_empty_string(graph, "hook graph")
         if node is not None:
             node = require_non_empty_string(node, "hook node")
-            if node not in registered.nodes:
-                raise ValueError(f"graph {graph!r} has no node {node!r}")
-        return self._attach_executor_hook(hook, phase=phase, graph=graph, node=node)
+        if not isinstance(self._executor, HookableGraphExecutor):
+            raise TypeError("the configured GraphExecutor does not support hooks")
+        contribution = _HookContribution(hook, phase, node)
+        with self._lock:
+            registered = None if graph is None else self._graphs.get(graph)
+            if graph is not None and registered is None:
+                self._pending_hooks.setdefault(graph, []).append(contribution)
+            else:
+                if (
+                    registered is not None
+                    and node is not None
+                    and node not in registered.nodes
+                ):
+                    raise ValueError(f"graph {graph!r} has no node {node!r}")
+                contribution.handle = self._attach_executor_hook(
+                    hook, phase=phase, graph=graph, node=node
+                )
+
+        def detach() -> None:
+            """撤销尚未绑定或已经安装到执行器的当前 Hook 贡献。"""
+
+            with self._lock:
+                if graph is not None:
+                    pending = self._pending_hooks.get(graph)
+                    if pending is not None and contribution in pending:
+                        pending.remove(contribution)
+                        if not pending:
+                            del self._pending_hooks[graph]
+                if contribution.handle is not None:
+                    contribution.handle.detach()
+                    contribution.handle = None
+
+        return detach
 
     def _attach_executor_hook(
         self,
@@ -619,7 +670,7 @@ class GraphWorker:
             raise TypeError("the configured GraphExecutor does not support hooks")
         return self._executor.attach(hook, phase=phase, graph=graph, node=node)
 
-    def register_policy(self, name: str, selector: InputSelector) -> GraphWorker:
+    def register_policy(self, name: str, selector: InputSelector) -> Callable[[], None]:
         """注册 selector contribution；使用它的 Graph 必须尚未冻结。
 
         Args:
@@ -627,12 +678,11 @@ class GraphWorker:
             selector: 仅依据端口和 token 数量选择输入的实现。
 
         Returns:
-            当前实例，可继续进行链式组合。
+            仅撤销本次策略注册的幂等函数，不影响已冻结的 Graph。
         """
 
         self._ensure_open()
-        self._policies.register(name, selector)
-        return self
+        return self._policies.register(name, selector)
 
     def observe_runtime(self, observer: RuntimeObserver) -> ObserverHandle:
         """注册只读运行时生命周期观察者。
@@ -699,6 +749,14 @@ class GraphWorker:
             failure = exc
         with self._lock:
             self._closed = True
+            bindings = tuple(reversed(self._bindings))
+            self._bindings.clear()
+        for unbind in bindings:
+            try:
+                unbind()
+            except Exception as exc:  # noqa: BLE001
+                if failure is None:
+                    failure = exc
         components = (
             _unique(self._consumer, self._executor)
             if self._close_injected
@@ -712,7 +770,7 @@ class GraphWorker:
         if failure is not None:
             raise failure
 
-    def __enter__(self):
+    def __enter__(self) -> GraphWorker:
         """进入资源作用域并返回当前句柄。
 
         Returns:

@@ -127,11 +127,11 @@ runtime.wait_idle()
 
 ## 5. 异步 Node
 
-[`examples/async_node.py`](../examples/async_node.py) 展示 `AsyncNode`。它与 `Node` 有相同的 Ports、Output、
-Edge 和 InputPolicy，只是 `execute()` 是 `async def`：
+[`examples/async_node.py`](../examples/async_node.py) 展示同一个 `Node` 基类的异步用法：需要等待 I/O 时，将
+`execute()` 写成 `async def`，Ports、Output、Edge 和 InputPolicy 的使用方式不变：
 
 ```python
-class DelayedUpper(AsyncNode):
+class DelayedUpper(Node):
     input_ports = Ports(text=str)
     output_ports = Ports(result=str)
 
@@ -140,8 +140,11 @@ class DelayedUpper(AsyncNode):
         return Output(inputs["text"].upper(), "result")
 ```
 
-队列路由中的 `concurrency` 限制整张 Graph 的同时执行数。对于单个需要等待 I/O 的 Node，继承 `AsyncNode`；
-对于多份彼此独立的工作，使用 Event 路由和命名队列。
+普通 `def execute()` 也可以直接返回 Awaitable，由 Engine 等待并处理完成后的 Output、普通 iterable 或 None。
+异步生成器不属于节点返回契约。
+
+队列路由中的 `concurrency` 限制整张 Graph 的同时执行数，Node 等待 I/O 期间仍占用本次执行的并发与 Slot。
+取消和 timeout 也会等待协程清理完成后才释放资源。对于多份彼此独立的工作，使用 Event 路由和命名队列。
 
 ## 6. 流式终端输出
 

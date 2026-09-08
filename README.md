@@ -29,6 +29,9 @@ Node firing 的时限由该 Node 的 `timeout` 属性声明。`start()` 返回�
 `Execution` 可调用 `result()`、直接 `await`，也可同步或异步迭代 terminal Output；`Runtime.iter()` 和
 `Runtime.aiter()` 提供对应便利入口。
 
+所有节点统一继承 `Node`。`execute()` 可以使用普通 `def` 或 `async def`；普通函数返回的 Awaitable 也由
+Engine 等待，再按相同的 Output 契约处理结果。
+
 ## 最小示例
 
 ```python

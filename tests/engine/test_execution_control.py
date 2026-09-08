@@ -10,7 +10,6 @@ from threading import Lock, Thread
 import pytest
 
 from interlace import (
-    AsyncNode,
     Context,
     ExecutionLimits,
     ExecutionStatus,
@@ -46,7 +45,7 @@ def test_async_cleanup_finishes_before_execution_releases_slot(control) -> None:
     )
     seen_slots = []
 
-    class Slow(AsyncNode):
+    class Slow(Node):
         async def execute(self, inputs, context):
             """执行当前测试场景的节点行为，供外层契约断言检查。
 
@@ -539,7 +538,7 @@ def test_unconsumed_stream_can_be_closed_without_blocking_execution() -> None:
 def test_async_node_timeout_interrupts_awaitable() -> None:
     """验证异步节点超时会中断其等待对象。"""
 
-    class Slow(AsyncNode):
+    class Slow(Node):
         """当前契约测试使用的 Slow 替代实现。
 
         Attributes:
@@ -581,7 +580,7 @@ def test_async_node_timeout_interrupts_awaitable() -> None:
 def test_none_timeouts_leave_slow_node_unlimited() -> None:
     """验证空超时不会终止较慢节点。"""
 
-    class Slow(AsyncNode):
+    class Slow(Node):
         """当前契约测试使用的 Slow 替代实现。
 
         Attributes:
@@ -619,7 +618,7 @@ def test_none_timeouts_leave_slow_node_unlimited() -> None:
 def test_async_node_business_timeout_is_not_misclassified_as_control_timeout() -> None:
     """验证业务 TimeoutError 不会被误判为引擎控制超时。"""
 
-    class Failing(AsyncNode):
+    class Failing(Node):
         """当前契约测试使用的 Failing 替代实现。
 
         Attributes:
@@ -659,7 +658,7 @@ def test_async_node_business_timeout_is_not_misclassified_as_control_timeout() -
 def test_graph_timeout_is_distinct_from_node_timeout() -> None:
     """验证 Graph 超时与节点超时采用不同异常。"""
 
-    class SlowRelay(AsyncNode):
+    class SlowRelay(Node):
         """当前契约测试使用的 SlowRelay 替代实现。
 
         Attributes:
@@ -706,7 +705,7 @@ def test_graph_timeout_is_distinct_from_node_timeout() -> None:
 def test_each_node_uses_its_own_timeout() -> None:
     """验证各节点分别使用自身的超时限制。"""
 
-    class SlowRelay(AsyncNode):
+    class SlowRelay(Node):
         """当前契约测试使用的 SlowRelay 替代实现。
 
         Attributes:
@@ -753,7 +752,7 @@ def test_each_node_uses_its_own_timeout() -> None:
 def test_graph_freeze_snapshots_node_timeout() -> None:
     """验证 Graph 冻结后使用节点超时快照。"""
 
-    class Slow(AsyncNode):
+    class Slow(Node):
         """当前契约测试使用的 Slow 替代实现。
 
         Attributes:
@@ -872,7 +871,7 @@ def test_non_cooperative_sync_node_is_checked_when_it_returns() -> None:
 def test_execution_cancel_interrupts_async_node() -> None:
     """验证执行取消能够中断异步节点。"""
 
-    class Waiting(AsyncNode):
+    class Waiting(Node):
         """当前契约测试使用的 Waiting 替代实现。
 
         Attributes:
@@ -921,7 +920,7 @@ def test_execution_cancel_interrupts_async_node() -> None:
 def test_control_timeout_bypasses_hook_business_error_recovery() -> None:
     """验证控制超时不能被业务错误 Hook 恢复。"""
 
-    class Waiting(AsyncNode):
+    class Waiting(Node):
         """当前契约测试使用的 Waiting 替代实现。
 
         Attributes:
@@ -978,7 +977,7 @@ def test_control_timeout_bypasses_hook_business_error_recovery() -> None:
 def test_arun_cancellation_cancels_underlying_execution() -> None:
     """验证取消 arun 等待方会取消底层执行。"""
 
-    class Waiting(AsyncNode):
+    class Waiting(Node):
         """当前契约测试使用的 Waiting 替代实现。
 
         Attributes:

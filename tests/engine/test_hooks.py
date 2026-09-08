@@ -8,7 +8,7 @@ from threading import get_ident
 
 import pytest
 
-from interlace import AsyncNode, Graph, Node, Output, Ports, Runtime
+from interlace import Graph, Node, Output, Ports, Runtime
 from interlace.engine.errors import HookExecutionError, InvalidOutputError
 from interlace.engine.hooks import (
     NodeCall,
@@ -97,7 +97,7 @@ def test_object_hook_transforms_inputs_and_outputs() -> None:
 
             del call
             order.append("exit")
-            return (Output(outputs[0].value + 3, "result"),)
+            return Output(outputs.value + 3, "result")
 
     with Runtime() as runtime:
         runtime.register("work.graph", single_node_graph(node))
@@ -443,7 +443,7 @@ def test_single_function_hooks_support_all_phases() -> None:
 
         del call
         await asyncio.sleep(0)
-        return (Output(outputs[0].value * 2, "result"),)
+        return Output(outputs.value * 2, "result")
 
     with Runtime() as runtime:
         runtime.register("work.graph", single_node_graph(node))
@@ -460,7 +460,7 @@ def test_async_node_and_async_hooks_share_background_loop() -> None:
     loop_threads: list[int] = []
     caller_thread = get_ident()
 
-    class AsyncWork(AsyncNode):
+    class AsyncWork(Node):
         """当前契约测试使用的 AsyncWork 替代实现。
 
         Attributes:
@@ -545,7 +545,7 @@ def test_hook_detach_is_hot_and_idempotent() -> None:
         """
 
         del call
-        return (Output(outputs[0].value * 2, "result"),)
+        return Output(outputs.value * 2, "result")
 
     with Runtime() as runtime:
         runtime.register("work.graph", single_node_graph(node))
@@ -889,7 +889,7 @@ def test_async_enter_can_short_circuit() -> None:
 def test_function_error_hook_can_recover_async_node_error() -> None:
     """验证函数错误 Hook 能恢复异步节点的业务异常。"""
 
-    class Broken(AsyncNode):
+    class Broken(Node):
         """当前契约测试使用的 Broken 替代实现。
 
         Attributes:

@@ -178,13 +178,16 @@ class EventBus(Protocol):
         handler: EventHandler,
         *,
         subscription: str | None = None,
-    ) -> None:
+    ) -> Callable[[], None]:
         """订阅 Event；同名 subscription 的实例竞争消费。
 
         Args:
             event_type: 用于订阅或路由匹配的事件类型。
             handler: 接收事件或投递的处理函数。
             subscription: 竞争消费组名称，None 创建独立订阅。
+
+        Returns:
+            仅注销本次注册的幂等函数；已接受的投递仍可完成。
         """
 
     def publish(self, event: Event) -> None:
@@ -255,7 +258,7 @@ class TaskConsumer(Protocol):
         *,
         concurrency: int,
         slots: SlotProvider | None = None,
-    ) -> None:
+    ) -> Callable[[], None]:
         """绑定通道，并为不携带 Slot 的根 Work 分配执行槽。
 
         Args:
@@ -263,6 +266,9 @@ class TaskConsumer(Protocol):
             handler: 接收事件或投递的处理函数。
             concurrency: 当前消费者允许并行执行的完整 Graph 数量。
             slots: 提供本地执行槽的资源池能力。
+
+        Returns:
+            注销本次绑定并等待已接受交付清理的幂等函数；排队工作遵循后端的排空契约。
         """
 
     def wait_idle(self, timeout: float | None = None) -> None:

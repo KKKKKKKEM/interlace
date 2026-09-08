@@ -66,6 +66,10 @@ Execution 保留完整 terminal Output，因此迭代可以重放，`result()` �
 Output 后失败，已发布 Output 不撤回，迭代器在读完它们后抛出执行异常。停止迭代不会隐式取消 Graph，需要调用
 `execution.cancel()` 显式取消。
 
+默认 Engine 不会提前耗尽 Node 返回的 Iterable。背压计数限制已提交的未读输出，执行器最多再持有正在交付的一项；
+取消和超时会中止后续推进并关闭输出迭代器。Node Hook 的出口转换逐项执行，同步 Node 的迭代由执行线程推进，
+异步 Hook 只接收已读取的单项 Output。
+
 保留完整输出是逻辑契约，存放位置可以替换。默认 OutputStore 使用内存，也可以由 ExecutionFactory 为每次执行
 创建磁盘或其他追加式存储。`wait()`、执行结束和流消费结束不会自动读取全量输出；`result()`、`await execution`
 或成功后的 `outputs` 属性会按需读取完整 tuple，因此这些调用仍需要容纳全量结果的内存。
@@ -92,7 +96,7 @@ outputs = runtime.run(
 单次 Node firing 的时限是 Node 自身的配置：
 
 ```python
-class Fetch(AsyncNode):
+class Fetch(Node):
     timeout = 10
 
     async def execute(self, inputs, context): ...
@@ -114,13 +118,17 @@ outputs = execution.result()
 same = runtime.get_execution(execution.id)
 ```
 
-`Execution` 记录 `id`、`status`、`steps`、当前 Node、起止时间、输出和异常。`cancel()` 是协作式取消：异步
-Node 的 await 会被及时中断；同步 Node 可在长循环中调用 `context.checkpoint()`。无法安全强杀的普通同步函数会
-在返回后检查 deadline，因此超过 timeout 后产生的外部副作用不会被自动撤销。
+`Execution` 记录 `id`、`status`、`steps`、当前 Node、起止时间、输出和异常。`cancel()` 是协作式取消：Node 返回的
+Awaitable 会收到取消请求，包括 `async def execute()` 创建的协程；同步代码可在长循环中调用
+`context.checkpoint()`。无法安全强杀的普通同步函数会在返回后检查 deadline，因此超过 timeout 后产生的外部副作用
+不会被自动撤销。
 
 异步取消或超时会向实际协程发送取消请求，并等待它完成 `finally` 等清理后才结束 execution、释放执行锁并归还
 Slot。清理期间 execution 仍为 `RUNNING`，`wait_idle()` 也会继续等待。协程若抑制取消或清理迟迟不结束，等待可能
 超过配置的 timeout；该限制不能安全强杀协程，也不会让下一张 Graph 提前复用仍在使用的资源。
+
+等待期间仍占用本次完整 Graph execution 的队列并发与 Slot，使用 `async def` 或从普通 `def` 返回 Awaitable
+都不会把一次 Graph 拆成多份独立工作。
 
 ```mermaid
 stateDiagram-v2

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import enum
 import itertools
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from threading import RLock
 from types import MappingProxyType
@@ -13,7 +13,7 @@ from typing import Any
 from .core import Node, Output
 from .events import Context
 
-Outputs = tuple[Output, ...]
+Outputs = Output | Iterable[Output] | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,19 +67,19 @@ class NodeHook:
 
         return call
 
-    def exit(self, call: NodeCall, outputs: Outputs) -> Outputs | Awaitable[Outputs]:
-        """在 Node 成功或被短路后转换结果。
+    def exit(self, call: NodeCall, output: Output) -> Outputs | Awaitable[Outputs]:
+        """转换一项 Node 或短路输出，可保留、丢弃或展开为多项。
 
         Args:
             call: Hook 当前处理的节点调用记录。
-            outputs: 按交付顺序组织的节点输出。
+            output: Engine 已从源中读取的当前输出；Hook 不推进源迭代器。
 
         Returns:
-            符合声明端口契约的 Output。
+            一项 Output、惰性 Iterable 或 None；None 丢弃当前项。
         """
 
         del call
-        return outputs
+        return output
 
     def error(self, call: NodeCall, error: Exception) -> Outputs | Awaitable[Outputs]:
         """处理 Node 异常；默认继续抛出。
@@ -89,7 +89,7 @@ class NodeHook:
             error: 需要传播、记录或用于恢复的异常。
 
         Returns:
-            符合声明端口契约的 Output。
+            恢复输出，可为 Output、Iterable[Output] 或 None；继续经过当前及外层出口转换。
         """
 
         del call
@@ -233,20 +233,20 @@ class _FunctionHook(NodeHook):
             return self._function(call)
         return call
 
-    def exit(self, call: NodeCall, outputs: Outputs) -> Any:
-        """在节点完成后调用出口 Hook 并取得输出。
+    def exit(self, call: NodeCall, output: Output) -> Any:
+        """将当前单项输出交给出口函数 Hook。
 
         Args:
             call: Hook 当前处理的节点调用记录。
-            outputs: 按交付顺序组织的节点输出。
+            output: 当前等待转换的单项节点输出。
 
         Returns:
             同步调用或异步等待完成后的处理结果。
         """
 
         if self._phase is HookPhase.EXIT:
-            return self._function(call, outputs)
-        return outputs
+            return self._function(call, output)
+        return output
 
     def error(self, call: NodeCall, error: Exception) -> Any:
         """在错误阶段执行回调，未恢复的异常继续传播。
