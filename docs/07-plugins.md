@@ -435,6 +435,19 @@ Graph，再调用 `graph.plan()`；自行组装 Runtime 时也可以显式将同
 注销后，新 Graph 冻结时无法再解析该名称，已冻结 Graph 继续使用原快照；旧注销函数也不会影响后来建立的同名注册。
 Runtime 门面的 `register_policy()` 仍返回 Runtime 以支持链式组合，固定插件贡献的注销由 PluginHost 管理。
 
+## 节点诊断
+
+`NodeHook.inspect(call, phase, value)` 通过相同 Hook 注册与插件贡献通道参与实际 Node 调用边界。它同步返回 None，
+只允许读取，不接管执行控制；采集失败（包括非法 Hook 控制信号）不会改变业务结果。
+
+`HookPhase.ENTER` 位于全部入口转换之后，call.inputs 为实际输入，value 为 None；`EXIT` 逐项接收尚未经过出口
+转换的 Node 原始 Output；`ERROR` 接收实际调用或迭代异常。短路而未调用 Node 时，不补造实际调用记录。
+诊断方法不推进源迭代器，也不恢复业务异常。
+
+`interlace.engine.observation.current_node_event()` 提供当前 firing 的只读 execution、node 与 step 身份。
+默认 Engine 通过 `node_observation_scope()` 为同步、异步和生成器清理维持关联；替代执行器可通过同一公开作用域
+提供身份。该身份不写入领域 Event 或 Context，也不跨进程传播。
+
 ## 动态 Node Hook
 
 Graph 注册后保持冻结，但默认 `Engine` 允许使用者给后续 Graph execution 动态挂载 Hook：
@@ -501,7 +514,7 @@ Hook 通过两个信号显式改变流程：
 
 - `ShortCircuit(*outputs)` 只能从 `enter()` 发出。它跳过当前 Node，把 outputs 当作该 Node 的结果，经过
   当前 Node 的 output port/type 校验后继续走既有 Edge。
-- `StopGraph(*outputs)` 可以从任意 Hook 阶段发出。它立即停止后续 Node 执行，将携带的 outputs 追加到已经产生的
+- `StopGraph(*outputs)` 可以从 enter、exit 或 error 变换阶段发出。它立即停止后续 Node 执行，将携带的 outputs 追加到已经产生的
   terminal Output 后，按相同顺序发布到输出流并返回完整结果。已发布的数据不会被替换，空参数也会保留此前输出。
   当前 Graph 没有 graph-level output schema，因此对这些附加输出只校验它们是 `Output`。
 

@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Interlace Studio</title>
+    <script>
+      // 在样式和应用加载前应用主题，防止持久深色偏好刷新时闪白。
+      (() => {
+        let preference = "system";
+        try {
+          preference = localStorage.getItem("interlace.theme") || "system";
+        } catch {}
+        if (!["light", "dark", "system"].includes(preference))
+          preference = "system";
+        document.documentElement.dataset.themePreference = preference;
+        document.documentElement.dataset.theme =
+          preference === "system"
+            ? matchMedia("(prefers-color-scheme: dark)").matches
+              ? "dark"
+              : "light"
+            : preference;
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

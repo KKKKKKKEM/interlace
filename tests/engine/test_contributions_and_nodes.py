@@ -76,6 +76,7 @@ def test_runtime_observer_sees_read_only_lifecycle_and_cannot_break_work(
     assert [event.kind for event in events] == [
         RuntimeEventKind.EXECUTION_STARTED,
         RuntimeEventKind.NODE_STARTED,
+        RuntimeEventKind.OUTPUT_ROUTED,
         RuntimeEventKind.NODE_FINISHED,
         RuntimeEventKind.EXECUTION_FINISHED,
     ]

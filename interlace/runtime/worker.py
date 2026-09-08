@@ -10,6 +10,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from functools import partial
 from threading import RLock
+from types import MappingProxyType
 from typing import Any
 
 from ..engine.core import Output, _validate_timeout, require_non_empty_string
@@ -230,6 +231,16 @@ class GraphWorker:
             self._graphs[name] = graph
             self._pending_hooks.pop(name, None)
         return self
+
+    def graphs(self) -> Mapping[str, Graph]:
+        """取得供服务与诊断使用的冻结图注册快照。
+
+        Returns:
+            不允许增删注册项的名称与 Graph 映射。
+        """
+
+        with self._lock:
+            return MappingProxyType(dict(self._graphs))
 
     def consume(
         self,

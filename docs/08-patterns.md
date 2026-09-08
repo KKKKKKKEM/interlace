@@ -169,6 +169,7 @@ async for output in runtime.aiter("output-stream", 4):
 outputs = await runtime.start("output-stream", 4)
 ```
 
-`output_buffer` 限制活跃消费者的未读窗口。流式迭代结束后，Execution 仍保留完整 terminal Output tuple。
+`output_buffer` 限制活跃消费者的未读窗口。流式迭代结束后，输出存储仍按追加顺序保留可重放结果；
+调用 `result()` 时才读取完整 terminal Output tuple。
 
-[上一章：插件、SPI 与适配器开发](07-plugins.md)
+[上一章：插件、SPI 与适配器开发](07-plugins.md) · [下一章：RPC 与可视化工作台](09-service-and-studio.md)

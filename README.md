@@ -65,6 +65,33 @@ with Runtime() as runtime:
 6. [Runtime 内部架构](docs/06-runtime-architecture.md)
 7. [插件、SPI 与适配器开发](docs/07-plugins.md)
 8. [编排模式](docs/08-patterns.md)
+9. [RPC 与可视化工作台](docs/09-service-and-studio.md)
+
+## 可选 RPC 与可视化
+
+官方服务 extra 提供 HTTP/JSON 调用、JSON-RPC 2.0、SSE 输出流，以及内置的图编辑与运行工作台。
+基础安装仍保持零运行时依赖，不自动启动服务。
+
+```bash
+uv pip install "interlace[service] @ git+https://github.com/KKKKKKKEM/interlace.git"
+uv run --extra service python examples/service.py
+```
+
+打开 `http://127.0.0.1:8000`，按“项目列表 → 定义列表 → 定义详情”进入管理界面。已有数据迁入默认项目；
+详情分为概览、图编排与运行记录。已有代码图直接支持远程调用和运行查看；登记节点工厂与配置模型后，工作台还可
+拖拽连线、编辑配置、校验、保存草稿与发布不可变版本。界面已随包构建，使用者无需安装 Node.js。
+
+已有 Runtime 可直接接入：
+
+```python
+from interlace.service import GraphService
+
+# runtime 为已经注册 Graph 的运行时，由调用方管理生命周期。
+service = GraphService(runtime, database=".interlace/studio.sqlite3")
+service.serve()
+```
+
+安装、节点目录、HTTP/JSON-RPC 调用及服务所有权见[第九章](docs/09-service-and-studio.md)。
 
 ## 当前范围
 

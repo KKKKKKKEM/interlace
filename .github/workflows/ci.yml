@@ -28,6 +28,8 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Run tests
         run: uv run --python "${{ matrix.python-version }}" --with pytest pytest -q
+      - name: Run service contracts
+        run: uv run --python "${{ matrix.python-version }}" --extra service pytest tests/service -q
 
   static:
     name: Static checks and build
@@ -45,8 +47,36 @@ jobs:
       - name: Run Ruff
         run: uv run --with ruff ruff check interlace tests examples
       - name: Run mypy
-        run: uv run --with mypy mypy interlace
+        run: uv run --extra service mypy interlace
       - name: Check formatting
         run: uv run --with ruff ruff format --check interlace
       - name: Build distributions
         run: uv build
+
+  studio:
+    name: Studio browser contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install and build Studio
+        working-directory: web
+        run: npm ci && npm run build
+      - name: Verify bundled assets
+        run: git diff --exit-code -- interlace/service/static
+      - name: Install browser
+        working-directory: web
+        run: npx playwright install --with-deps chromium
+      - name: Run browser contracts
+        working-directory: web
+        run: npm test
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: studio-browser-results
+          path: web/test-results/

@@ -13,6 +13,7 @@
 | 运行角色 | `interlace.runtime` | EventRouter、GraphWorker | 分别处理 Event -> Work 与 Work -> Graph execution |
 | 能力端口 | `interlace.spi` | RouterRole、WorkerRole、EventBus、任务传输、GraphExecutor、SlotProvider、执行资源协议 | 隔离编排、传输、执行和资源实现 |
 | 默认适配器 | `interlace.adapters.memory`、`interlace.engine.executor` | EventBus、TaskBackend、Engine | 提供单进程内存运行时 |
+| 可选官方服务 | `interlace.service` | GraphService、NodeCatalog、Studio | 提供 RPC、图编辑发布与观测历史，按 extra 安装 |
 
 Runtime 是面向应用的稳定门面，PluginHost 是系统装配根。普通应用不需要看到后四层。
 
@@ -46,7 +47,14 @@ interlace/
 ├── spi/                     # EventBus、任务传输、GraphExecutor 等窄协议
 ├── adapters/                # 随包提供的具体部署适配器
 │   └── memory.py            # memory.EventBus、memory.TaskBackend
-└── nodes/                   # 可复用的非内核 Node，例如 KeyedJoin
+├── nodes/                   # 可复用的非内核 Node，例如 KeyedJoin
+└── service/                 # 按需安装的官方 RPC 与 Studio
+    ├── catalog.py           # 显式节点工厂与图文档编译
+    ├── models.py            # JSON 传输和编辑文档模型
+    ├── service.py           # 协议共用的图服务
+    ├── store.py             # 草稿、版本、观测与输出历史
+    ├── http.py              # HTTP、JSON-RPC、SSE 与 ASGI 装配
+    └── static/              # 随 Python 包交付的已构建工作台
 ```
 
 `interlace.engine` 不再充当高级 API 聚合入口。普通应用只从 `interlace` 导入；插件、SPI 和基础设施作者根据职责从
@@ -71,6 +79,7 @@ flowchart LR
     Plugins --> Engine
     Plugins --> SPI
     Nodes[interlace.nodes] --> Engine
+    Service[interlace.service] --> Public
 ```
 
 这里的关键约束是：
@@ -81,6 +90,10 @@ flowchart LR
 - `plugins` 管理装配元数据与生命周期，通过 SPI 的公开角色安装标准贡献，不读取 Runtime 私有状态；
 - `runtime` 可以依赖前述各层并完成组合，但不得把部署算法重新实现到门面中；
 - `nodes` 只放可复用的非内核 Node，只依赖内核公共语义，不能成为 Runtime 的隐式前置条件。
+- `service` 依赖公开 Runtime、Graph、Execution 及观察模型；核心不导入服务或 Web 依赖。`web/` 保存工作台源代码。
+
+服务通过 `Runtime.graphs()` 读取已注册图的只读快照；默认 GraphWorker 实现 `interlace.spi.GraphCatalog`。
+替代 Worker 若需启用图检查与服务，同样实现该窄协议。服务不回退读取默认 Worker 的私有注册表。
 
 ## 默认装配
 

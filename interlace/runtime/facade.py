@@ -29,7 +29,7 @@ from ..plugins import (
     Plugin,
     PluginHost,
 )
-from ..spi import EventHandler, RouterRole, SlotProvider, WorkerRole
+from ..spi import EventHandler, GraphCatalog, RouterRole, SlotProvider, WorkerRole
 from ._utils import _close_components, _remaining
 from .plugin import LocalRuntimePlugin
 
@@ -142,6 +142,20 @@ class Runtime:
 
         self.worker.register(name, graph)
         return self
+
+    def graphs(self) -> Mapping[str, Graph]:
+        """通过公开图目录能力读取当前注册快照。
+
+        Returns:
+            名称到冻结 Graph 的只读映射。
+
+        Raises:
+            TypeError: 注入的 Worker 未提供 GraphCatalog 能力。
+        """
+
+        if not isinstance(self.worker, GraphCatalog):
+            raise TypeError("worker must implement GraphCatalog for graph inspection")
+        return self.worker.graphs()
 
     def observe(self, event_type: str, handler: EventHandler) -> Runtime:
         """注册只读事件观察者，不建立目标 Graph 路由。

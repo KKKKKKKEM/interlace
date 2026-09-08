@@ -1,0 +1,24 @@
+{
+  "name": "interlace-studio",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "vite build && node build-licenses.mjs",
+    "test": "playwright test",
+    "format": "prettier --write src tests *.js *.json *.mjs index.html"
+  },
+  "dependencies": {
+    "@xyflow/react": "^12.8.0",
+    "eventsource-parser": "^3.0.0",
+    "lucide-react": "^0.468.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-router-dom": "^7.9.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.56.0",
+    "vite": "^6.4.0",
+    "prettier": "^3.6.0"
+  }
+}

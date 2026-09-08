@@ -1,0 +1,239 @@
+/* 基础层：调色板与跨主题共享的字体、圆角、材质参数。 */
+:root {
+  --neutral-0: #ffffff;
+  --neutral-25: #fafbfc;
+  --neutral-50: #f3f6f7;
+  --neutral-100: #edf1f3;
+  --neutral-200: #dce4e5;
+  --neutral-300: #b7c8c5;
+  --neutral-400: #8f9e9b;
+  --neutral-500: #65736f;
+  --neutral-600: #4d5b57;
+  --neutral-700: #35403d;
+  --neutral-750: #2d3532;
+  --neutral-800: #252c29;
+  --neutral-850: #202623;
+  --neutral-900: #1b201e;
+  --neutral-950: #151917;
+  --teal-50: #e8f5ef;
+  --teal-200: #9de4d4;
+  --teal-300: #76d5bf;
+  --teal-400: #53bfa6;
+  --teal-600: #087f70;
+  --teal-700: #066859;
+  --teal-900: #193b32;
+  --green-300: #81d4a5;
+  --green-700: #16805c;
+  --green-950: #192e24;
+  --red-300: #f3a0ad;
+  --red-700: #b63b4c;
+  --red-950: #362429;
+  --amber-300: #e5be77;
+  --amber-700: #916015;
+  --amber-950: #322c21;
+  --blue-300: #a5bfdf;
+  --blue-700: #536c83;
+  --blue-950: #26313d;
+  --font-sans:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Microsoft YaHei", sans-serif;
+  --font-mono: "SFMono-Regular", Consolas, monospace;
+  --radius-xs: 2px;
+  --radius-sm: 4px;
+  --radius-5: 5px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-7: 7px;
+  --radius-full: 50%;
+  --duration-fast: 140ms;
+  --duration-normal: 160ms;
+  --duration-tooltip: 350ms;
+  --font-size-9: 9px;
+  --font-size-10: 10px;
+  --font-size-11: 11px;
+  --font-size-12: 12px;
+  --font-size-13: 13px;
+  --font-size-14: 14px;
+  --font-size-15: 15px;
+  --font-size-16: 16px;
+  --font-size-18: 18px;
+  --font-size-19: 19px;
+  --font-size-20: 20px;
+  --font-size-21: 21px;
+  --font-size-23: 23px;
+  --opacity-disabled: 0.4;
+  --blur-glass: blur(22px) saturate(125%);
+  --blur-caption: blur(12px);
+  --blur-overlay: blur(6px);
+  --blur-navigation: blur(4px);
+}
+
+/* 语义层：主题只在此处选择颜色用途，业务样式不引用调色板。 */
+:root,
+:root[data-theme="light"] {
+  color-scheme: light;
+  --color-page: var(--neutral-100);
+  --color-surface: var(--neutral-0);
+  --color-surface-soft: var(--neutral-50);
+  --color-surface-hover: #f0f5f3;
+  --color-surface-selected: #e4f1e9;
+  --color-surface-glass: #ffffffb3;
+  --color-surface-translucent: #ffffffe0;
+  --color-surface-node: #ffffffdb;
+  --color-surface-dialog: #fafdfff0;
+  --color-overlay: #203c5126;
+  --color-border: var(--neutral-200);
+  --color-border-subtle: #e8edee;
+  --color-border-strong: var(--neutral-300);
+  --color-border-glass: #cdd9dcaa;
+  --color-text: var(--neutral-850);
+  --color-text-secondary: var(--neutral-600);
+  --color-text-muted: var(--neutral-500);
+  --color-text-inverse: var(--neutral-0);
+  --color-accent: var(--teal-600);
+  --color-accent-hover: var(--teal-700);
+  --color-accent-soft: var(--teal-50);
+  --color-on-accent: var(--neutral-0);
+  --color-success: var(--green-700);
+  --color-success-soft: #eff8f3;
+  --color-success-border: #c5dfd0;
+  --color-danger: var(--red-700);
+  --color-danger-soft: #fcf0f2;
+  --color-danger-border: #e6bec5;
+  --color-warning: var(--amber-700);
+  --color-warning-soft: #fff3db;
+  --color-warning-border: #d6bc8b;
+  --color-info: var(--blue-700);
+  --color-info-soft: #eaf0f6;
+  --color-focus-soft: #087f7018;
+  --color-canvas: #edf2f3;
+  --color-canvas-dot: #c5d3cf;
+  --color-edge: #91a49b;
+  --color-handle: #879f93;
+  --background-shell: linear-gradient(120deg, #dce9e6, #f1f4f6 48%, #e0e8f2);
+  --background-workbench: linear-gradient(
+    120deg,
+    #e7f0ed,
+    #f2f5f8 55%,
+    #e5edf4
+  );
+  --background-canvas: linear-gradient(125deg, #e2eeea, #eef2f5 48%, #e4edf5);
+  --shadow-floating: 0 2px 6px #294c480a;
+  --shadow-dialog: 0 8px 24px #263d511a;
+  --shadow-drawer: -8px 0 22px #2536430a;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --color-page: var(--neutral-950);
+  --color-surface: var(--neutral-900);
+  --color-surface-soft: var(--neutral-850);
+  --color-surface-hover: var(--neutral-800);
+  --color-surface-selected: #20382e;
+  --color-surface-glass: #202623bd;
+  --color-surface-translucent: #1b201ee8;
+  --color-surface-node: #252c29ed;
+  --color-surface-dialog: #202623f2;
+  --color-overlay: #00000066;
+  --color-border: #35413b;
+  --color-border-subtle: #2b342f;
+  --color-border-strong: #61746a;
+  --color-border-glass: #53675b66;
+  --color-text: #e7eeea;
+  --color-text-secondary: #c0ccc5;
+  --color-text-muted: #9aaaa1;
+  --color-text-inverse: var(--neutral-950);
+  --color-accent: var(--teal-300);
+  --color-accent-hover: var(--teal-200);
+  --color-accent-soft: var(--teal-900);
+  --color-on-accent: var(--neutral-950);
+  --color-success: var(--green-300);
+  --color-success-soft: var(--green-950);
+  --color-success-border: #375b46;
+  --color-danger: var(--red-300);
+  --color-danger-soft: var(--red-950);
+  --color-danger-border: #6b404b;
+  --color-warning: var(--amber-300);
+  --color-warning-soft: var(--amber-950);
+  --color-warning-border: #6c5836;
+  --color-info: var(--blue-300);
+  --color-info-soft: var(--blue-950);
+  --color-focus-soft: #76d5bf26;
+  --color-canvas: #181e1b;
+  --color-canvas-dot: #38473e;
+  --color-edge: #6d8979;
+  --color-handle: #93ac9d;
+  --background-shell: linear-gradient(120deg, #1b2620, #1b201e 48%, #202529);
+  --background-workbench: linear-gradient(
+    120deg,
+    #1e2822,
+    #202623 55%,
+    #21282b
+  );
+  --background-canvas: linear-gradient(125deg, #18221c, #1c211e 48%, #1c2327);
+  --shadow-floating: 0 2px 6px #00000026;
+  --shadow-dialog: 0 8px 24px #0000004d;
+  --shadow-drawer: -8px 0 22px #00000033;
+}
+
+/* 组件层：同一视觉角色共用语义值，可在这里独立调整组件。 */
+:root {
+  --button-background: var(--color-surface);
+  --button-foreground: var(--color-text);
+  --button-border: var(--color-border);
+  --button-radius: var(--radius-md);
+  --input-background: var(--color-surface);
+  --input-foreground: var(--color-text);
+  --input-border: var(--color-border);
+  --input-radius: var(--radius-md);
+  --tooltip-background: var(--color-text);
+  --tooltip-foreground: var(--color-text-inverse);
+  --node-background: var(--color-surface-node);
+  --node-border: var(--color-border-glass);
+  --node-radius: var(--radius-lg);
+  --node-selection-ring: 0 0 0 2px var(--color-focus-soft);
+  --node-port-background: transparent;
+  --canvas-background: var(--background-canvas);
+  --canvas-dot: var(--color-canvas-dot);
+  --canvas-edge: var(--color-edge);
+  --canvas-edge-label: var(--color-text-secondary);
+  --canvas-edge-label-background: var(--color-canvas);
+  --glass-background: var(--color-surface-glass);
+  --glass-border: var(--color-border-glass);
+  --glass-filter: var(--blur-glass);
+  --dialog-background: var(--color-surface-dialog);
+  --dialog-border: var(--color-border-glass);
+  --dialog-radius: var(--radius-lg);
+  --dialog-shadow: var(--shadow-dialog);
+  --table-header-background: var(--color-surface-soft);
+  --table-row-hover: var(--color-surface-hover);
+  --table-row-selected: var(--color-surface-selected);
+}
+
+/* React Flow 通过公开 CSS 变量接入相同主题，避免第三方默认浅色泄漏。 */
+.react-flow {
+  --xy-background-color: transparent;
+  --xy-background-pattern-color: var(--canvas-dot);
+  --xy-edge-stroke: var(--canvas-edge);
+  --xy-edge-stroke-selected: var(--color-accent);
+  --xy-connectionline-stroke: var(--color-accent);
+  --xy-handle-background-color: var(--color-handle);
+  --xy-handle-border-color: var(--node-background);
+  --xy-selection-background-color: var(--color-focus-soft);
+  --xy-selection-border: 1px solid var(--color-accent);
+  --xy-edge-label-background-color: var(--canvas-edge-label-background);
+  --xy-edge-label-color: var(--canvas-edge-label);
+}
+
+/* 无透明偏好使用当前主题实底，保留相同语义与交互。 */
+@media (prefers-reduced-transparency: reduce) {
+  :root {
+    --glass-background: var(--color-surface-soft);
+    --dialog-background: var(--color-surface);
+    --node-background: var(--color-surface);
+    --glass-filter: none;
+    --blur-caption: none;
+    --blur-overlay: none;
+    --blur-navigation: none;
+  }
+}

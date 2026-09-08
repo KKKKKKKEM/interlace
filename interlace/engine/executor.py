@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import inspect
+import logging
+import traceback
+
 from collections import deque
 from collections.abc import (
     Callable,
@@ -40,11 +44,19 @@ from .hooks import (
     ShortCircuit,
     StopGraph,
 )
-from .observation import ObservationHub, RuntimeEvent, RuntimeEventKind
+from .observation import (
+    ObservationHub,
+    RuntimeEvent,
+    RuntimeEventKind,
+    node_observation_scope,
+)
 from .runner import LocalRunner
 from .slots import Slot
 
 Emit = Callable[[Event], None]
+
+# 诊断回调失败只写基础设施日志，不参与业务异常恢复。
+_LOGGER = logging.getLogger(__name__)
 
 
 class Engine:
@@ -264,18 +276,19 @@ class Engine:
                 scope=node_id,
                 options=options,
             )
-            self._observations.publish(
-                RuntimeEvent(
-                    RuntimeEventKind.NODE_STARTED,
-                    graph=graph_name,
-                    execution_id=execution.id,
-                    node=node_id,
-                    attributes={"step": execution.steps + 1},
-                )
-            )
+            node_started = False
             node_error: BaseException | None = None
+            node_event = RuntimeEvent(
+                RuntimeEventKind.NODE_STARTED,
+                graph=graph_name,
+                execution_id=execution.id,
+                node=node_id,
+                attributes={"step": execution.steps + 1},
+            )
             try:
-                with execution.step(node_id):
+                with execution.step(node_id), node_observation_scope(node_event):
+                    node_started = True
+                    self._observations.publish(node_event)
                     try:
                         with closing(
                             self._call_node(
@@ -308,7 +321,6 @@ class Engine:
                                 edges = outgoing_for(node_id, output.port)
                                 if not edges:
                                     execution.publish_output(output)
-                                    continue
                                 for edge in edges:
                                     target_type = specs[edge.target].input_ports[
                                         edge.target_port
@@ -324,6 +336,22 @@ class Engine:
                                         output.value
                                     )
                                     schedule_if_ready(edge.target)
+                                self._observations.publish(
+                                    RuntimeEvent(
+                                        RuntimeEventKind.OUTPUT_ROUTED,
+                                        graph=graph_name,
+                                        execution_id=execution.id,
+                                        node=node_id,
+                                        attributes={
+                                            "step": execution.steps,
+                                            "port": output.port,
+                                            "targets": tuple(
+                                                (edge.target, edge.target_port)
+                                                for edge in edges
+                                            ),
+                                        },
+                                    )
+                                )
                     except ShortCircuit as exc:
                         raise HookExecutionError(
                             "ShortCircuit is only valid during hook enter",
@@ -345,19 +373,40 @@ class Engine:
                 node_error = exc
                 raise
             finally:
-                self._observations.publish(
-                    RuntimeEvent(
-                        RuntimeEventKind.NODE_FINISHED,
-                        graph=graph_name,
-                        execution_id=execution.id,
-                        node=node_id,
-                        status="failed" if node_error is not None else "succeeded",
-                        error_type=(
-                            None if node_error is None else type(node_error).__name__
-                        ),
-                        attributes={"step": execution.steps},
+                if node_started:
+                    error_details = {}
+                    if node_error is not None:
+                        try:
+                            error_details = {
+                                "error": str(node_error)[:65536],
+                                "traceback": "".join(
+                                    traceback.format_exception(
+                                        type(node_error),
+                                        node_error,
+                                        node_error.__traceback__,
+                                    )
+                                )[:65536],
+                            }
+                        except BaseException:
+                            error_details = {"error": type(node_error).__name__}
+                    self._observations.publish(
+                        RuntimeEvent(
+                            RuntimeEventKind.NODE_FINISHED,
+                            graph=graph_name,
+                            execution_id=execution.id,
+                            node=node_id,
+                            status="failed" if node_error is not None else "succeeded",
+                            error_type=(
+                                None
+                                if node_error is None
+                                else type(node_error).__name__
+                            ),
+                            attributes={
+                                "step": execution.steps,
+                                **error_details,
+                            },
+                        )
                     )
-                )
             # 每轮只消费一组输入，避免活跃循环使其他节点长期无法执行。
             schedule_if_ready(node_id)
 
@@ -464,16 +513,25 @@ class Engine:
 
             if index == len(hooks):
                 try:
+                    self._inspect_node(hooks, call, HookPhase.ENTER, None)
                     result = self._resolve(
                         node.execute(call.inputs, context), execution
                     )
-                    yield from produce(result, "Node")
+                    with closing(produce(result, "Node")) as source_outputs:
+                        for output in source_outputs:
+                            self._inspect_node(hooks, call, HookPhase.EXIT, output)
+                            yield output
                 except (ShortCircuit, StopGraph) as signal:
                     raise HookExecutionError(
                         f"{type(signal).__name__} can only be raised by a hook",
                         graph=graph_name,
                         node=node_id,
                     ) from signal
+                except GeneratorExit:
+                    raise
+                except BaseException as exc:
+                    self._inspect_node(hooks, call, HookPhase.ERROR, exc)
+                    raise
                 return
 
             hook = hooks[index]
@@ -506,6 +564,30 @@ class Engine:
                 graph=graph_name,
                 node=node_id,
             ) from exc
+
+    @staticmethod
+    def _inspect_node(
+        hooks: tuple[NodeHook, ...], call: NodeCall, phase: HookPhase, value: Any
+    ) -> None:
+        """在实际调用边界通知诊断 Hook，不等待异步结果或改变输出。
+
+        Args:
+            hooks: 当前节点已绑定的 Hook 快照。
+            call: 实际传给节点的调用参数。
+            phase: 实际输入、原始输出或异常阶段。
+            value: 当前输出或异常，输入阶段为 None。
+        """
+
+        for hook in hooks:
+            try:
+                callback: Callable[[NodeCall, HookPhase, Any], object] = hook.inspect
+                result = callback(call, phase, value)
+                if result is not None:
+                    if inspect.iscoroutine(result):
+                        result.close()
+                    raise TypeError("NodeHook.inspect must return None synchronously")
+            except BaseException:
+                _LOGGER.exception("node diagnostic observer failed")
 
     def _resolve(self, value: object, execution: Execution) -> object:
         """通过调用运行器解析同步值或等待异步结果。

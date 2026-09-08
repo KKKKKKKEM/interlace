@@ -19,7 +19,7 @@ from .runtime import (
     Work,
     WorkHandler,
 )
-from .roles import RouterRole, WorkerRole
+from .roles import GraphCatalog, RouterRole, WorkerRole
 from ..engine.execution_resources import ExecutionNotifier, OutputStore
 
 __all__ = [
@@ -44,4 +44,5 @@ __all__ = [
     "Work",
     "WorkHandler",
     "WorkerRole",
+    "GraphCatalog",
 ]

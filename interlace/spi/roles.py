@@ -17,6 +17,19 @@ from .runtime import EventHandler
 
 
 @runtime_checkable
+class GraphCatalog(Protocol):
+    """供服务与诊断工具读取已注册图的可选角色能力。"""
+
+    def graphs(self) -> Mapping[str, Graph]:
+        """取得已冻结图的只读注册快照。
+
+        Returns:
+            注册名称到冻结 Graph 的映射。
+        """
+        ...
+
+
+@runtime_checkable
 class RouterRole(Protocol):
     @property
     def idle(self) -> bool:

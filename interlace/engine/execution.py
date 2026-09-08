@@ -504,7 +504,7 @@ class Execution:
             self._notifier.notify()
         return _OutputIterator(self, stream_id)
 
-    def __aiter__(self) -> AsyncIterator[Output]:
+    def __aiter__(self) -> _AsyncOutputIterator:
         """异步迭代 terminal Output，语义与同步迭代一致。
 
         Returns:

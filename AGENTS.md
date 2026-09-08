@@ -141,6 +141,8 @@ Event、Context、Execution、ExecutionLimits、ExecutionStatus、Slot、SlotPoo
 5. keyed join、窗口和领域状态属于扩展 Node，不进入 Engine 的固定调度语义。
 6. Engine 逐项推进 Node 输出；NodeHook.exit 逐项接收 Output，可返回 Output、Iterable[Output] 或 None。
    Hook 不接管 Node 源迭代器；迭代阶段的控制边界、取消、超时、清理与直接调用一致。
+7. NodeHook.inspect 通过相同 Hook 贡献通道同步采集实际 Node 调用边界：输入位于所有 enter 转换之后，原始输出
+   位于 exit 转换之前；不得修改参数或恢复异常，返回值不参与执行，采集失败隔离。触发身份通过观测作用域关联。
 
 ## 第十三条：公共行为必须可验证
 
@@ -173,6 +175,20 @@ Event、Context、Execution、ExecutionLimits、ExecutionStatus、Slot、SlotPoo
 4. 成员字段（含类属性和私有实例字段）必须有中文说明，可使用字段旁注释或类文档字符串的 Attributes 节，明确
    含义及必要的单位、默认值、所有权或可变性边界。实现、测试和示例均遵守本条。
 
+## 第十六条：官方服务按需启用
+
+1. RPC 与可视化属于官方 `interlace.service` 扩展层，通过 `interlace[service]` 安装；基础包保持零运行时依赖，
+   导入 `interlace` 不加载服务依赖或监听端口。
+2. 服务仅通过 Runtime、Execution、冻结 Graph 与公开 GraphCatalog 能力调用和检查图，不读取运行角色私有状态。
+3. HTTP/JSON、JSON-RPC 与可视化共享执行服务和 Execution 契约；协议适配器不实现第二套执行器。
+4. 可视化节点只能由应用显式登记的工厂与配置模型构建；草稿可不完整，发布必须经过核心冻结校验。
+5. 发布版本不可变，执行记录保存当时的图结构；草稿更新比较修订号。任意 Python 构造代码不隐式转换为编辑文档。
+6. 生命周期观测不携带节点业务输入对象；服务可通过受控 NodeHook.inspect 独立快照输入、配置和原始输出，并通过
+   观测作用域关联 Python logging。诊断记录按 execution、node 与 firing 隔离，允许关闭采集，不改变原对象或业务结果。
+7. 服务历史、诊断与终端输出存储不代表任务恢复、broker 持久化或跨进程 Slot 延续。
+8. 项目属于服务管理层，按“项目、逻辑定义、版本与运行实例”组织界面；不改变 Runtime 注册名与执行语义。
+   已有定义通过数据迁移归入默认项目，移动定义时其草稿、版本与历史保持整体归属，定义标识仍全局唯一。
+
 ## 验证要求
 
 行为变更应先运行相关测试，并在可行时运行完整检查：
@@ -185,3 +201,6 @@ uv run --with ruff ruff format --check interlace
 ```
 
 文档变更还应检查本地链接、Markdown 围栏和发生变化的 Mermaid 图。
+
+服务变更运行 `uv run --extra service pytest tests/service -q`；界面变更在 `web/` 中运行 `npm ci`、
+`npm run build` 与 `npm test`。内置静态资源随 Python 分发包交付，安装用户不需要 Node.js。

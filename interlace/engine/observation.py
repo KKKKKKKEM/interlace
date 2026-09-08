@@ -5,7 +5,9 @@ from __future__ import annotations
 import enum
 import itertools
 import logging
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from threading import RLock
@@ -23,6 +25,7 @@ class RuntimeEventKind(str, enum.Enum):
         EXECUTION_FINISHED: 执行终止事件。
         NODE_STARTED: 节点触发开始事件。
         NODE_FINISHED: 节点触发结束事件。
+        OUTPUT_ROUTED: 输出通过校验后的端口传播记录，不携带业务值。
         EVENT_PUBLISHED: 领域事件已发布事件。
         WORK_SUBMITTED: 工作已提交事件。
         WORK_FINISHED: 工作交付结束事件。
@@ -32,6 +35,7 @@ class RuntimeEventKind(str, enum.Enum):
     EXECUTION_FINISHED = "execution.finished"
     NODE_STARTED = "node.started"
     NODE_FINISHED = "node.finished"
+    OUTPUT_ROUTED = "output.routed"
     EVENT_PUBLISHED = "event.published"
     WORK_SUBMITTED = "work.submitted"
     WORK_FINISHED = "work.finished"
@@ -84,6 +88,40 @@ class RuntimeObserver(Protocol):
         Args:
             event: 需要发布、观察或处理的事件。
         """
+
+
+# 仅携带观测身份；事件循环提交会复制当前上下文，不携带领域数据。
+_NODE_EVENT: ContextVar[RuntimeEvent | None] = ContextVar(
+    "interlace.node_event", default=None
+)
+
+
+def current_node_event() -> RuntimeEvent | None:
+    """读取当前调用链的节点触发身份，供日志与诊断扩展关联记录。
+
+    Returns:
+        当前节点开始事件；不在节点调用链内时为 None。
+    """
+
+    return _NODE_EVENT.get()
+
+
+@contextmanager
+def node_observation_scope(event: RuntimeEvent) -> Iterator[None]:
+    """在完整 firing 期间关联观测身份，并在清理后恢复上层作用域。
+
+    Args:
+        event: 本次节点开始事件。
+
+    Yields:
+        同步或异步节点与生成器清理共用的身份作用域。
+    """
+
+    token = _NODE_EVENT.set(event)
+    try:
+        yield
+    finally:
+        _NODE_EVENT.reset(token)
 
 
 class ObserverHandle:

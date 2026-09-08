@@ -47,3 +47,6 @@ logs/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+node_modules/
+.interlace/
+web/test-results/

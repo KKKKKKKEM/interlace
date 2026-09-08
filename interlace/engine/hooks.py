@@ -55,6 +55,17 @@ class NodeCall:
 class NodeHook:
     """通过 enter、exit 和 error 介入一次 Node 执行。"""
 
+    def inspect(self, call: NodeCall, phase: HookPhase, value: Any) -> None:
+        """同步采集实际 Node 调用边界；返回值不参与业务流程，失败被隔离。
+
+        Args:
+            call: 已经过全部 enter 转换的实际调用，只允许读取。
+            phase: ENTER 表示实际调用前，EXIT 表示一项原始 Node 输出，ERROR 表示调用或迭代失败。
+            value: ENTER 为 None，EXIT 为 Output，ERROR 为异常；不得修改原对象。
+        """
+
+        del call, phase, value
+
     def enter(self, call: NodeCall) -> NodeCall | Awaitable[NodeCall]:
         """在 Node 执行前转换调用参数。
 
