@@ -309,7 +309,7 @@ class GraphExecutor(Protocol):
 
         Args:
             name: 注册或查找使用的名称。
-            graph: 目标 Graph 定义或其注册名称，以类型声明为准。
+            graph: 冻结的目标图；执行器每次节点调用使用 graph.context_factory 创建上下文。
             inputs: 入口数据或按端口名称组织的输入映射。
             emit: 发布跨图事件的回调。
             plan: 限定本次执行范围的计划，None 使用完整 Graph。

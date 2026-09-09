@@ -97,6 +97,14 @@ Event、Context、Execution、ExecutionLimits、ExecutionStatus、Slot、SlotPoo
    Runtime 的 start/run/arun/iter/aiter 接受 options 并在提交前深复制；Work.options 供任务适配器传递。
    配置键使用领域命名空间，值必须可深复制，不保存 Client 等资源；核心不解释下载或模型推理等领域选项。
    配置不沿 Output 改写、不随 emit 继承，跨图事件创建的新 execution 默认使用空配置。
+5. Graph(context_factory=...) 按图固定同步 Context 工厂，默认 Context.make；工厂每次 Node firing 接收已绑定的
+   基础 Context 与 Hook enter 前的只读输入，返回本次独立 Context。领域工厂自行定义构造与 make 逻辑，
+   通过 Context(parent=base) 组合基础上下文；emit、取消、Slot、state 的节点命名空间隔离、options 快照和
+   静止回调均委托给基础上下文，不复制内部执行状态。parent 与底层绑定参数互斥；核心不解释领域字段。
+   Node 与该次调用的 Hook 使用同一返回实例，工厂不得缓存或跨调用复用 Context，不得改写基础执行能力契约。
+6. 领域字段由工厂或领域节点从 typed inputs 绑定，跨节点数据通过 Output 传递；Context 实例和附加字段不自动沿 Edge、
+   Event 或跨进程传播，也不因同名 state 命名空间而跨 Node 共享。目标图使用自身 context_factory。
+   工厂执行计入本次 Node firing 的步数与超时，错误和取消按原执行契约传播；替代 GraphExecutor 必须遵守同一约定。
 
 ## 第九条：同步与异步共享语义
 

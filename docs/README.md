@@ -21,7 +21,7 @@
 4. [Event 与跨图工作流](04-events-and-workflows.md)
    Context.emit、事件路由、Work、观察者和 Slot 链路。
 5. [Execution、并发与失败](05-execution.md)
-   输出流、取消、超时、并发、错误传播和生命周期。
+   领域 Context 工厂与组合、输出流、取消、超时、并发、错误传播和生命周期。
 
 ### 第三部分：理解和扩展系统
 

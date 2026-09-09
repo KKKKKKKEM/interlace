@@ -21,8 +21,10 @@ from .runtime import (
 )
 from .roles import GraphCatalog, RouterRole, WorkerRole
 from ..engine.execution_resources import ExecutionNotifier, OutputStore
+from ..engine.events import ContextFactory
 
 __all__ = [
+    "ContextFactory",
     "Delivery",
     "DeliveryOutcome",
     "DeliveryResult",

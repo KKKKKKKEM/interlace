@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import math
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
@@ -16,6 +17,7 @@ from .core import (
     require_non_empty_string,
 )
 from .errors import GraphError, GraphFrozenError, GraphValidationError
+from .events import Context, ContextFactory
 from .policies import BoundPolicy, PolicyRef, PolicyRegistry
 
 
@@ -181,6 +183,7 @@ class Graph:
 
     Attributes:
         _entrypoint: Graph 入口节点 ID。
+        _context_factory: 构造时固定的同步领域 Context 工厂，不保存当前执行状态。
         _nodes: Graph 内节点 ID 到节点实例的绑定。
         _edges: 保持声明顺序的有向边集合。
         _edge_set: 用于拒绝重复边的集合。
@@ -189,13 +192,36 @@ class Graph:
         _frozen: 是否已完成冻结，冻结后不再接受定义修改。
     """
 
-    def __init__(self, *, entrypoint: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        entrypoint: str | None = None,
+        context_factory: ContextFactory = Context.make,
+    ) -> None:
         """创建处于构建状态的空 Graph。
 
         Args:
             entrypoint: 可选的入口 Node ID，也可稍后用 entry() 设置。
+            context_factory: 接收基础 Context 和只读输入的同步工厂，默认 Context.make。
+
+        Raises:
+            TypeError: context_factory 不可调用或声明为异步函数、生成器函数。
         """
 
+        if not callable(context_factory) or any(
+            check(callback)
+            for callback in (
+                context_factory,
+                getattr(context_factory, "__call__", None),
+            )
+            for check in (
+                inspect.iscoroutinefunction,
+                inspect.isasyncgenfunction,
+                inspect.isgeneratorfunction,
+            )
+        ):
+            raise TypeError("context_factory must be a synchronous callable")
+        self._context_factory = context_factory
         self._entrypoint = (
             None
             if entrypoint is None
@@ -207,6 +233,16 @@ class Graph:
         self._outgoing: dict[tuple[str, str], tuple[Edge, ...]] = {}
         self._node_specs: dict[str, NodeSpec] = {}
         self._frozen = False
+
+    @property
+    def context_factory(self) -> ContextFactory:
+        """返回本图固定使用的节点上下文工厂。
+
+        Returns:
+            从基础执行能力和当前输入创建 Context 的同步可调用对象。
+        """
+
+        return self._context_factory
 
     @property
     def entrypoint(self) -> str:

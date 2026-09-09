@@ -266,16 +266,6 @@ class Engine:
                     continue
                 consumed = {port: queues[node_id][port].popleft() for port in selection}
 
-            context = Context(
-                emit,
-                slot,
-                checkpoint=execution.checkpoint,
-                is_cancelled=lambda: execution.cancel_requested,
-                local=local_state,
-                finalizers=finalizers,
-                scope=node_id,
-                options=options,
-            )
             node_started = False
             node_error: BaseException | None = None
             node_event = RuntimeEvent(
@@ -289,6 +279,33 @@ class Engine:
                 with execution.step(node_id), node_observation_scope(node_event):
                     node_started = True
                     self._observations.publish(node_event)
+                    try:
+                        base_context = Context(
+                            emit,
+                            slot,
+                            checkpoint=execution.checkpoint,
+                            is_cancelled=lambda: execution.cancel_requested,
+                            local=local_state,
+                            finalizers=finalizers,
+                            scope=node_id,
+                            options=options,
+                        )
+                        context = graph.context_factory(
+                            base_context, MappingProxyType(consumed)
+                        )
+                        if not isinstance(context, Context):
+                            if inspect.iscoroutine(context):
+                                context.close()
+                            raise TypeError("context_factory must return a Context")
+                    except ExecutionControlError:
+                        raise
+                    except Exception as exc:
+                        raise ExecutionError(
+                            f"context factory failed: {exc}",
+                            graph=graph_name,
+                            node=node_id,
+                        ) from exc
+                    execution.checkpoint()
                     try:
                         with closing(
                             self._call_node(

@@ -6,7 +6,7 @@ from collections.abc import Callable, Mapping, MutableMapping
 from copy import deepcopy
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any
+from typing import Any, TypeVar
 
 from .core import require_non_empty_string
 from .slots import Slot
@@ -31,6 +31,7 @@ class Event:
 
 
 Emit = Callable[[Event], None]
+_C = TypeVar("_C", bound="Context")  # 保留领域工厂返回的具体 Context 子类类型。
 
 
 def snapshot_options(options: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -59,6 +60,10 @@ def snapshot_options(options: Mapping[str, Any] | None) -> dict[str, Any]:
 class Context:
     """向当前 Node 暴露事件、Slot 和协作式执行检查点。
 
+    领域工厂通过 Graph(context_factory=...) 装配。领域类型通过 parent 组合基础上下文，
+    自行定义构造参数和 make 逻辑；继承只复用执行能力的转发接口。
+    每次节点调用创建独立实例；附加字段由工厂或领域节点绑定，不自动跨节点或 execution 传播。
+
     Attributes:
         __slots__: 实例允许保存的字段名称，限制动态增加属性。
         _emit: 事件发布回调。
@@ -69,6 +74,7 @@ class Context:
         _finalizers: 当前执行静止阶段的回调集合。
         _scope: 当前节点或插件的状态隔离作用域。
         _options: 当前节点调用独立持有的执行配置，顶层只读。
+        _parent: 组合模式下借用的基础上下文，执行能力完全委托给它；根上下文为 None。
     """
 
     __slots__ = (
@@ -80,11 +86,12 @@ class Context:
         "_scope",
         "_slot",
         "_options",
+        "_parent",
     )
 
     def __init__(
         self,
-        emit: Emit,
+        emit: Emit | None = None,
         slot: Slot | None = None,
         *,
         checkpoint: Callable[[], None] | None = None,
@@ -93,6 +100,7 @@ class Context:
         finalizers: list[Callable[[], None]] | None = None,
         scope: str = "",
         options: Mapping[str, Any] | None = None,
+        parent: Context | None = None,
     ) -> None:
         """绑定 Runtime 的内部事件接收函数。
 
@@ -105,11 +113,33 @@ class Context:
             finalizers: 静止阶段按注册顺序调用的回调集合。
             scope: 当前回调或状态所属的隔离作用域。
             options: 本次执行配置；深复制后顶层只读，不随 emit 继承。
+            parent: 借用的基础上下文；提供时只组合其执行能力，不接受其他绑定参数。
 
         Raises:
             TypeError: 参数类型或接口实现不符合当前契约。
         """
 
+        self._parent = parent
+        if parent is not None:
+            if not isinstance(parent, Context):
+                raise TypeError("parent must be a Context")
+            if (
+                any(
+                    value is not None
+                    for value in (
+                        emit,
+                        slot,
+                        checkpoint,
+                        is_cancelled,
+                        local,
+                        finalizers,
+                        options,
+                    )
+                )
+                or scope != ""
+            ):
+                raise TypeError("parent cannot be combined with execution bindings")
+            return
         if not callable(emit):
             raise TypeError("context emitter must be callable")
         if slot is not None and not isinstance(slot, Slot):
@@ -125,6 +155,30 @@ class Context:
         if not callable(self._checkpoint) or not callable(self._is_cancelled):
             raise TypeError("context control callbacks must be callable")
 
+    @classmethod
+    def make(cls: type[_C], base: Context, inputs: Mapping[str, Any]) -> _C:
+        """组合当前节点的基础上下文，创建默认的能力转发对象。
+
+        领域工厂可以独立实现本方法并调用自己的构造器；构造器通过
+        super().__init__(parent=base) 组合执行能力，无需接受底层绑定参数。
+
+        Args:
+            base: 引擎为本次调用绑定的执行能力，不包含 Runtime 内部工作对象。
+            inputs: 本次 firing 选中的只读端口映射，位于 Hook enter 转换之前。
+
+        Returns:
+            当前类的新实例，执行能力委托给 base，不复制或重新初始化其状态。
+
+        Raises:
+            TypeError: 基础上下文或输入类型非法，或使用默认工厂的类型不接受 parent。
+        """
+
+        if not isinstance(base, Context):
+            raise TypeError("base must be a Context")
+        if not isinstance(inputs, Mapping):
+            raise TypeError("inputs must be a mapping")
+        return cls(parent=base)
+
     @property
     def options(self) -> Mapping[str, Any]:
         """读取本次执行配置；嵌套值的修改仅影响当前节点调用。
@@ -133,7 +187,7 @@ class Context:
             顶层只读的领域配置映射，不包含运行时资源。
         """
 
-        return self._options
+        return self._options if self._parent is None else self._parent.options
 
     @property
     def slot(self) -> Slot | None:
@@ -143,7 +197,7 @@ class Context:
             当前逻辑链使用的本地 Slot。
         """
 
-        return self._slot
+        return self._slot if self._parent is None else self._parent.slot
 
     def emit(self, event_type: str, payload: Any = None) -> Event:
         """向 Runtime 提交一项跨 Graph 领域事件。
@@ -156,6 +210,8 @@ class Context:
             事件传输已经接受的 Event 实例。
         """
 
+        if self._parent is not None:
+            return self._parent.emit(event_type, payload)
         event = Event(event_type, payload)
         self._emit(event)
         return event
@@ -168,12 +224,15 @@ class Context:
             满足当前操作的判断条件时返回 True，否则返回 False。
         """
 
-        return self._is_cancelled()
+        return self._is_cancelled() if self._parent is None else self._parent.cancelled
 
     def checkpoint(self) -> None:
         """让同步 Node 协作式响应取消、总超时和单 Node 超时。"""
 
-        self._checkpoint()
+        if self._parent is not None:
+            self._parent.checkpoint()
+        else:
+            self._checkpoint()
 
     def state(self, namespace: str) -> MutableMapping[str, Any]:
         """返回当前 execution 内、按插件命名空间隔离的临时状态。
@@ -185,6 +244,8 @@ class Context:
             当前作用域与命名空间对应的可变执行局部映射。
         """
 
+        if self._parent is not None:
+            return self._parent.state(namespace)
         namespace = require_non_empty_string(namespace, "context state namespace")
         scoped = (self._scope, namespace)
         return self._local.setdefault(scoped, {})
@@ -199,6 +260,9 @@ class Context:
             TypeError: 参数类型或接口实现不符合当前契约。
         """
 
+        if self._parent is not None:
+            self._parent.on_quiescence(callback)
+            return
         if not callable(callback):
             raise TypeError("quiescence callback must be callable")
         self._finalizers.append(callback)
@@ -218,3 +282,6 @@ def _false() -> bool:
     """
 
     return False
+
+
+ContextFactory = Callable[[Context, Mapping[str, Any]], Context]

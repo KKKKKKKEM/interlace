@@ -4,6 +4,7 @@ import asyncio
 import pickle
 import sqlite3
 from collections.abc import Awaitable
+from types import MappingProxyType
 from typing import Any, cast
 from threading import Event as ThreadEvent
 
@@ -98,7 +99,12 @@ class SyncExecutor:
         with execution.step(graph.entrypoint):
             outputs = graph.nodes[graph.entrypoint].execute(
                 {"default": inputs},
-                Context(emit, slot, checkpoint=execution.checkpoint),
+                graph.context_factory(
+                    Context(
+                        emit, slot, checkpoint=execution.checkpoint, options=options
+                    ),
+                    MappingProxyType({"default": inputs}),
+                ),
             )
         for output in outputs:
             execution.publish_output(output)
@@ -148,7 +154,12 @@ class AsyncExecutor(SyncExecutor):
         with execution.step(graph.entrypoint):
             outputs = graph.nodes[graph.entrypoint].execute(
                 {"default": inputs},
-                Context(emit, slot, checkpoint=execution.checkpoint),
+                graph.context_factory(
+                    Context(
+                        emit, slot, checkpoint=execution.checkpoint, options=options
+                    ),
+                    MappingProxyType({"default": inputs}),
+                ),
             )
         for output in outputs:
             await execution.apublish_output(output)
@@ -157,6 +168,51 @@ class AsyncExecutor(SyncExecutor):
                     await asyncio.sleep(0.005)
             if self.fail:
                 raise ValueError("executor failed after output")
+
+
+@pytest.mark.parametrize("executor_type", [SyncExecutor, AsyncExecutor])
+def test_alternate_executor_uses_graph_context_factory(executor_type) -> None:
+    """验证替代执行器遵守图上声明的领域工厂契约。
+
+    Args:
+        executor_type: 同步或异步替代执行器。
+    """
+
+    contexts = []
+
+    def make(base, inputs):
+        """组合执行能力并登记工厂输入。
+
+        Args:
+            base: 当前调用基础上下文。
+            inputs: 当前端口映射。
+
+        Returns:
+            当前调用的组合上下文。
+        """
+
+        assert inputs == {"default": 2}
+        context = Context(parent=base)
+        assert context.options == {"domain.enabled": True}
+        contexts.append(context)
+        return context
+
+    executor = executor_type()
+    try:
+        with Runtime(plugins=(LocalRuntimePlugin(executor=executor),)) as runtime:
+            runtime.register(
+                "domain",
+                Graph(entrypoint="produce", context_factory=make).add(
+                    produce=Produce()
+                ),
+            )
+            assert runtime.run("domain", 2, options={"domain.enabled": True}) == (
+                Output(0),
+                Output(1),
+            )
+        assert len(contexts) == 1
+    finally:
+        executor.close()
 
 
 @pytest.mark.parametrize("executor_type", [SyncExecutor, AsyncExecutor])

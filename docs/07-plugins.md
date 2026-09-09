@@ -159,6 +159,7 @@ tasks = memory.TaskBackend()
 | `SlotProvider` | 申请资源、查询容量和可用通知 | `SlotPool` |
 | `RouterRole` / `WorkerRole` | Runtime 所依赖的事件与执行角色 | EventRouter / GraphWorker |
 | `GraphExecutor` | 执行已冻结 Graph，通过 Execution 交付终端 Output | `Engine` |
+| `ContextFactory` | 从基础 Context 与当前输入创建领域 Context，通过 Graph 配置 | `Context.make` |
 | `HookableGraphExecutor` | GraphExecutor 的可选动态 Hook 能力 | `Engine` |
 | `ExecutionFactory` | 为每次直接执行和 Work 创建独立句柄及资源 | `Execution` 构造器 |
 | `OutputStore` | 顺序追加、按索引重放终端输出 | MemoryOutputStore |
@@ -183,7 +184,9 @@ TaskPublisher 的 `submit()` 正常返回即表示后端已接受 Work，同时�
 - GraphExecutor 接收注册名、冻结 Graph、入口输入、Event emitter、可选 ExecutionPlan，以及可选 `slot=`、`options=` 和必需的
   `execution=`。GraphWorker 会把冻结后的 Node timeout 快照绑定到 Execution 并开始执行；替换执行器必须为每次
   Node firing 使用 `with execution.step(node_id): ...` 包住完整调用，并在调度边界调用
-  `execution.checkpoint()`，从而保留步数、取消和 timeout 语义。终端输出逐项调用 `execution.publish_output(output)`，
+  `execution.checkpoint()`，从而保留步数、取消和 timeout 语义。在该边界内绑定基础 Context，并通过
+  `graph.context_factory(base, inputs)` 创建节点与 Hook 共用的领域上下文；工厂约束见
+  [领域 Context 工厂与组合](05-execution.md#领域-context-工厂与组合)。终端输出逐项调用 `execution.publish_output(output)`，
   异步执行器使用 `await execution.apublish_output(output)` 避免背压阻塞事件循环。同步执行返回 None，异步执行返回
   Awaitable[None]，不得返回结果 tuple；所有结果都来自同一输出存储。自定义执行器若还实现
   `HookableGraphExecutor` 的 `attach()`，`Runtime.attach()` 会按结构化能力委托给它。

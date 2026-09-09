@@ -39,6 +39,75 @@ outputs = await execution
 取消等待该 Execution 的 asyncio Task 时，会协作式取消底层 execution。`Runtime.arun()` 保留为等价便利接口，内部也是
 `await runtime.start(...)`，所有入口共享同一条执行路径。
 
+## 领域 Context 工厂与组合
+
+`Graph(context_factory=...)` 在图定义中固定一个同步工厂。每次 Node firing，引擎先绑定基础 Context，再调用
+`factory(base, inputs)`；工厂返回当前调用使用的 Context。默认是 `Context.make`，函数、可调用对象和领域类型
+自己的 `make` 类方法都可以作为工厂。类型标注可从 `interlace.spi` 导入 `ContextFactory`。
+
+领域类型通过 `super().__init__(parent=base)` 组合基础上下文，可以自行定义构造参数。例如：
+
+```python
+from interlace import Context
+
+
+class AirContext(Context):
+    """借用执行能力并保存当前任务的领域引用。
+
+    Attributes:
+        seed: 当前调用借用的业务种子，不自动跨节点传播。
+    """
+
+    def __init__(self, base, seed):
+        """按领域自己的签名初始化。
+
+        Args:
+            base: 当前节点调用的基础上下文。
+            seed: 从输入取得的业务种子。
+        """
+        super().__init__(parent=base)
+        self.seed = seed
+
+    @classmethod
+    def make(cls, base, inputs):
+        """由领域决定种子的来源与创建逻辑。
+
+        Args:
+            base: 引擎绑定的执行能力。
+            inputs: 本次节点调用的只读端口映射。
+
+        Returns:
+            当前调用独立使用的领域上下文。
+        """
+        return cls(base, seed=inputs["seed"])
+```
+
+使用 `Graph(entrypoint="consume", context_factory=AirContext.make)` 装配该工厂；图中使用此工厂的节点应声明
+`seed` 输入端口。工厂也可以根据实际输入分支，选择不同的领域类型。核心不解释 seed、request 或其他领域字段。
+
+组合保留同一基础 Context 的 `emit`、`slot`、取消检查、节点命名空间状态、配置和静止回调；不复制内部绑定，
+也不重新计算配置快照。`parent` 与 emitter、Slot、配置等底层绑定参数互斥。领域对象的字段由工厂自行初始化，
+基类继承仅复用执行能力的转发接口。调用方仍可用 `Context(emit, ...)` 创建独立的基础上下文。
+
+工厂是可重入的同步创建逻辑，不缓存或跨调用复用 Context。传入的端口映射顶层只读，内部数据沿用原输入所有权，
+不会深复制。工厂看到的是 **Hook enter 转换前** 的输入；后续 Hook 替换输入不会自动重写已经初始化的领域字段。
+需要基于转换后数据绑定字段时，在领域 Node 内完成绑定。Node 与该次调用的所有 Hook 使用同一工厂返回实例。
+
+每次 firing 的 Context 独立创建；同一节点的 `state(namespace)` 在当前 execution 内按原契约共享，其他节点和
+其他 execution 隔离。领域数据跨节点由 typed Output 传递，分支时由领域逻辑明确复制或共享。Context 与附加字段
+不会自动沿 Event 传播，目标图使用自己的工厂和配置；进程边界只传递可序列化任务数据。
+
+工厂执行计入节点步数和超时；错误保留原始异常链和节点位置，控制异常直接传播。同步工厂仍遵循协作式取消，
+可以调用 `base.checkpoint()`；异步和生成器工厂会被拒绝，耗时业务应放入 Node。工厂失败发生在 Hook 调用前，
+不会进入 NodeHook.error 恢复路径。替代 GraphExecutor 也必须调用图上配置的工厂并保持这些边界。
+
+完整示例见 [domain_context.py](../examples/domain_context.py)：两个节点各自创建领域 Context，通过 CrawlData
+携带 seed 与 request，执行时不访问网络。
+
+```bash
+uv run python examples/domain_context.py
+```
+
 ## Terminal Output 流
 
 除最终 `tuple[Output, ...]` 外，调用方可以按产生顺序消费所有没有下游 Edge 的 Output：
