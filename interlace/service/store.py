@@ -447,16 +447,32 @@ class ServiceStore:
             body: 不携带业务值的生命周期元数据。
         """
 
+        self.append_events(((execution_id, body),))
+
+    def append_events(
+        self, entries: tuple[tuple[str | None, dict[str, Any]], ...]
+    ) -> None:
+        """在一次事务中追加一批观测记录。
+
+        Args:
+            entries: 按观测顺序排列的 execution ID 与事件内容。
+        """
+
+        if not entries:
+            return
+        rows = tuple(
+            (
+                execution_id,
+                json.dumps(body, ensure_ascii=False, allow_nan=False),
+            )
+            for execution_id, body in entries
+        )
         with self.lock:
             if self._closed:
                 return
             with self.connection:
-                self.connection.execute(
-                    "INSERT INTO events(execution_id, body) VALUES (?, ?)",
-                    (
-                        execution_id,
-                        json.dumps(body, ensure_ascii=False, allow_nan=False),
-                    ),
+                self.connection.executemany(
+                    "INSERT INTO events(execution_id, body) VALUES (?, ?)", rows
                 )
 
     def events(self, execution_id: str, after: int = 0) -> list[dict[str, Any]]:

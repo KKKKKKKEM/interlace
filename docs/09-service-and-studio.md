@@ -87,6 +87,9 @@ app.mount("/interlace", service.create_app(token="application-provided-token"))
 `token` 是可选 Bearer 令牌，保护 HTTP、JSON-RPC、SSE 和 OpenAPI 数据接口。工作台可在令牌对话框中输入，
 保存在当前浏览器标签页的 sessionStorage，随后放入 Authorization 请求头，不写入 URL。
 默认仅监听 `127.0.0.1`。TLS、用户体系和多用户权限由应用或反向代理承担。
+单个 HTTP 请求体默认最多 1 MiB，可通过 `create_app(max_request_bytes=...)` 或
+`serve(max_request_bytes=...)` 调整；`GraphService(max_active_executions=...)` 默认把当前 Runtime 的同时活跃执行限制为
+128，达到上限返回 HTTP 429。反向代理仍应设置自己的连接数、请求大小和速率限制。
 
 ## 节点目录与编辑边界
 
@@ -204,6 +207,7 @@ curl http://127.0.0.1:8000/rpc \
 
 诊断默认启用，可用 `GraphService(runtime, diagnostics=False)` 关闭参数、原始输出和日志采集，保留生命周期与终端结果。
 参数通过同一 Hook 贡献通道的同步 `NodeHook.inspect()` 采集：输入在全部 enter 转换之后，原始输出在 exit 转换之前。
+同一 firing 的诊断记录最多积累 64 条后批量提交，并在节点结束前冲刷剩余记录，减少文件 SQLite 的逐条事务开销。
 采集立即生成独立快照，不修改原对象，失败不改变业务结果。生命周期仍使用公开 Runtime Observer，
 `output.routed` 只记录 step、port 和目标端口集合，不携带业务对象。
 

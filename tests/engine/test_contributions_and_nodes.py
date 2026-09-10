@@ -173,6 +173,20 @@ def test_contributed_policy_is_bound_when_graph_freezes() -> None:
         assert runtime.run("policy.graph", 2) == (Output(5, "total"),)
 
 
+def test_policy_config_is_deeply_frozen_before_graph_registration() -> None:
+    """调用方与 selector 都不能改写冻结策略的嵌套配置。"""
+
+    original = {"ports": ["a", "b"], "limits": {"count": 2}}
+    policy = PolicyRef("example.test/frozen", original)
+    original["ports"].append("c")
+    original["limits"]["count"] = 3
+
+    assert policy.config["ports"] == ("a", "b")
+    assert policy.config["limits"]["count"] == 2
+    with pytest.raises(TypeError):
+        policy.config["limits"]["count"] = 4
+
+
 def test_missing_contributed_policy_fails_at_registration() -> None:
     """验证缺少贡献策略时注册 Graph 明确失败。"""
 

@@ -407,7 +407,7 @@ class PluginHost:
             指定能力的已装配实现。
 
         Raises:
-            LookupError: 指定编码不存在或不是文本编码。
+            LookupError: 指定能力尚未由插件提供。
         """
 
         capability = require_non_empty_string(capability, "capability")
@@ -762,7 +762,7 @@ class ContributionPlugin:
 
         Args:
             plugin_id: 带命名空间的插件标识。
-            version: 等待开始前观察到的通知版本。
+            version: 插件自身版本。
             requires: 当前插件依赖的插件标识集合。
             selectors: 待注册的具名输入选择器。
             hooks: 待装配的节点 Hook 集合。

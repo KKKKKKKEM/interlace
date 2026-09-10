@@ -3,12 +3,34 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass, field
 from threading import RLock
 from types import MappingProxyType
 from typing import Any, Protocol
 
 from .core import InputPolicy, require_non_empty_string
+
+
+def _freeze_config(value: Any) -> Any:
+    """递归复制策略配置，并把内置可变容器转换为只读值。
+
+    Args:
+        value: 待保存到冻结策略引用中的配置值。
+
+    Returns:
+        与调用方状态隔离的只读配置值。
+    """
+
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {deepcopy(key): _freeze_config(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_config(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_freeze_config(item) for item in value)
+    return deepcopy(value)
 
 
 class InputSelector(Protocol):
@@ -52,7 +74,7 @@ class PolicyRef:
         require_non_empty_string(self.name, "policy name")
         if not isinstance(self.config, Mapping):
             raise TypeError("policy config must be a mapping")
-        object.__setattr__(self, "config", MappingProxyType(dict(self.config)))
+        object.__setattr__(self, "config", _freeze_config(self.config))
 
 
 @dataclass(frozen=True, slots=True)

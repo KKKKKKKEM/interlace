@@ -251,6 +251,42 @@ def test_draft_conflict_freeze_validation_and_immutable_versions(api: Any) -> No
         assert result["outputs"][0]["value"] == expected
 
 
+def test_publish_registration_failure_rolls_back_version_and_draft(
+    api: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Runtime 拒绝新版本时不得提交对应版本、草稿或归属。
+
+    Args:
+        api: 测试客户端与服务。
+        monkeypatch: 替换 Runtime 注册入口的测试夹具。
+    """
+
+    _, service = api
+
+    def reject(name: str, graph: Graph) -> Runtime:
+        """拒绝测试发布的 Runtime 注册。
+
+        Args:
+            name: 待注册的版本名称。
+            graph: 已编译的冻结 Graph。
+
+        Raises:
+            RuntimeError: 模拟 Runtime 注册失败。
+        """
+
+        del name, graph
+        raise RuntimeError("registration failed")
+
+    monkeypatch.setattr(service.runtime, "register", reject)
+    request = DraftRequest(definition=GraphDefinition.model_validate(definition()))
+    with pytest.raises(RuntimeError, match="registration failed"):
+        service.publish(request)
+
+    assert service.store.versions() == []
+    assert service.store.drafts() == []
+    assert "visual" not in service.store.memberships()
+
+
 def test_observation_replay_and_output_failure_preservation(api: Any) -> None:
     """输出失败保留已交付项目，节点时间线支持从游标重放。
 
@@ -330,6 +366,43 @@ def test_service_auth_and_cross_site_writes() -> None:
                 == 403
             )
             assert client.get("/openapi.json").status_code == 401
+
+
+def test_service_limits_request_body_and_active_executions() -> None:
+    """服务边界拒绝过大请求和超过容量的并发执行。"""
+
+    with Runtime() as runtime:
+        runtime.register("wait", Graph(entrypoint="wait").add(wait=Waiting()))
+        service = GraphService(runtime, max_active_executions=1)
+        with TestClient(service.create_app(max_request_bytes=256)) as client:
+            oversized = client.post(
+                "/api/call",
+                json={
+                    "graph": "wait",
+                    "inputs": {"default": "x" * 512},
+                },
+            )
+            assert oversized.status_code == 413
+            chunked = client.post(
+                "/rpc",
+                content=(part for part in (b"{" + b"x" * 200, b"x" * 200 + b"}")),
+                headers={"Content-Type": "application/json"},
+            )
+            assert chunked.status_code == 413
+
+            first = client.post(
+                "/api/executions",
+                json={"graph": "wait", "inputs": {"default": None}},
+            ).json()
+            second = client.post(
+                "/api/executions",
+                json={"graph": "wait", "inputs": {"default": None}},
+            )
+            assert second.status_code == 429
+            assert "max_active_executions=1" in second.json()["detail"]
+            client.post(f"/api/executions/{first['id']}/cancel")
+            with pytest.raises(Exception, match="cancel"):
+                runtime.get_execution(first["id"]).result(timeout=2)
 
 
 def test_published_definitions_and_history_survive_restart(tmp_path: Path) -> None:

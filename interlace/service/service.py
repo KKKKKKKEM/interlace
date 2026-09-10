@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from threading import RLock
 from typing import Any
 
 from pydantic import TypeAdapter
@@ -16,6 +17,10 @@ from .catalog import NodeCatalog, describe_graph
 from .diagnostics import NodeDiagnostics, snapshot_value
 from .models import DraftRequest, GraphDefinition, RunRequest
 from .store import ConflictError, ServiceStore
+
+
+class ServiceCapacityError(RuntimeError):
+    """服务达到本地活跃执行上限，调用方应稍后重试。"""
 
 
 def encode(value: Any) -> Any:
@@ -51,6 +56,8 @@ class GraphService:
         _observer: 服务持有的只读观察注册。
         _closed: 服务是否已关闭。
         _diagnostics: 节点参数与日志采集器，关闭采集时为 None。
+        max_active_executions: 当前 Runtime 允许同时存在的活跃执行数量。
+        _start_lock: 串行执行容量检查与提交，避免并发请求越过上限。
     """
 
     def __init__(
@@ -60,6 +67,7 @@ class GraphService:
         nodes: NodeCatalog | None = None,
         database: str | Path = ":memory:",
         diagnostics: bool = True,
+        max_active_executions: int = 128,
     ) -> None:
         """接入已有 Runtime，并恢复已发布的图定义。
 
@@ -68,17 +76,24 @@ class GraphService:
             nodes: 编辑器可构造的节点类型目录。
             database: 服务数据库路径，默认仅内存保存。
             diagnostics: 是否采集实际节点输入、原始输出和 Python 日志，默认启用。
+            max_active_executions: 服务允许的活跃执行上限。
 
         Raises:
             ValueError: 已保存版本无法由当前节点目录编译。
             TypeError: Worker 不支持公开图目录。
         """
 
+        if type(max_active_executions) is not int or max_active_executions < 1:
+            raise ValueError(
+                "max_active_executions must be an integer greater than zero"
+            )
         runtime.graphs()
         self.runtime = runtime
         self.nodes = nodes or NodeCatalog()
         self.store = ServiceStore(database)
         self._closed = False
+        self.max_active_executions = max_active_executions
+        self._start_lock = RLock()
         self._diagnostics: NodeDiagnostics | None = None
         try:
             versions = self.store.versions()
@@ -311,6 +326,7 @@ class GraphService:
         graph = self.nodes.compile(request.definition)
         name = request.definition.name
         body = request.definition.model_dump()
+        encoded = json.dumps(body, ensure_ascii=False, allow_nan=False)
         with self.store.lock:
             self.store.require_definition_project(name, request.project_id)
             current = next(
@@ -327,17 +343,24 @@ class GraphService:
             with self.store.connection:
                 self.store.connection.execute(
                     "INSERT INTO versions VALUES (?, ?, ?)",
-                    (
-                        name,
-                        version,
-                        json.dumps(body, ensure_ascii=False, allow_nan=False),
-                    ),
+                    (name, version, encoded),
+                )
+                self.store.connection.execute(
+                    "INSERT OR REPLACE INTO documents VALUES (?, ?, ?)",
+                    (name, request.revision + 1, encoded),
+                )
+                self.store.connection.execute(
+                    "INSERT INTO definition_projects(name, project_id) VALUES (?, ?) "
+                    "ON CONFLICT(name) DO UPDATE SET "
+                    "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+                    (name, request.project_id),
                 )
                 self.runtime.register(registered, graph)
-            revision = self.store.save_draft(
-                name, body, request.revision, request.project_id
-            )
-        return {"graph": registered, "version": version, "revision": revision}
+        return {
+            "graph": registered,
+            "version": version,
+            "revision": request.revision + 1,
+        }
 
     def start(self, request: RunRequest) -> Execution:
         """按端口类型解码 JSON 并提交统一 Execution。
@@ -365,13 +388,20 @@ class GraphService:
             )
             for port, typ in ports.items()
         }
-        execution = self.runtime.start(
-            request.graph,
-            next(iter(inputs.values())) if len(ports) == 1 else inputs,
-            options=request.options,
-            max_steps=request.max_steps,
-            timeout=request.timeout,
-        )
+        with self._start_lock:
+            active = sum(not item.done for item in self.runtime.executions())
+            if active >= self.max_active_executions:
+                raise ServiceCapacityError(
+                    "graph service reached max_active_executions="
+                    f"{self.max_active_executions}"
+                )
+            execution = self.runtime.start(
+                request.graph,
+                next(iter(inputs.values())) if len(ports) == 1 else inputs,
+                options=request.options,
+                max_steps=request.max_steps,
+                timeout=request.timeout,
+            )
         self.store.record_execution(self.snapshot(execution))
         if execution.done:
             self._archive(execution)
@@ -549,11 +579,14 @@ class GraphService:
                 self._diagnostics.close()
             self.store.close()
 
-    def create_app(self, *, token: str | None = None) -> Any:
+    def create_app(
+        self, *, token: str | None = None, max_request_bytes: int = 1_048_576
+    ) -> Any:
         """创建包含 RPC 与 Studio 的 ASGI 应用。
 
         Args:
             token: 可选 Bearer 令牌，保护 API 和执行数据。
+            max_request_bytes: 单个 HTTP 请求体允许的最大字节数。
 
         Returns:
             可由 ASGI 服务器或现有应用挂载的 FastAPI 应用。
@@ -561,10 +594,15 @@ class GraphService:
 
         from .http import create_app
 
-        return create_app(self, token=token)
+        return create_app(self, token=token, max_request_bytes=max_request_bytes)
 
     def serve(
-        self, *, host: str = "127.0.0.1", port: int = 8000, token: str | None = None
+        self,
+        *,
+        host: str = "127.0.0.1",
+        port: int = 8000,
+        token: str | None = None,
+        max_request_bytes: int = 1_048_576,
     ) -> None:
         """在当前进程启动官方服务入口。
 
@@ -572,8 +610,13 @@ class GraphService:
             host: 监听地址，默认仅本机。
             port: HTTP 监听端口。
             token: 可选 API Bearer 令牌。
+            max_request_bytes: 单个 HTTP 请求体允许的最大字节数。
         """
 
         import uvicorn
 
-        uvicorn.run(self.create_app(token=token), host=host, port=port)
+        uvicorn.run(
+            self.create_app(token=token, max_request_bytes=max_request_bytes),
+            host=host,
+            port=port,
+        )

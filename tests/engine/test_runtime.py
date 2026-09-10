@@ -24,6 +24,7 @@ from interlace import (
 from interlace.adapters import memory
 from interlace.engine.errors import (
     IncompleteInputsError,
+    InterlaceRuntimeError,
     InvalidOutputError,
     PortValueTypeError,
 )
@@ -111,6 +112,27 @@ def test_runtime_executes_graph_internal_dataflow() -> None:
         outputs = runtime.run("join.graph", 2)
 
     assert outputs == (Output(5, "total"),)
+
+
+def test_duplicate_registration_does_not_freeze_rejected_graph() -> None:
+    """名称冲突必须在修改调用方 Graph 之前失败。"""
+
+    rejected = Graph(entrypoint="split").add("split", Split())
+    with Runtime() as runtime:
+        runtime.register("join.graph", join_graph())
+        with pytest.raises(InterlaceRuntimeError, match="duplicate registered graph"):
+            runtime.register("join.graph", rejected)
+
+    assert not rejected.frozen
+
+
+def test_on_validates_route_before_creating_consumer() -> None:
+    """确定性的 route 参数错误不能留下孤立消费通道。"""
+
+    with Runtime() as runtime:
+        with pytest.raises(ValueError, match="event type"):
+            runtime.on("", graph="graph", queue="orphan")
+        runtime.consume("orphan", concurrency=2)
 
 
 def test_runtime_executes_self_loop_until_node_stops_emitting_feedback() -> None:

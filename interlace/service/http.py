@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from jsonrpcserver import Error, Result, Success, async_dispatch
@@ -28,7 +28,7 @@ from .models import (
     ProjectRequest,
     DefinitionProjectRequest,
 )
-from .service import GraphService, encode
+from .service import GraphService, ServiceCapacityError, encode
 from .store import ConflictError
 
 
@@ -51,16 +51,94 @@ def sse(kind: str, value: Any, event_id: int | None = None) -> str:
     )
 
 
-def create_app(service: GraphService, *, token: str | None = None) -> FastAPI:
+class RequestBodyLimitMiddleware:
+    """在应用解析请求前限制 HTTP body 的累计字节数。
+
+    Attributes:
+        app: 下游 ASGI 应用。
+        max_bytes: 单个请求体允许的最大字节数。
+    """
+
+    def __init__(self, app: Any, max_bytes: int) -> None:
+        """保存下游应用和请求体上限。
+
+        Args:
+            app: 待保护的 ASGI 应用。
+            max_bytes: 单个请求体允许的最大字节数。
+        """
+
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        """累计 HTTP body，并在超过上限时中止解析。
+
+        Args:
+            scope: 当前 ASGI 连接作用域。
+            receive: 读取请求消息的异步回调。
+            send: 发送响应消息的异步回调。
+        """
+
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        headers = dict(scope.get("headers", ()))
+        content_length = headers.get(b"content-length")
+        if content_length is not None:
+            try:
+                too_large = int(content_length) > self.max_bytes
+            except ValueError:
+                too_large = False
+            if too_large:
+                response = JSONResponse(
+                    {"detail": "请求体超过服务允许的大小"}, status_code=413
+                )
+                await response(scope, receive, send)
+                return
+        received = 0
+
+        async def limited_receive() -> Any:
+            """读取一段请求体并检查累计大小。
+
+            Returns:
+                未超过容量限制的下一条 ASGI 消息。
+
+            Raises:
+                HTTPException: 累计请求体超过配置上限。
+            """
+
+            nonlocal received
+            message = await receive()
+            if message.get("type") == "http.request":
+                received += len(message.get("body", b""))
+                if received > self.max_bytes:
+                    raise HTTPException(
+                        status_code=413, detail="请求体超过服务允许的大小"
+                    )
+            return message
+
+        await self.app(scope, limited_receive, send)
+
+
+def create_app(
+    service: GraphService,
+    *,
+    token: str | None = None,
+    max_request_bytes: int = 1_048_576,
+) -> FastAPI:
     """创建可独立启动或挂载的官方服务应用。
 
     Args:
         service: 协议共同使用的图服务。
         token: 可选 API 访问令牌，不放入 URL。
+        max_request_bytes: 单个 HTTP 请求体允许的最大字节数。
 
     Returns:
         带 OpenAPI、RPC 和 Studio 的 FastAPI 应用。
     """
+
+    if type(max_request_bytes) is not int or max_request_bytes < 1:
+        raise ValueError("max_request_bytes must be an integer greater than zero")
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -80,6 +158,7 @@ def create_app(service: GraphService, *, token: str | None = None) -> FastAPI:
             service.close()
 
     app = FastAPI(title="Interlace Graph Service", version="1.0", lifespan=lifespan)
+    app.add_middleware(RequestBodyLimitMiddleware, max_bytes=max_request_bytes)
 
     @app.middleware("http")
     async def access(request: Request, call_next: Any) -> Response:
@@ -134,6 +213,8 @@ def create_app(service: GraphService, *, token: str | None = None) -> FastAPI:
             status = 404
         elif isinstance(exc, ConflictError):
             status = 409
+        elif isinstance(exc, ServiceCapacityError):
+            status = 429
         elif isinstance(exc, (ValueError, TypeError, ValidationError, GraphError)):
             status = 422
         elif isinstance(exc, InterlaceRuntimeError):
@@ -149,6 +230,7 @@ def create_app(service: GraphService, *, token: str | None = None) -> FastAPI:
         TypeError,
         GraphError,
         InterlaceRuntimeError,
+        ServiceCapacityError,
     ):
         app.add_exception_handler(error_type, failure)
 

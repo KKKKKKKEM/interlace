@@ -194,15 +194,15 @@ class GraphWorker:
             ValueError: 参数值或字段组合不合法。
         """
 
-        self._ensure_open()
         name = require_non_empty_string(name, "registered graph name")
         if not isinstance(graph, Graph):
             raise TypeError("graph must be a Graph")
-        if not graph.frozen:
-            graph.freeze(self._policies)
         with self._lock:
+            self._ensure_open()
             if name in self._graphs:
                 raise InterlaceRuntimeError(f"duplicate registered graph {name!r}")
+            if not graph.frozen:
+                graph.freeze(self._policies)
             pending = tuple(self._pending_hooks.get(name, ()))
             for contribution in pending:
                 if (

@@ -308,3 +308,63 @@ def test_diagnostics_do_not_consume_unserializable_domain_resources() -> None:
             ]["inputs"]["default"]
         )
         service.close()
+
+
+def test_diagnostics_batch_output_records_and_flush_before_node_finish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """密集输出按批写入，节点结束前仍保存完整有序诊断。
+
+    Args:
+        monkeypatch: 记录批量存储调用的测试夹具。
+    """
+
+    class Many(Node):
+        """产生超过一个诊断批次的终端输出。"""
+
+        input_ports = Ports(count=int)
+        output_ports = Ports(value=int)
+
+        def execute(self, inputs: Any, context: Any) -> Iterator[Output]:
+            """按顺序产生指定数量的输出。
+
+            Args:
+                inputs: 包含输出数量的入口值。
+                context: 当前执行上下文。
+
+            Yields:
+                递增整数 Output。
+            """
+
+            del context
+            for value in range(inputs["count"]):
+                yield Output(value, "value")
+
+    with Runtime() as runtime:
+        runtime.register("many", Graph(entrypoint="many").add(many=Many()))
+        service = GraphService(runtime)
+        calls: list[int] = []
+        append_events = service.store.append_events
+
+        def record(entries: Any) -> None:
+            """记录每次批量事务的事件数并委托真实存储。
+
+            Args:
+                entries: 本次批量追加的诊断事件。
+            """
+
+            calls.append(len(entries))
+            append_events(entries)
+
+        monkeypatch.setattr(service.store, "append_events", record)
+        handle = runtime.start("many", 130)
+        assert len(handle.result(timeout=2)) == 130
+        runtime.wait_idle()
+
+        events = service.store.events(handle.id)
+        outputs = [item for item in events if item["kind"] == "node.output"]
+        finished = next(item for item in events if item["kind"] == "node.finished")
+        assert len(outputs) == 130
+        assert outputs[-1]["id"] < finished["id"]
+        assert calls.count(64) == 2
+        service.close()

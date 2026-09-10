@@ -1,5 +1,8 @@
 """运行时观察者注册身份和卸载隔离的契约测试。"""
 
+import pytest
+
+from interlace import Runtime
 from interlace.engine.observation import (
     ObservationHub,
     RuntimeEvent,
@@ -44,3 +47,32 @@ def test_old_observer_handle_does_not_detach_later_registration() -> None:
 
     hub.publish(event)
     assert events == [event]
+
+
+def test_runtime_observer_rolls_back_router_if_worker_registration_fails() -> None:
+    """第二个角色拒绝观察者时必须撤销第一个角色的注册。"""
+
+    runtime = Runtime()
+    try:
+        original = runtime.worker.observe_runtime
+
+        def reject(observer):
+            """拒绝测试观察者注册。
+
+            Args:
+                observer: 待注册的观察者。
+
+            Raises:
+                RuntimeError: 模拟替换角色注册失败。
+            """
+
+            del observer
+            raise RuntimeError("worker registration failed")
+
+        runtime.worker.observe_runtime = reject
+        with pytest.raises(RuntimeError, match="worker registration failed"):
+            runtime.observe_runtime(lambda event: None)
+        assert runtime.router._observations._observers == ()
+        runtime.worker.observe_runtime = original
+    finally:
+        runtime.close()

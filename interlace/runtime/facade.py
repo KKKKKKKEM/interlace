@@ -8,7 +8,7 @@ from collections.abc import AsyncIterator, Callable, Iterable, Iterator, Mapping
 from threading import RLock
 from typing import Any
 
-from ..engine.core import Output, _validate_timeout
+from ..engine.core import Output, _validate_timeout, require_non_empty_string
 from ..engine.errors import RuntimeClosedError
 from ..engine.events import Event
 from ..engine.execution import Execution, ExecutionLimits
@@ -486,12 +486,13 @@ class Runtime:
             用于卸载本次注册的句柄。
         """
 
-        return CompositeObserverHandle(
-            (
-                self.router.observe_runtime(observer),
-                self.worker.observe_runtime(observer),
-            )
-        )
+        router_handle = self.router.observe_runtime(observer)
+        try:
+            worker_handle = self.worker.observe_runtime(observer)
+        except BaseException:
+            router_handle.detach()
+            raise
+        return CompositeObserverHandle((router_handle, worker_handle))
 
     def on(
         self,
@@ -520,6 +521,20 @@ class Runtime:
         Returns:
             本次操作得到的 Runtime 实例。
         """
+
+        # 组合前完成全部本地参数校验，避免确定性 route 错误遗留 Consumer。
+        require_non_empty_string(event_type, "subscription event type")
+        require_non_empty_string(graph, "route graph")
+        require_non_empty_string(queue, "task queue")
+        if subscription is not None:
+            require_non_empty_string(subscription, "route subscription")
+        if type(concurrency) is not int:
+            raise TypeError("queue concurrency must be an integer")
+        if concurrency < 1:
+            raise ValueError("queue concurrency must be at least 1")
+        if slots is not None and not isinstance(slots, SlotProvider):
+            raise TypeError("slots must implement SlotProvider or be None")
+        ExecutionLimits(max_steps, timeout)
 
         # 先启动本地消费者，再开放对应的事件路由。
         self.consume(queue, concurrency=concurrency, slots=slots)

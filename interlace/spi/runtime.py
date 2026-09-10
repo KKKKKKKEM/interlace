@@ -122,6 +122,10 @@ class DeliveryResult:
 
         if not isinstance(self.outcome, DeliveryOutcome):
             raise TypeError("delivery outcome must be DeliveryOutcome")
+        if self.error is not None and not isinstance(self.error, BaseException):
+            raise TypeError("delivery error must be a BaseException or None")
+        if self.outcome is DeliveryOutcome.ACK and self.error is not None:
+            raise ValueError("ACK delivery result must not contain an error")
 
     @classmethod
     def ack(cls) -> DeliveryResult:

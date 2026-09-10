@@ -622,3 +622,10 @@ def test_task_backend_requires_explicit_delivery_result() -> None:
     with pytest.raises(TypeError, match="must return DeliveryResult"):
         backend.wait_idle()
     backend.close()
+
+
+def test_ack_delivery_result_rejects_an_error() -> None:
+    """ACK 不得携带会被后端静默忽略的异常。"""
+
+    with pytest.raises(ValueError, match="must not contain an error"):
+        DeliveryResult(DeliveryOutcome.ACK, ValueError("lost"))

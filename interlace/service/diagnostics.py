@@ -95,6 +95,8 @@ class NodeDiagnostics(NodeHook):
         _lock: 保护并发 firing 的采集范围。
         _hook: 本次诊断独立拥有的 Hook 注册。
         _handler: 本次诊断独立拥有的标准日志处理器。
+        _pending: 按 firing 暂存、等待批量写入的诊断事件。
+        _batch_size: 单次事务最多积累的诊断事件数量。
         _closed: 是否已停止采集。
     """
 
@@ -108,6 +110,11 @@ class NodeDiagnostics(NodeHook):
 
         self.store = store
         self._active: set[tuple[str | None, str | None, Any]] = set()
+        self._pending: dict[
+            tuple[str | None, str | None, Any],
+            list[tuple[str | None, dict[str, Any]]],
+        ] = {}
+        self._batch_size = 64
         self._lock = RLock()
         self._closed = False
         self._handler = _NodeLogHandler(self)
@@ -132,6 +139,8 @@ class NodeDiagnostics(NodeHook):
                 self._active.add(key)
             elif event.kind.value == "node.finished":
                 self._active.discard(key)
+                pending = tuple(self._pending.pop(key, ()))
+                self._flush(pending)
 
     def inspect(self, call: NodeCall, phase: HookPhase, value: Any) -> None:
         """在所有输入 Hook 后、原始输出变换前采集实际调用数据。
@@ -183,28 +192,42 @@ class NodeDiagnostics(NodeHook):
         """
 
         key = (event.execution_id, event.node, event.attributes.get("step"))
+        body = {
+            "kind": kind,
+            "graph": event.graph,
+            "node": event.node,
+            "execution_id": event.execution_id,
+            "status": None,
+            "attributes": {
+                "step": event.attributes.get("step"),
+                **attributes,
+            },
+            "occurred_at": datetime.now(timezone.utc).isoformat(),
+        }
         with self._lock:
             if self._closed or key not in self._active:
                 return
-            try:
-                self.store.append_event(
-                    event.execution_id,
-                    {
-                        "kind": kind,
-                        "graph": event.graph,
-                        "node": event.node,
-                        "execution_id": event.execution_id,
-                        "status": None,
-                        "attributes": {
-                            "step": event.attributes.get("step"),
-                            **attributes,
-                        },
-                        "occurred_at": datetime.now(timezone.utc).isoformat(),
-                    },
-                )
-            except Exception:
-                # 日志处理器不能通过再次写日志报告存储异常，避免递归。
-                pass
+            pending = self._pending.setdefault(key, [])
+            pending.append((event.execution_id, body))
+            if len(pending) >= self._batch_size:
+                batch = tuple(pending)
+                pending.clear()
+                self._flush(batch)
+
+    def _flush(self, entries: tuple[tuple[str | None, dict[str, Any]], ...]) -> None:
+        """批量保存诊断事件，存储失败不进入业务执行结果。
+
+        Args:
+            entries: 按采集顺序排列的诊断事件。
+        """
+
+        if not entries:
+            return
+        try:
+            self.store.append_events(entries)
+        except Exception:
+            # 日志处理器不能通过再次写日志报告存储异常，避免递归。
+            pass
 
     def close(self) -> None:
         """注销本次 Hook 和日志处理器，不改变其他日志配置。"""
@@ -214,6 +237,11 @@ class NodeDiagnostics(NodeHook):
                 return
             self._closed = True
             self._active.clear()
+            pending = tuple(
+                entry for entries in self._pending.values() for entry in entries
+            )
+            self._pending.clear()
+        self._flush(pending)
         self._hook.detach()
         logging.getLogger().removeHandler(self._handler)
         self._handler.close()
