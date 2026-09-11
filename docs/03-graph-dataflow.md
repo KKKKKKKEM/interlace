@@ -150,12 +150,38 @@ full = graph.plan(include={"load", "parse", "enrich", "save"})
 runtime.run("document.graph", payload, plan=fast)
 ```
 
-`plan()` 会在需要时先冻结 Graph。计划只保留两端都被选择的原有 Edge，不会跨过未选择 Node 自动补边；入口不在
-计划内、所选 Node 不可达，或 `ALL` Node 缺少输入端口时，创建计划会立即失败。计划绑定创建它的 Graph 实例，
+`plan()` 会在需要时先冻结 Graph。缺省保留所选节点间的原有 Edge，也可通过 `edges=` 显式选择原图连接。
+连接始终按原图顺序保存，不会跨过未选节点自动补边，也不允许新增或改写连接。
+`entrypoint=` 可指定所选节点中的任意入口，省略时使用原图入口；本次输入按该入口的 Ports 校验。
+入口不在计划内、所选 Node 从该入口不可达，或其他 `ALL` Node 缺少输入端口时，创建计划会立即失败。
+静态连通不保证条件分支一定产生全部输入。计划绑定创建它的 Graph 实例，
 创建后不可变，可以安全复用，也可以在并发 execution 中使用不同计划。没有传 `plan` 时仍执行完整 Graph。
 
-高级调用也可以使用 `ExecutionPlan(frozen_graph, nodes)`。构造只接受所属 Graph 与节点 ID 集合，入口、Edge 和
-索引由同一校验过程派生；`dataclasses.replace(plan, nodes=...)` 会重新执行完整校验，不能独立覆盖派生字段。
+例如只运行解析段，明确接受该段的完整出口：
+
+```python
+parse_only = graph.plan(
+    include={"parse"},
+    entrypoint="parse",
+    edges=[],
+    outputs={("parse", "default")},  # 按实际声明填写端口名。
+)
+print(parse_only.describe())
+runtime.run("document.graph", document, plan=parse_only)
+```
+
+`outputs=` 是完整出口断言，不是输出过滤器。计划中每个没有下游连接的已声明输出端口都必须列入；
+多出或缺少出口时创建计划失败，可防止裁掉重试回边后把 retry 当作正常结果。省略该参数时仍交付全部终端输出。
+`plan.outputs` 是全部出口，`cut_outputs` 是因裁剪新产生的出口，差集是原图已有出口。
+`boundary_edges` 包含从所选节点出发但被排除的连接：扇出只裁掉部分目标时，它仍在此列出，但不新增终端输出。
+`describe()` 返回入口类型、节点、连接和上述边界的独立可 JSON 编码快照，不运行任何节点，也不保证每个端口都会产出。
+
+高级调用为 `ExecutionPlan(frozen_graph, nodes, entrypoint=..., edges=..., outputs=...)`。
+`dataclasses.replace` 会重新校验并保留原计划入口与边；缩小节点集合时可显式传 `edges=None` 重新派生连接。
+派生出口与索引不能直接替换。通常重新调用 `graph.plan(...)` 更直观。
+
+计划不复制节点、不建立嵌套执行，也不撤销副作用。选中节点的 Hook、Event、写库与新任务提交照常发生；
+新任务不会自动继承当前计划。
 
 ## 输入触发策略
 

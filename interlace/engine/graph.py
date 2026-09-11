@@ -8,7 +8,7 @@ from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import TypeVar, overload
+from typing import Any, TypeVar, overload
 
 from .core import (
     InputPolicy,
@@ -72,25 +72,42 @@ class ExecutionPlan:
     Attributes:
         graph: 计划所属的已冻结 Graph 定义。
         nodes: 复制并冻结的待执行节点 ID 集合。
-        entrypoint: 从所属 Graph 派生的唯一入口节点 ID。
-        edges: 从节点集合派生、保持原始顺序的 Graph 有向边。
+        entrypoint: 本次执行的唯一入口，缺省使用原图入口。
+        edges: 保留的原图连接，始终保持原图顺序。
+        outputs: 所有没有计划内下游的输出端口，使用节点 ID 与端口名二元组。
+        cut_outputs: outputs 中因裁剪而成为出口的端口。
+        boundary_edges: 源节点被选择但未保留的原图连接，包括部分扇出裁剪。
         _outgoing: 从派生边建立的只读下游索引。
     """
 
     graph: Graph
     nodes: frozenset[str]
-    entrypoint: str = field(init=False)
-    edges: tuple[Edge, ...] = field(init=False)
+    entrypoint: str
+    edges: tuple[Edge, ...]
+    outputs: frozenset[tuple[str, str]] = field(init=False)
+    cut_outputs: frozenset[tuple[str, str]] = field(init=False)
+    boundary_edges: tuple[Edge, ...] = field(init=False)
     _outgoing: Mapping[tuple[str, str], tuple[Edge, ...]] = field(
         init=False, repr=False
     )
 
-    def __init__(self, graph: Graph, nodes: Iterable[str]) -> None:
+    def __init__(
+        self,
+        graph: Graph,
+        nodes: Iterable[str],
+        *,
+        entrypoint: str | None = None,
+        edges: Iterable[Edge] | None = None,
+        outputs: Iterable[tuple[str, str]] | None = None,
+    ) -> None:
         """校验所选节点形成严格子图，并从冻结 Graph 派生全部执行元数据。
 
         Args:
             graph: 已通过类型、策略和可达性校验的冻结 Graph。
             nodes: 待执行节点 ID；复制为不可变集合后保存。
+            entrypoint: 明确的执行入口，None 使用原图入口。
+            edges: 保留的原图连接，None 保留所选节点间全部连接。
+            outputs: 预期的完整出口集合，None 不额外约束；不用于过滤输出。
 
         Raises:
             TypeError: Graph 类型或节点 ID 集合不符合契约。
@@ -118,25 +135,51 @@ class ExecutionPlan:
             raise GraphValidationError(
                 f"execution plan references unknown nodes: {sorted(unknown)!r}"
             )
-        if graph.entrypoint not in selected:
+        entrypoint = (
+            graph.entrypoint
+            if entrypoint is None
+            else require_non_empty_string(entrypoint, "plan entrypoint")
+        )
+        if entrypoint not in selected:
             raise GraphValidationError(
-                f"execution plan must contain graph entrypoint {graph.entrypoint!r}"
+                f"execution plan must contain entrypoint {entrypoint!r}"
             )
 
-        edges = tuple(
+        available = tuple(
             edge
             for edge in graph.edges
             if edge.source in selected and edge.target in selected
         )
+        if edges is None:
+            retained = available
+        else:
+            requested = tuple(edges)
+            if any(not isinstance(edge, Edge) for edge in requested):
+                raise TypeError("plan edges must contain Edge instances")
+            invalid = set(requested) - set(available)
+            if invalid:
+                raise GraphValidationError(
+                    "plan edges must be original edges between selected nodes: "
+                    f"{sorted(map(repr, invalid))!r}"
+                )
+            requested_edges = set(requested)
+            retained = tuple(edge for edge in available if edge in requested_edges)
         adjacency: dict[str, set[str]] = defaultdict(set)
         incoming_ports: dict[str, set[str]] = defaultdict(set)
         outgoing: dict[tuple[str, str], list[Edge]] = defaultdict(list)
-        for edge in edges:
+        for edge in retained:
             adjacency[edge.source].add(edge.target)
             incoming_ports[edge.target].add(edge.target_port)
             outgoing[(edge.source, edge.source_port)].append(edge)
 
-        unreachable = selected - graph._reachable(adjacency)
+        reached: set[str] = set()
+        pending = [entrypoint]
+        while pending:
+            current = pending.pop()
+            if current not in reached:
+                reached.add(current)
+                pending.extend(adjacency.get(current, ()))
+        unreachable = selected - reached
         if unreachable:
             raise GraphValidationError(
                 "execution plan nodes are unreachable from entrypoint using original "
@@ -145,7 +188,7 @@ class ExecutionPlan:
         for node_id in selected:
             spec = graph.spec_for(node_id)
             if (
-                node_id == graph.entrypoint
+                node_id == entrypoint
                 or spec.input_policy.ref.name != "interlace.core/all"
             ):
                 continue
@@ -156,10 +199,47 @@ class ExecutionPlan:
                     f"{sorted(missing)!r}"
                 )
 
+        terminal = frozenset(
+            (node_id, port)
+            for node_id in selected
+            for port in graph.spec_for(node_id).output_ports
+            if not outgoing.get((node_id, port))
+        )
+        if outputs is not None:
+            expected = tuple(outputs)
+            if any(
+                not isinstance(value, tuple)
+                or len(value) != 2
+                or any(not isinstance(part, str) or not part.strip() for part in value)
+                for value in expected
+            ):
+                raise TypeError("plan outputs must contain (node_id, port) tuples")
+            expected_ports = frozenset(expected)
+            if terminal != expected_ports:
+                raise GraphValidationError(
+                    "plan output boundary differs: "
+                    f"unexpected={sorted(terminal - expected_ports)!r}, "
+                    f"missing={sorted(expected_ports - terminal)!r}"
+                )
         object.__setattr__(self, "graph", graph)
         object.__setattr__(self, "nodes", selected)
-        object.__setattr__(self, "entrypoint", graph.entrypoint)
-        object.__setattr__(self, "edges", edges)
+        object.__setattr__(self, "entrypoint", entrypoint)
+        object.__setattr__(self, "edges", retained)
+        object.__setattr__(self, "outputs", terminal)
+        object.__setattr__(
+            self,
+            "cut_outputs",
+            frozenset(value for value in terminal if graph.outgoing_for(*value)),
+        )
+        object.__setattr__(
+            self,
+            "boundary_edges",
+            tuple(
+                edge
+                for edge in graph.edges
+                if edge.source in selected and edge not in retained
+            ),
+        )
         object.__setattr__(
             self,
             "_outgoing",
@@ -178,6 +258,46 @@ class ExecutionPlan:
         """
 
         return self._outgoing.get((node_id, port), ())
+
+    def describe(self) -> dict[str, Any]:
+        """返回独立的可 JSON 编码诊断快照，不运行节点或读取执行状态。
+
+        Returns:
+            入口及输入类型、所选节点和边、原有出口、裁剪出口与被裁剪连接。
+            出口来自端口声明，不保证每个出口在实际运行中都会产生结果。
+        """
+
+        def connection(edge: Edge) -> dict[str, str]:
+            """把一条不可变连接转换为诊断字段。
+
+            Args:
+                edge: 原图连接。
+
+            Returns:
+                新建的连接描述。
+            """
+            return {
+                "source": edge.source,
+                "source_port": edge.source_port,
+                "target": edge.target,
+                "target_port": edge.target_port,
+            }
+
+        return {
+            "entrypoint": self.entrypoint,
+            "inputs": {
+                port: f"{kind.__module__}.{kind.__qualname__}"
+                for port, kind in self.graph.spec_for(
+                    self.entrypoint
+                ).input_ports.items()
+            },
+            "nodes": [node for node in self.graph.nodes if node in self.nodes],
+            "edges": [connection(edge) for edge in self.edges],
+            "outputs": sorted(self.outputs),
+            "original_outputs": sorted(self.outputs - self.cut_outputs),
+            "cut_outputs": sorted(self.cut_outputs),
+            "boundary_edges": [connection(edge) for edge in self.boundary_edges],
+        }
 
 
 class Graph:
@@ -448,6 +568,9 @@ class Graph:
         self,
         *,
         include: Iterable[str],
+        entrypoint: str | None = None,
+        edges: Iterable[Edge] | None = None,
+        outputs: Iterable[tuple[str, str]] | None = None,
         policies: PolicyRegistry | None = None,
     ) -> ExecutionPlan:
         """选择由原有节点和边组成的严格执行子图。
@@ -457,6 +580,9 @@ class Graph:
 
         Args:
             include: 执行计划中需要保留的节点 ID 集合。
+            entrypoint: 所选节点中的执行入口，None 使用原图入口。
+            edges: 明确保留的原图连接，None 使用所选节点间全部原有连接。
+            outputs: 预期完整出口集合，None 不额外校验；不改变输出交付。
             policies: 注册并绑定输入选择策略的容器。
 
         Returns:
@@ -469,7 +595,9 @@ class Graph:
 
         if not self._frozen:
             self.freeze(policies)
-        return ExecutionPlan(self, include)
+        return ExecutionPlan(
+            self, include, entrypoint=entrypoint, edges=edges, outputs=outputs
+        )
 
     def freeze(self, policies: PolicyRegistry | None = None) -> Graph:
         """校验并冻结 Graph。

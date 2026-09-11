@@ -46,7 +46,10 @@ Event、Context、Execution、ExecutionLimits、ExecutionStatus、Slot、SlotPoo
 4. Node ID 属于 Graph binding，Node 不保存某次 execution 状态。
 5. Graph 内循环由 Output 沿回边继续传值，并在不再产生可执行数据时自然结束。
 6. 无下游 Edge 的 Output 由 `Runtime.run()` 返回。
-7. ExecutionPlan 只以冻结 Graph 和所选 Node ID 为构造输入；入口、Edge 和执行索引必须由同一次校验派生。
+7. ExecutionPlan 从冻结 Graph 选择节点、可选独立入口和原有 Edge；缺省入口沿用原图，缺省连接保留所选节点间的全部边。
+   不自动补边或改变节点行为；按实际入口绑定输入并校验可达性及其他 ALL 节点的完整输入。
+   无计划内下游的端口是终端输出；可声明完整预期 outputs，在执行前拒绝出口不符，不过滤结果或隐式截断流程。
+   outputs、cut_outputs、boundary_edges 和 describe() 提供不可变边界或独立诊断快照；静态可达不保证运行时产出。
 8. Graph.compose() 以节点映射、显式入口和 Edge 集合快捷组装普通 Graph，不推断入口或端口；返回值保持构建状态，
    复用 add/connect 与原有冻结校验，不引入第二套图定义或执行语义。
 
@@ -138,6 +141,7 @@ Event、Context、Execution、ExecutionLimits、ExecutionStatus、Slot、SlotPoo
 4. 控制异常不得被 Node Hook 当作普通业务异常恢复。
 5. 跨 Graph 的每个 Work 是独立 execution，独立计步和计时。
 6. Execution 是同步等待、异步等待和 terminal Output 流的统一句柄；便利接口不得维护不同执行语义。
+   ExecutionPlan 只约束当前执行，选中节点的 Event、外部写入及新 Work 不因计划而被屏蔽或自动继承计划。
 7. 已交给流消费者的 terminal Output 不因后续 Graph 失败而撤回。
 8. 输出存储与等待通知实现可替换；存储必须维持追加顺序和可重放性。完整结果按需读取，流式消费不得强制物化
    全量结果；同步与异步交付共享背压、取消和超时约束。

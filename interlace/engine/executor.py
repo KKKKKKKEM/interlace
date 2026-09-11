@@ -137,7 +137,8 @@ class Engine:
                 raise ValueError("execution plan belongs to a different Graph")
         if execution.status is not ExecutionStatus.RUNNING:
             raise RuntimeError("execution must be running")
-        prepared = self._coerce_inputs(graph, inputs)
+        entrypoint = graph.entrypoint if plan is None else plan.entrypoint
+        prepared = self._coerce_inputs(graph, inputs, entrypoint=entrypoint)
         snapshot = self.hooks.snapshot(name)
         self._run(name, graph, prepared, emit, snapshot, plan, slot, execution, options)
 
@@ -202,6 +203,7 @@ class Engine:
         """
 
         nodes = graph.nodes
+        entrypoint = graph.entrypoint if plan is None else plan.entrypoint
         active_nodes = set(nodes) if plan is None else plan.nodes
         specs = {
             node_id: graph.spec_for(node_id)
@@ -222,10 +224,10 @@ class Engine:
         }
         outgoing_for = graph.outgoing_for if plan is None else plan.outgoing_for
         for port, value in initial_inputs.items():
-            queues[graph.entrypoint][port].append(value)
+            queues[entrypoint][port].append(value)
         started: set[str] = set()
-        ready: deque[str] = deque((graph.entrypoint,))
-        scheduled = {graph.entrypoint}
+        ready: deque[str] = deque((entrypoint,))
+        scheduled = {entrypoint}
         local_state: dict[tuple[str, str], MutableMapping[str, Any]] = {}
         finalizers: list[Callable[[], None]] = []
 
@@ -240,7 +242,7 @@ class Engine:
                 return
             spec = specs[node_id]
             if spec.input_policy.on_start:
-                runnable = node_id == graph.entrypoint and node_id not in started
+                runnable = node_id == entrypoint and node_id not in started
             else:
                 runnable = (
                     spec.input_policy.select(input_ports[node_id], queues[node_id])
@@ -778,12 +780,15 @@ class Engine:
         return iter(result)
 
     @staticmethod
-    def _coerce_inputs(graph: Graph, value: Any) -> Mapping[str, Any]:
+    def _coerce_inputs(
+        graph: Graph, value: Any, *, entrypoint: str
+    ) -> Mapping[str, Any]:
         """将入口输入规范化为符合端口声明的映射。
 
         Args:
             graph: 目标 Graph 定义或其注册名称，以类型声明为准。
             value: 当前节点或 Hook 产生的待解析返回值。
+            entrypoint: 本次计划入口，未使用计划时为原图入口。
 
         Returns:
             按端口名称组织的已校验输入映射。
@@ -792,7 +797,7 @@ class Engine:
             PortValueTypeError: 实际输入或输出值不符合端口类型。
         """
 
-        ports = graph.spec_for(graph.entrypoint).input_ports
+        ports = graph.spec_for(entrypoint).input_ports
         names = tuple(ports)
         if not names:
             if value not in (None, {}):

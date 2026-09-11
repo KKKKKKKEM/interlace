@@ -212,7 +212,8 @@ Execution。`iter()`、`aiter()` 必须先建立输出订阅再启动执行，�
 冻结 Graph、验证 ExecutionPlan，保持 Work 并发、Slot 链、错误传播和等待关闭的契约。
 
 替换执行器可以通过 `graph.spec_for(node_id)` 读取冻结后的端口、输入策略和 timeout，通过 `graph.outgoing_for()`
-读取原图连接；ExecutionPlan 的 `graph` 和 `outgoing_for()` 描述计划所属图及计划内的连接，不需要读取私有字段。
+读取原图连接；有计划时必须使用 `plan.entrypoint` 绑定输入与启动调度，使用 `plan.nodes` 和 `outgoing_for()`
+选择节点与连接。不能继续按原图入口校验本次输入；计划出口与 diagnostics 已通过公开字段提供，不需要读取私有字段。
 执行宿主调用 `execution.start(graph)` 开始计时，执行器正常完成后调用 `succeed()`，异常时调用 `fail(error)`。
 `start()` 返回 False 表示句柄已在启动前取消，宿主不得继续执行。取消和 timeout 的解释仍由 Execution 统一负责。
 

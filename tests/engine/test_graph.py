@@ -597,7 +597,7 @@ def test_execution_plan_replacement_rebuilds_edges_before_execution() -> None:
         .connect("source", "sink", source_port="value", target_port="value")
     )
     plan = graph.plan(include={"source", "sink"})
-    reduced = replace(plan, nodes=frozenset({"source"}))
+    reduced = replace(plan, nodes=frozenset({"source"}), edges=None)
 
     assert reduced.edges == ()
     assert reduced.outgoing_for("source", "value") == ()
@@ -608,7 +608,7 @@ def test_execution_plan_replacement_rebuilds_edges_before_execution() -> None:
 
 @pytest.mark.parametrize(
     ("name", "value"),
-    [("entrypoint", "missing"), ("edges", ()), ("_outgoing", {})],
+    [("outputs", ()), ("cut_outputs", ()), ("_outgoing", {})],
 )
 def test_execution_plan_rejects_replacement_of_derived_fields(name, value) -> None:
     """派生字段不能独立替换并偏离节点选择。
@@ -688,7 +688,7 @@ def test_execution_plan_rejects_disconnected_selection() -> None:
         graph.plan(include={"source", "sink"})
     plan = graph.plan(include={"source", "relay", "sink"})
     with pytest.raises(GraphValidationError, match="unreachable"):
-        replace(plan, nodes=frozenset({"source", "sink"}))
+        replace(plan, nodes=frozenset({"source", "sink"}), edges=None)
     with pytest.raises(GraphValidationError, match="entrypoint"):
         replace(plan, nodes=frozenset({"relay", "sink"}))
 
@@ -791,7 +791,7 @@ def test_execution_plan_requires_all_join_inputs() -> None:
         graph.plan(include={"split", "left", "join"})
     plan = graph.plan(include={"split", "left", "right", "join"})
     with pytest.raises(GraphValidationError, match="ALL node.*right"):
-        replace(plan, nodes=frozenset({"split", "left", "join"}))
+        replace(plan, nodes=frozenset({"split", "left", "join"}), edges=None)
 
 
 def test_input_policy_any_uses_declaration_order() -> None:
