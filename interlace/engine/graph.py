@@ -8,7 +8,7 @@ from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import overload
+from typing import TypeVar, overload
 
 from .core import (
     InputPolicy,
@@ -19,6 +19,8 @@ from .core import (
 from .errors import GraphError, GraphFrozenError, GraphValidationError
 from .events import Context, ContextFactory
 from .policies import BoundPolicy, PolicyRef, PolicyRegistry
+
+_G = TypeVar("_G", bound="Graph")  # 快捷构建保留调用方 Graph 子类的返回类型。
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,6 +235,54 @@ class Graph:
         self._outgoing: dict[tuple[str, str], tuple[Edge, ...]] = {}
         self._node_specs: dict[str, NodeSpec] = {}
         self._frozen = False
+
+    @classmethod
+    def compose(
+        cls: type[_G],
+        *,
+        nodes: Mapping[str, Node],
+        entrypoint: str,
+        edges: Iterable[Edge] = (),
+        context_factory: ContextFactory = Context.make,
+    ) -> _G:
+        """按显式入口、节点映射和有序 Edge 集合组装可继续修改的 Graph。
+
+        复制节点绑定和边集合，不复制 Node 行为。通过 add/connect 构建，
+        完整类型、可达性和输入策略校验仍在 freeze 或 Runtime.register 时执行。
+
+        Args:
+            nodes: Graph 内节点 ID 到 Node 实例的映射，可为空以便后续补全。
+            entrypoint: 显式指定的入口节点 ID，不根据边或映射顺序推断。
+            edges: 按声明顺序消费一次的 Edge iterable，默认没有连线。
+            context_factory: 本图每次 Node firing 使用的同步 Context 工厂。
+
+        Returns:
+            尚未冻结、可继续调用 add/connect 的 Graph。
+
+        Raises:
+            TypeError: 节点映射、Node、Edge、入口 ID 或 Context 工厂类型不合法。
+            ValueError: 节点 ID 或入口 ID 为空。
+            GraphError: Edge 重复。
+        """
+
+        if not isinstance(nodes, Mapping):
+            raise TypeError("compose nodes must be a mapping of node IDs to Nodes")
+        graph = cls(
+            entrypoint=require_non_empty_string(entrypoint, "graph entrypoint"),
+            context_factory=context_factory,
+        )
+        for node_id, node in nodes.items():
+            graph.add(node_id, node)
+        for edge in edges:
+            if not isinstance(edge, Edge):
+                raise TypeError("compose edges must contain only Edge instances")
+            graph.connect(
+                edge.source,
+                edge.target,
+                source_port=edge.source_port,
+                target_port=edge.target_port,
+            )
+        return graph
 
     @property
     def context_factory(self) -> ContextFactory:

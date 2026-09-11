@@ -49,11 +49,32 @@ Iterable 由 Engine 逐项推进；terminal Output 可在生成器结束前交�
 Graph 在构建阶段可变，`freeze()` 后成为可执行的静态定义：
 
 ```python
+from interlace import Edge, Graph
+
+graph = Graph.compose(
+    nodes={"parse": Parse(), "store": Store()},
+    entrypoint="parse",
+    edges=[Edge("parse", "store", "length", "length")],
+).freeze()
+```
+
+`Graph.compose()` 将节点、入口和连线集中在一次声明中，适用于线性、分支、汇合和循环图。
+`Edge(source, target, source_port, target_port)` 的后两个参数默认均为 `"default"`；使用命名端口时必须明确填写，
+不按端口名或类型猜测连接。入口由 `entrypoint` 显式指定，不取节点映射中的第一个节点，也不根据入边推断。
+
+`nodes` 接受节点 ID 到 Node 的映射，`edges` 接受 Edge iterable（包括一次性生成器），默认没有边。
+构建时复制绑定并按顺序消费边集合，不复制 Node 实例；之后修改外部映射或列表不改变图结构。
+`compose()` 不自动冻结，可以继续调用 `add()`、`entry()` 和 `connect()` 补全图，也可以传入空节点映射构建草稿；
+空图不能注册执行。重复边和非法参数在构建时失败，未知节点、端口类型、可达性和输入策略等仍在冻结时统一校验。
+需要领域上下文时，通过 `Graph.compose(..., context_factory=MyContext.make)` 固定本图的同步工厂。
+
+按步骤动态构建时，也可以使用同一套增量接口：
+
+```python
 graph = (
     Graph(entrypoint="parse")
     .add(parse=Parse(), store=Store())
     .connect("parse", "store", source_port="length", target_port="length")
-    .freeze()
 )
 ```
 

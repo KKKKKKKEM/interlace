@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from interlace import Graph, Node, Output, Ports, Runtime
+from interlace import Edge, Graph, Node, Output, Ports, Runtime
 
 
 class Strip(Node):
@@ -67,10 +67,10 @@ def run(text: str = "  hello, interlace  ") -> str:
         当前记录携带的数据值。
     """
 
-    graph = (
-        Graph(entrypoint="strip")
-        .add(strip=Strip(), upper=Upper())
-        .connect("strip", "upper", source_port="text", target_port="text")
+    graph = Graph.compose(
+        nodes={"strip": Strip(), "upper": Upper()},
+        entrypoint="strip",
+        edges=[Edge("strip", "upper", "text", "text")],
     )
     with Runtime() as runtime:
         runtime.register("linear", graph)

@@ -48,7 +48,7 @@ class Upper(Node):
         return Output(inputs["text"].upper(), "result")
 
 
-graph = Graph(entrypoint="upper").add(upper=Upper())
+graph = Graph.compose(nodes={"upper": Upper()}, entrypoint="upper")
 
 with Runtime() as runtime:
     runtime.register("upper.graph", graph)

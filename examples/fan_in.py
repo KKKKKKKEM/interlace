@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from interlace import Graph, InputPolicy, Node, Output, Ports, Runtime
+from interlace import Edge, Graph, InputPolicy, Node, Output, Ports, Runtime
 
 
 class Split(Node):
@@ -70,11 +70,13 @@ def run(value: int = 2) -> int:
         当前记录携带的数据值。
     """
 
-    graph = (
-        Graph(entrypoint="split")
-        .add(split=Split(), add=Add())
-        .connect("split", "add", source_port="left", target_port="left")
-        .connect("split", "add", source_port="right", target_port="right")
+    graph = Graph.compose(
+        nodes={"split": Split(), "add": Add()},
+        entrypoint="split",
+        edges=[
+            Edge("split", "add", "left", "left"),
+            Edge("split", "add", "right", "right"),
+        ],
     )
     with Runtime() as runtime:
         runtime.register("fan-in", graph)

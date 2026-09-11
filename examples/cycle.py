@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from interlace import Graph, Node, Output, Ports, Runtime
+from interlace import Edge, Graph, Node, Output, Ports, Runtime
 
 
 class Counter(Node):
@@ -44,10 +44,10 @@ def run(value: int = 0) -> int:
         当前记录携带的数据值。
     """
 
-    graph = (
-        Graph(entrypoint="counter")
-        .add(counter=Counter())
-        .connect("counter", "counter", source_port="again", target_port="value")
+    graph = Graph.compose(
+        nodes={"counter": Counter()},
+        entrypoint="counter",
+        edges=[Edge("counter", "counter", "again", "value")],
     )
     with Runtime() as runtime:
         runtime.register("cycle", graph)

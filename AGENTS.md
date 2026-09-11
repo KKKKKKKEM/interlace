@@ -47,6 +47,8 @@ Event、Context、Execution、ExecutionLimits、ExecutionStatus、Slot、SlotPoo
 5. Graph 内循环由 Output 沿回边继续传值，并在不再产生可执行数据时自然结束。
 6. 无下游 Edge 的 Output 由 `Runtime.run()` 返回。
 7. ExecutionPlan 只以冻结 Graph 和所选 Node ID 为构造输入；入口、Edge 和执行索引必须由同一次校验派生。
+8. Graph.compose() 以节点映射、显式入口和 Edge 集合快捷组装普通 Graph，不推断入口或端口；返回值保持构建状态，
+   复用 add/connect 与原有冻结校验，不引入第二套图定义或执行语义。
 
 ## 第四条：Event 是最小事实
 

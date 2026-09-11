@@ -11,6 +11,7 @@ import pytest
 
 from interlace import (
     Context,
+    Edge,
     ExecutionPlan,
     Graph,
     InputPolicy,
@@ -20,6 +21,7 @@ from interlace import (
     Runtime,
 )
 from interlace.engine.errors import (
+    GraphError,
     GraphFrozenError,
     GraphValidationError,
     InvalidOutputError,
@@ -116,10 +118,10 @@ def test_graph_rejects_all_node_without_every_required_incoming_port() -> None:
 
             del inputs, context
 
-    graph = (
-        Graph(entrypoint="source")
-        .add(source=Source(), join=Join())
-        .connect("source", "join", source_port="value", target_port="left")
+    graph = Graph.compose(
+        nodes={"source": Source(), "join": Join()},
+        entrypoint="source",
+        edges=[Edge("source", "join", "value", "left")],
     )
 
     with pytest.raises(GraphValidationError, match="join.*right"):
@@ -152,6 +154,168 @@ def test_graph_add_rejects_mixed_forms() -> None:
 
     with pytest.raises(TypeError, match="either"):
         cast(Any, Graph().add)("source", Source(), sink=Sink())
+
+
+def test_graph_compose_copies_collections_and_keeps_explicit_entrypoint() -> None:
+    """映射顺序不决定入口，外部集合修改不影响绑定或边，Node 实例仍可复用。"""
+
+    source, sink = Source(), Sink()
+    nodes: dict[str, Node] = {"sink": sink, "source": source}
+    edges = [Edge("source", "sink", "value", "value")]
+    graph = Graph.compose(nodes=nodes, entrypoint="source", edges=edges)
+    nodes.clear()
+    edges.clear()
+
+    assert graph.entrypoint == "source"
+    assert list(graph.nodes) == ["sink", "source"]
+    assert graph.nodes["source"] is source
+    assert graph.nodes["sink"] is sink
+    assert graph.edges == (Edge("source", "sink", "value", "value"),)
+    assert not graph.frozen
+    with Runtime() as runtime:
+        runtime.register("composed", graph)
+        assert runtime.run("composed") == ()
+    assert graph.frozen
+
+
+def test_graph_compose_consumes_edge_iterator_and_allows_extension() -> None:
+    """一次性边迭代器保持声明顺序，构建结果可以继续添加节点和连线。"""
+
+    edges = (Edge("source", target, "value", "value") for target in ("right", "left"))
+    graph = Graph.compose(
+        nodes={"source": Source(), "left": Sink(), "right": Sink()},
+        entrypoint="source",
+        edges=edges,
+    )
+    assert tuple(edges) == ()
+    graph.add(extra=Sink()).connect(
+        "source", "extra", source_port="value", target_port="value"
+    )
+    graph.freeze()
+    assert [edge.target for edge in graph.edges] == ["right", "left", "extra"]
+    with pytest.raises(GraphFrozenError):
+        graph.add(late=Sink())
+
+
+def test_graph_compose_preserves_subclass_and_context_factory() -> None:
+    """类方法保留 Graph 子类，并在实际执行时使用注入的 Context 工厂。"""
+
+    class CustomGraph(Graph):
+        """复用默认 Graph 构造契约的应用子类。"""
+
+    contexts: list[Context] = []
+
+    def make(base: Context, inputs: Mapping[str, Any]) -> Context:
+        """为每次节点调用创建独立上下文并记录工厂实际执行。
+
+        Args:
+            base: 当前节点已绑定的基础执行能力。
+            inputs: 工厂收到的只读输入，本场景不使用。
+
+        Returns:
+            委托基础能力的独立 Context。
+        """
+
+        del inputs
+        context = Context(parent=base)
+        contexts.append(context)
+        return context
+
+    graph = CustomGraph.compose(
+        nodes={"source": Source(), "sink": Sink()},
+        entrypoint="source",
+        edges=[Edge("source", "sink", "value", "value")],
+        context_factory=make,
+    )
+    assert isinstance(graph, CustomGraph)
+    assert graph.context_factory is make
+    with Runtime() as runtime:
+        runtime.register("context", graph)
+        runtime.run("context")
+    assert len(contexts) == 2
+    assert contexts[0] is not contexts[1]
+
+
+def test_graph_compose_accepts_empty_draft_and_single_node() -> None:
+    """空节点映射可以继续补全，省略边时支持单节点执行。"""
+
+    graph = Graph.compose(nodes={}, entrypoint="source")
+    with pytest.raises(GraphValidationError, match="at least one node"):
+        graph.freeze()
+    graph.add(source=Source())
+    with Runtime() as runtime:
+        runtime.register("single", graph)
+        assert runtime.run("single") == (Output("value", "value"),)
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"nodes": [("source", Source())]},
+        {"nodes": {"source": object()}},
+        {"nodes": {1: Source()}},
+        {"entrypoint": None},
+        {"edges": [("source", "sink")]},
+        {"edges": None},
+        {"context_factory": None},
+    ],
+)
+def test_graph_compose_rejects_invalid_arguments(arguments: dict[str, Any]) -> None:
+    """构建时拒绝错误类型，不将元组或字典隐式转换为 Edge。
+
+    Args:
+        arguments: 覆盖合法默认参数的非法字段。
+    """
+
+    kwargs: dict[str, Any] = {"nodes": {"source": Source()}, "entrypoint": "source"}
+    kwargs.update(arguments)
+    with pytest.raises(TypeError):
+        Graph.compose(**kwargs)
+
+
+def test_graph_compose_rejects_duplicate_edges() -> None:
+    """快捷构建复用 connect 的重复边错误契约。"""
+
+    edge = Edge("source", "sink", "value", "value")
+    with pytest.raises(GraphError, match="duplicate edge"):
+        Graph.compose(
+            nodes={"source": Source(), "sink": Sink()},
+            entrypoint="source",
+            edges=[edge, edge],
+        )
+
+
+@pytest.mark.parametrize(
+    ("entrypoint", "edges", "message"),
+    [
+        ("missing", [], "entrypoint"),
+        ("source", [], "unreachable"),
+        ("source", [Edge("source", "missing", "value", "value")], "unknown node"),
+        ("source", [Edge("source", "sink", "missing", "value")], "output port"),
+        ("source", [Edge("source", "sink", "value", "missing")], "input port"),
+    ],
+)
+def test_graph_compose_defers_structure_validation_to_registration(
+    entrypoint: str, edges: list[Edge], message: str
+) -> None:
+    """快捷组装不提前冻结，不跳过注册时的入口、可达性与端口校验。
+
+    Args:
+        entrypoint: 当前场景指定的入口 ID。
+        edges: 当前场景的连接定义。
+        message: 预期的静态校验错误片段。
+    """
+
+    graph = Graph.compose(
+        nodes={"source": Source(), "sink": Sink()},
+        entrypoint=entrypoint,
+        edges=edges,
+    )
+    assert not graph.frozen
+    with Runtime() as runtime:
+        with pytest.raises(GraphValidationError, match=message):
+            runtime.register("invalid", graph)
+    assert not graph.frozen
 
 
 def test_graph_accepts_cycle() -> None:
@@ -221,9 +385,11 @@ def test_graph_rejects_incompatible_ports() -> None:
 
         input_ports = Ports(value=str)
 
-    graph = Graph(entrypoint="source")
-    graph.add("source", Wide()).add("sink", Narrow())
-    graph.connect("source", "sink", source_port="value", target_port="value")
+    graph = Graph.compose(
+        nodes={"source": Wide(), "sink": Narrow()},
+        entrypoint="source",
+        edges=[Edge("source", "sink", "value", "value")],
+    )
 
     with pytest.raises(GraphValidationError, match="incompatible"):
         graph.freeze()

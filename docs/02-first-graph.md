@@ -18,7 +18,7 @@ class Upper(Node):
         return Output(inputs["text"].upper(), port="result")
 
 
-graph = Graph(entrypoint="upper").add(upper=Upper())
+graph = Graph.compose(nodes={"upper": Upper()}, entrypoint="upper")
 
 with Runtime() as runtime:
     runtime.register("upper.graph", graph)  # register() 会冻结并校验 Graph
@@ -41,6 +41,9 @@ flowchart LR
 
 单节点没有下游 Edge，因此它产生的 `Output` 会作为 `Runtime.run()` 的返回值。若把 output port 连接给另一个
 Node，它只在同一张 Graph 内传播。
+
+`Graph.compose()` 将节点映射、显式入口和可选的 `edges` 集合集中声明；单节点示例可以省略边。
+返回的图仍可继续修改，注册时统一冻结校验。多节点组装见下一章的 [Graph 与 Edge](03-graph-dataflow.md#graph-与-edge)。
 
 默认不限制执行步数和时长。需要约束循环或外部调用时，可以显式配置：
 
