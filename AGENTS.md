@@ -218,3 +218,7 @@ uv run --with ruff ruff format --check interlace
 
 服务变更运行 `uv run --extra service pytest tests/service -q`；界面变更在 `web/` 中运行 `npm ci`、
 `npm run build` 与 `npm test`。内置静态资源随 Python 分发包交付，安装用户不需要 Node.js。
+
+发布使用与 `pyproject.toml` 版本一致的 `v<version>` Release 标签，完整 CI 通过后构建并严格检查 wheel/sdist 元数据。
+PyPI 上传通过 `python-publish.yml` 和 `pypi` environment 的 Trusted Publisher 授权，只在上传作业授予 OIDC 权限。
+源码、构建产物与已上传版本必须区分；下游正式依赖仅在发行版已上传并验证可安装后切换，不借用本地路径或其他仓库凭据。

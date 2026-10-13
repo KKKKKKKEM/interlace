@@ -16,6 +16,33 @@ uv pip install "interlace @ git+https://github.com/KKKKKKKEM/interlace.git"
 
 生产项目应将 Git 依赖固定到经过验证的提交。开发本仓库可使用 `uv sync`。
 
+### 发布到 PyPI
+
+仓库的 `.github/workflows/python-publish.yml` 在 GitHub Release 发布后运行完整 CI、构建 wheel/sdist、
+检查发行元数据，并通过 PyPI Trusted Publishing 上传同一批已验证产物。Release 标签必须与项目版本一致：
+当前版本为 `0.1.0`，对应标签 `v0.1.0`。尚未完成首次上传，不能把上述 Git 安装命令改成索引安装。
+
+首次发布前，在 PyPI 的 Publishing 页面添加 pending publisher：
+
+- PyPI 项目：`interlace`
+- GitHub owner：`KKKKKKKEM`
+- GitHub repository：`interlace`
+- Workflow filename：`python-publish.yml`
+- Environment：`pypi`
+
+发布工作流只在上传作业授予 OIDC `id-token: write`，不借用其他仓库的 PyPI Token。
+维护者应在 GitHub 配置 `pypi` environment 的审批与标签限制，再发布对应 Release。
+上传成功后先确认 PyPI 可安装该版本，再让下游更新依赖与锁文件；不要用本地目录替换下游正式依赖。
+
+本地检查发行包：
+
+```bash
+uv build --no-sources
+uv tool run twine check --strict dist/*
+```
+
+构建与元数据检查通过不代表已经上传，也不代表 PyPI 已授予项目发布权限。
+
 ```text
 Node -- Output / Edge --> Node
 Graph -- Event / Runtime --> Graph
