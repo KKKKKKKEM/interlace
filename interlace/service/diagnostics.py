@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import traceback
+from contextlib import suppress
 from datetime import datetime, timezone
 from threading import RLock
 from typing import Any
@@ -17,32 +19,67 @@ from interlace.engine.observation import RuntimeEvent, current_node_event
 
 from .store import ServiceStore
 
-# 按字段名隐藏常见凭据；自由文本日志由应用自身控制。
-_SECRET_FIELDS = frozenset(
-    {
-        "password",
-        "passwd",
-        "secret",
-        "token",
-        "access_token",
-        "refresh_token",
-        "authorization",
-        "api_key",
-        "apikey",
-        "cookie",
-        "set-cookie",
-    }
+# 字段名包含任一片段即视为凭据，按不区分大小写的子串匹配。
+_SECRET_KEY = re.compile(
+    r"secret|token|password|passwd|key|authorization|cookie|credential", re.IGNORECASE
 )
 
 
+def _redact_assignment(match: re.Match[str]) -> str:
+    """保留凭据名、分隔符与值两侧的引号，只替换值本身。"""
+
+    value = match.group(3)
+    quote = value[0] if value[0] in "\"'" else ""
+    return f"{match.group(1)}{match.group(2)}{quote}[REDACTED]{quote}"
+
+
+# 自由文本中的凭据形态：URL userinfo、Bearer/Basic 凭据与“名称=值”或“名称: 值”。
+# 自由文本不使用单独的 key 片段，避免把 KeyError 等异常名称当成凭据。
+_TEXT_PATTERNS: tuple[tuple[re.Pattern[str], Any], ...] = (
+    (
+        re.compile(r"\b([a-z][a-z0-9+.-]*://)[^\s/@]+@", re.IGNORECASE),
+        r"\1[REDACTED]@",
+    ),
+    (
+        re.compile(r"\b(bearer|basic)\s+[\w.~+/=-]+", re.IGNORECASE),
+        r"\1 [REDACTED]",
+    ),
+    (
+        re.compile(
+            r"([\w.-]*(?:secret|token|password|passwd|api[_-]?key|access[_-]?key"
+            r"|private[_-]?key|authorization|cookie|credential)[\w.-]*)"
+            r"([\"']?\s*[=:]\s*)(\"[^\"]*\"|'[^']*'|[^\s,;&'\"]+)",
+            re.IGNORECASE,
+        ),
+        _redact_assignment,
+    ),
+)
+
+
+def redact_text(text: str) -> str:
+    """隐藏自由文本中的 URL userinfo、认证头凭据和凭据名对应的值。
+
+    Args:
+        text: 日志消息、异常消息、堆栈或其他字符串值。
+
+    Returns:
+        凭据部分替换为 `[REDACTED]` 的文本。
+    """
+
+    for pattern, replacement in _TEXT_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
 def snapshot_value(value: Any) -> Any:
-    """立即创建可存储的独立参数快照，限制单条记录大小并隐藏凭据字段。
+    """立即创建可存储的独立参数快照，限制单条记录大小并隐藏凭据。
 
     Args:
         value: 当前调用边界的参数、配置或 Output。
 
     Returns:
-        JSON 数据；不支持的对象或过大内容返回明确的诊断标记。
+        JSON 数据；敏感字段与字符串中的凭据被替换，不支持的对象或超过 65,536 个字符的内容
+        返回明确的诊断标记。
     """
 
     try:
@@ -52,7 +89,7 @@ def snapshot_value(value: Any) -> Any:
                 "$unavailable": f"{type(item).__name__} 无法编码为 JSON"
             },
         )
-        protected = _redact(normalized)
+        protected = redact_value(normalized)
         text = json.dumps(protected, ensure_ascii=False, allow_nan=False)
         if len(text) > 65536:
             return {"$truncated": True, "preview": text[:65536]}
@@ -61,15 +98,15 @@ def snapshot_value(value: Any) -> Any:
         return {"$unavailable": f"{type(value).__name__} 无法编码为 JSON"}
 
 
-def _redact(value: Any, depth: int = 0) -> Any:
-    """逐层隐藏敏感键并限制递归深度。
+def redact_value(value: Any, depth: int = 0) -> Any:
+    """逐层隐藏敏感键的值和字符串中的凭据，超过 16 层返回截断标记。
 
     Args:
         value: 已转换为 JSON 基础类型的数据。
-        depth: 当前递归层数。
+        depth: 当前递归层数，调用方通常省略。
 
     Returns:
-        独立的脱敏结构。
+        不与输入共享可变容器的脱敏结构。
     """
 
     if depth > 16:
@@ -77,12 +114,14 @@ def _redact(value: Any, depth: int = 0) -> Any:
     if isinstance(value, dict):
         return {
             key: "[REDACTED]"
-            if key.lower() in _SECRET_FIELDS
-            else _redact(item, depth + 1)
+            if isinstance(key, str) and _SECRET_KEY.search(key)
+            else redact_value(item, depth + 1)
             for key, item in value.items()
         }
     if isinstance(value, list):
-        return [_redact(item, depth + 1) for item in value]
+        return [redact_value(item, depth + 1) for item in value]
+    if isinstance(value, str):
+        return redact_text(value)
     return value
 
 
@@ -171,10 +210,12 @@ class NodeDiagnostics(NodeHook):
                 "node.exception",
                 {
                     "error_type": type(value).__name__,
-                    "message": str(value)[:65536],
-                    "traceback": "".join(
-                        traceback.format_exception(
-                            type(value), value, value.__traceback__
+                    "message": redact_text(str(value))[:65536],
+                    "traceback": redact_text(
+                        "".join(
+                            traceback.format_exception(
+                                type(value), value, value.__traceback__
+                            )
                         )
                     )[:65536],
                 },
@@ -223,11 +264,9 @@ class NodeDiagnostics(NodeHook):
 
         if not entries:
             return
-        try:
+        # 日志处理器不能通过再次写日志报告存储异常，避免递归。
+        with suppress(Exception):
             self.store.append_events(entries)
-        except Exception:
-            # 日志处理器不能通过再次写日志报告存储异常，避免递归。
-            pass
 
     def close(self) -> None:
         """注销本次 Hook 和日志处理器，不改变其他日志配置。"""
@@ -265,7 +304,7 @@ class _NodeLogHandler(logging.Handler):
         self.diagnostics = diagnostics
 
     def emit(self, record: logging.LogRecord) -> None:
-        """提取日志文字及异常，不拦截进程级 stdout。
+        """提取脱敏后的日志文字及异常堆栈，不拦截进程级 stdout。
 
         Args:
             record: 已经通过应用日志级别过滤的记录。
@@ -274,20 +313,18 @@ class _NodeLogHandler(logging.Handler):
         event = current_node_event()
         if event is None:
             return
-        try:
+        with suppress(Exception):
             self.diagnostics.record(
                 event,
                 "node.log",
                 {
                     "level": record.levelname,
                     "logger": record.name,
-                    "message": record.getMessage()[:65536],
-                    "traceback": logging.Formatter().formatException(record.exc_info)[
-                        :65536
-                    ]
+                    "message": redact_text(record.getMessage())[:65536],
+                    "traceback": redact_text(
+                        logging.Formatter().formatException(record.exc_info)
+                    )[:65536]
                     if record.exc_info
                     else None,
                 },
             )
-        except Exception:
-            pass

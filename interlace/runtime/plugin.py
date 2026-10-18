@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import cast
 
 from ..adapters import memory
@@ -24,38 +25,38 @@ from ._utils import _close_components, _unique
 from .router import EventRouter
 from .worker import GraphWorker
 
+# 默认插件可以自行提供、也可以由其他插件提供的底层能力，按声明顺序排列。
+_INFRASTRUCTURE = (
+    CAP_EVENT_BUS,
+    CAP_TASK_BACKEND,
+    CAP_GRAPH_EXECUTOR,
+    CAP_EXECUTION_FACTORY,
+)
+
 
 class LocalRuntimePlugin:
     """使用标准能力协议组装单进程 Runtime 的内建插件。
 
-    Attributes:
-        descriptor: 插件身份、依赖和能力声明。
-        _events: 事件传输实现。
-        _tasks: 任务发布与消费后端。
-        _router_observations: 路由角色的生命周期观察中心。
-        _worker_observations: 执行角色的生命周期观察中心。
-        _policies: 当前角色使用的输入策略注册能力。
-        _executor: 执行 Graph 的实现。
-        _execution_factory: 创建可替换 Execution 句柄的工厂。
-        _provided: 当前默认插件负责提供的能力集合。
-        _owned: 由当前插件接管并负责关闭的组件。
-        _close_injected: 是否负责关闭调用方注入的底层组件。
-        router: 负责事件发布和工作路由的角色。
-        worker: 负责消费工作和执行 Graph 的角色。
-    """
+    插件总是提供 EventRouter 与 GraphWorker 角色；底层能力由 `infrastructure` 选择自行提供，
+    其余底层能力声明为依赖，从宿主中由其他插件提供。
 
-    descriptor = PluginDescriptor(
-        "interlace.core/local-runtime",
-        "1.0.0",
-        provides=(
-            CAP_EVENT_BUS,
-            CAP_TASK_BACKEND,
-            CAP_GRAPH_EXECUTOR,
-            CAP_EXECUTION_FACTORY,
-            CAP_EVENT_ROUTER,
-            CAP_GRAPH_WORKER,
-        ),
-    )
+    Attributes:
+        descriptor: 按本实例能力选择生成的插件身份、依赖和能力声明。
+        _events: 自行提供时注入或在 setup 中创建的事件传输。
+        _tasks: 自行提供时注入或在 setup 中创建的任务后端。
+        _router_observations: 路由角色的生命周期观察中心。
+        _worker_observations: 执行角色与默认 Engine 共享的生命周期观察中心。
+        _policies: Worker 冻结 Graph 时使用的输入策略注册表。
+        _executor: 自行提供时注入或在 setup 中创建的 Graph 执行器。
+        _execution_factory: 自行提供时注入或在 setup 中选用的 Execution 工厂。
+        _provided: 本插件自行提供的底层能力集合。
+        _owned: 依次表示事件传输、任务后端和执行器是否由本插件创建并负责关闭。
+        _close_injected: 停止时是否同时关闭调用方注入的底层组件。
+        _history_limit: 传给 GraphWorker 的 Execution 记录保留上限。
+        _direct_workers: 传给 GraphWorker 的直接执行线程数上限，None 使用标准库默认值。
+        router: setup 后创建的事件路由角色，之前为 None。
+        worker: setup 后创建的任务消费与执行角色，之前为 None。
+    """
 
     def __init__(
         self,
@@ -65,21 +66,26 @@ class LocalRuntimePlugin:
         executor: GraphExecutor | None = None,
         execution_factory: ExecutionFactory | None = None,
         close_injected: bool = False,
-        _provide_capabilities: frozenset[str] | None = None,
+        infrastructure: Iterable[str] | None = None,
+        history_limit: int = 1000,
+        direct_workers: int | None = None,
     ) -> None:
-        """保存默认装配需要的底层组件与资源所有权设置。
+        """选择自行提供的底层能力，并保存注入组件与资源所有权设置。
 
         Args:
-            events: 注入的事件传输实现。
-            tasks: 注入的任务传输实现。
-            executor: 实际执行任务或 Graph 的实现。
-            execution_factory: 创建独立 Execution 句柄的工厂能力。
-            close_injected: 是否由当前组件关闭注入的底层资源。
-            _provide_capabilities: 默认插件需要自行提供的底层能力集合。
+            events: 注入的事件传输；None 且自行提供时在 setup 中创建内存实现。
+            tasks: 注入的任务后端，须同时实现 TaskPublisher 与 TaskConsumer；None 且自行提供时创建内存实现。
+            executor: 注入的 Graph 执行器；None 且自行提供时创建默认 Engine。
+            execution_factory: 注入的 Execution 工厂；None 且自行提供时使用 Execution。
+            close_injected: 停止时是否同时关闭注入的 events、tasks 与 executor。
+            infrastructure: 本插件自行提供的底层能力，取自 event bus、task backend、graph executor 与
+                execution factory 四项；None 表示全部自行提供，其余能力声明为依赖。
+            history_limit: 传给 GraphWorker 的 Execution 记录保留上限。
+            direct_workers: 传给 GraphWorker 的直接执行线程数上限，None 使用标准库默认值。
 
         Raises:
-            TypeError: 参数类型或接口实现不符合当前契约。
-            ValueError: 参数值或字段组合不合法。
+            TypeError: 参数类型不符合契约，或为外部提供的能力注入了组件。
+            ValueError: infrastructure 包含底层能力以外的名称。
         """
 
         if type(close_injected) is not bool:
@@ -89,21 +95,16 @@ class LocalRuntimePlugin:
             and callable(getattr(tasks, "bind", None))
         ):
             raise TypeError("tasks must implement TaskPublisher and TaskConsumer")
-        infrastructure = {
-            CAP_EVENT_BUS,
-            CAP_TASK_BACKEND,
-            CAP_GRAPH_EXECUTOR,
-            CAP_EXECUTION_FACTORY,
-        }
-        provided = (
-            infrastructure
-            if _provide_capabilities is None
-            else set(_provide_capabilities)
-        )
-        if not provided <= infrastructure:
-            raise ValueError(
-                "local runtime can only select infrastructure capabilities"
-            )
+        if infrastructure is None:
+            provided = frozenset(_INFRASTRUCTURE)
+        else:
+            if isinstance(infrastructure, str):
+                raise TypeError("infrastructure must be an iterable of capabilities")
+            provided = frozenset(infrastructure)
+            if not provided <= frozenset(_INFRASTRUCTURE):
+                raise ValueError(
+                    "local runtime can only select infrastructure capabilities"
+                )
         if events is not None and CAP_EVENT_BUS not in provided:
             raise TypeError(
                 "events cannot be injected when event bus is externally provided"
@@ -121,19 +122,19 @@ class LocalRuntimePlugin:
         self.descriptor = PluginDescriptor(
             "interlace.core/local-runtime",
             "1.0.0",
-            requires_capabilities=tuple(sorted(infrastructure - provided)),
-            provides=tuple(
+            requires_capabilities=tuple(
                 capability
-                for capability in (
-                    CAP_EVENT_BUS,
-                    CAP_TASK_BACKEND,
-                    CAP_GRAPH_EXECUTOR,
-                    CAP_EXECUTION_FACTORY,
-                    CAP_EVENT_ROUTER,
-                    CAP_GRAPH_WORKER,
-                )
-                if capability in provided
-                or capability in (CAP_EVENT_ROUTER, CAP_GRAPH_WORKER)
+                for capability in _INFRASTRUCTURE
+                if capability not in provided
+            ),
+            provides=(
+                *(
+                    capability
+                    for capability in _INFRASTRUCTURE
+                    if capability in provided
+                ),
+                CAP_EVENT_ROUTER,
+                CAP_GRAPH_WORKER,
             ),
         )
         self._events = events
@@ -143,24 +144,26 @@ class LocalRuntimePlugin:
         self._policies = PolicyRegistry()
         self._executor = executor
         self._execution_factory = execution_factory
-        self._provided = frozenset(provided)
+        self._provided = provided
         self._owned = (
             CAP_EVENT_BUS in provided and events is None,
             CAP_TASK_BACKEND in provided and tasks is None,
             CAP_GRAPH_EXECUTOR in provided and executor is None,
         )
         self._close_injected = close_injected
+        self._history_limit = history_limit
+        self._direct_workers = direct_workers
         self.router: EventRouter | None = None
         self.worker: GraphWorker | None = None
 
     def setup(self, context: PluginContext) -> None:
-        """在插件装配阶段登记声明的能力或贡献。
+        """创建或取得底层能力，组装 EventRouter 与 GraphWorker，并向宿主提供本插件声明的能力。
 
         Args:
-            context: 当前调用的执行或插件上下文。
+            context: 插件宿主的装配上下文，用于取得依赖能力和登记提供的能力。
 
         Raises:
-            TypeError: 参数类型或接口实现不符合当前契约。
+            TypeError: 外部提供的任务后端不能同时投递与消费 Work，或 Execution 工厂不可调用。
         """
 
         if CAP_EVENT_BUS in self._provided and self._events is None:
@@ -212,6 +215,8 @@ class LocalRuntimePlugin:
             emit_local=self.router.publish_local,
             observations=self._worker_observations,
             policies=self._policies,
+            history_limit=self._history_limit,
+            direct_workers=self._direct_workers,
         )
         if CAP_EVENT_BUS in self._provided:
             context.provide(CAP_EVENT_BUS, events)
@@ -225,19 +230,22 @@ class LocalRuntimePlugin:
         context.provide(CAP_GRAPH_WORKER, self.worker)
 
     def start(self, context: PluginContext) -> None:
-        """完成本地默认插件启动，底层组件已在装配阶段创建。
+        """无额外启动步骤；组件已在 setup 中创建。
 
         Args:
-            context: 当前调用的执行或插件上下文。
+            context: 插件宿主的启动上下文，未使用。
         """
 
         del context
 
     def stop(self, context: PluginContext) -> None:
-        """停止插件并释放其拥有的资源。
+        """先关闭 Worker 与 Router，再逆序关闭本插件拥有或按 close_injected 接管的底层组件。
 
         Args:
-            context: 当前调用的执行或插件上下文。
+            context: 插件宿主的停止上下文，未使用。
+
+        Raises:
+            Exception: 关闭过程中最先出现的失败；其余组件仍会关闭。
         """
 
         del context
@@ -249,7 +257,7 @@ class LocalRuntimePlugin:
         components = tuple(
             component
             for component, owned in zip(
-                (self._events, self._tasks, self._executor), self._owned
+                (self._events, self._tasks, self._executor), self._owned, strict=True
             )
             if component is not None and (owned or self._close_injected)
         )

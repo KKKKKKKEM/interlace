@@ -2,11 +2,20 @@
 
 import asyncio
 import json
-from dataclasses import replace
 
 import pytest
 
-from interlace import Context, Edge, Graph, InputPolicy, Node, Output, Ports, Runtime
+from interlace import (
+    Context,
+    Edge,
+    ExecutionPlan,
+    Graph,
+    InputPolicy,
+    Node,
+    Output,
+    Ports,
+    Runtime,
+)
 from interlace.engine.errors import GraphValidationError, PortValueTypeError
 
 
@@ -138,7 +147,7 @@ def test_edge_selection_and_diagnostics_preserve_original_order_and_snapshot():
 def test_cut_retry_requires_explicit_acknowledgement_in_output_boundary():
     """严格出口声明在运行前拒绝意外暴露的重试端口。"""
     graph = workflow()
-    with pytest.raises(GraphValidationError, match="unexpected=.*retry"):
+    with pytest.raises(GraphValidationError, match=r"unexpected=.*retry"):
         graph.plan(
             include={"step"},
             entrypoint="step",
@@ -147,7 +156,7 @@ def test_cut_retry_requires_explicit_acknowledgement_in_output_boundary():
         )
     plan = graph.plan(include={"step"}, entrypoint="step", edges=[])
     assert plan.cut_outputs == {("step", "value"), ("step", "retry")}
-    copied = replace(plan)
+    copied = ExecutionPlan(graph, {"step"}, entrypoint="step", edges=())
     assert copied.entrypoint == "step"
     assert copied.edges == ()
     assert copied.describe() == plan.describe()

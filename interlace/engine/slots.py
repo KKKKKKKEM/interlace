@@ -7,11 +7,11 @@ import time
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Mapping, MutableMapping
 from contextlib import AbstractContextManager, contextmanager
-from threading import Condition, RLock
+from threading import Condition, Lock, RLock
 from typing import Any, Protocol, runtime_checkable
 from uuid import uuid4
 
-from .core import _validate_timeout, require_non_empty_string
+from .._validation import require_non_empty_string, validate_timeout
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -22,24 +22,36 @@ class SlotLease(Protocol):
 
     @property
     def slot(self) -> Slot:
-        """返回当前执行链使用的 Slot；不转移引用所有权。
+        """当前执行链使用的 Slot；读取不转移引用所有权。
 
-        Returns:
-            当前逻辑链使用的本地 Slot。
+        Raises:
+            RuntimeError: 全部引用已释放。
         """
         ...
 
     def retain(self) -> None:
-        """为分支或后续投递增加一个引用，必须匹配一次 release。"""
+        """为分支或后续投递增加一个引用，必须匹配一次 release。
+
+        Raises:
+            RuntimeError: 全部引用已释放。
+        """
 
     def release(self) -> None:
-        """释放当前引用；最后一个引用归还 Slot，归还后不可再次使用。"""
+        """释放一个引用；最后一个引用归还 Slot，归还后不可再次使用。
+
+        Raises:
+            RuntimeError: 全部引用已释放。
+        """
 
     def execution(self) -> AbstractContextManager[Slot]:
-        """串行占用 Slot 执行 Graph；退出前保留资源，不释放调用方引用。
+        """串行占用 Slot 执行一次 Graph execution。
+
+        进入时保留一个临时引用，再无超时地阻塞等待同一 Slot 上的其他 execution 退出；
+        退出时只释放该临时引用，不释放调用方持有的引用。同一线程嵌套进入同一 Slot
+        会死锁，同一逻辑链的后续 Work 必须在当前 execution 结束后执行。
 
         Returns:
-            保护 lease 引用并保证同槽串行执行的上下文管理器。
+            产出当前 Slot 的上下文管理器。
         """
         ...
 
@@ -50,65 +62,62 @@ class SlotProvider(Protocol):
 
     @property
     def size(self) -> int:
-        """返回执行槽池的固定容量。
-
-        Returns:
-            资源池的固定容量。
-        """
+        """池的固定容量。"""
         ...
 
     @property
     def available(self) -> int:
-        """返回当前可申请的执行槽数量。
-
-        Returns:
-            当前可供申请的空闲 Slot 数量。
-        """
+        """当前未租出的 Slot 数量。"""
         ...
 
     def try_acquire(self) -> SlotLease | None:
-        """尝试立即取得 Slot lease，无可用资源时返回 None。
+        """立即取得一个根执行链 lease；没有空闲 Slot 时返回 None。
 
         Returns:
-            调用方负责释放的 Slot lease；没有空闲资源时返回 None。
+            持有一个引用的 lease，调用方负责释放；池耗尽时为 None。
         """
         ...
 
     def acquire(self, timeout: float | None = None) -> SlotLease:
-        """等待可用的本地 Slot，并返回调用方负责释放的 lease。
+        """阻塞等待一个根执行链 lease。
 
         Args:
-            timeout: 等待或执行时限，单位秒；None 表示不设置时限。
+            timeout: 最长等待秒数；None 表示一直等待，0 表示不等待。
 
         Returns:
-            调用方负责释放的 Slot lease。
+            持有一个引用的 lease，调用方负责释放。
         """
         ...
 
     def subscribe_available(self, listener: Callable[[], None]) -> Callable[[], None]:
-        """注册资源可用回调并返回取消订阅函数。
+        """订阅 Slot 归还通知；通知只提示重试申请，不预留 Slot。
 
         Args:
-            listener: 资源可用时调用的通知函数。
+            listener: Slot 归还后调用的无参函数。
 
         Returns:
-            用于取消当前可用通知订阅的函数。
+            只注销本次订阅的幂等函数。
         """
         ...
 
     def close(self) -> None:
-        """结束当前组件的生命周期并释放其拥有的资源。"""
+        """停止新的申请并唤醒等待方；已租出的 lease 仍可稍后归还。"""
         ...
 
 
 class Slot(MutableMapping[str, Any]):
-    """保存一条逻辑执行链可复用的状态，与线程和 Worker 无关。
+    """保存一条逻辑执行链可复用的资源，与线程和 Worker 无关。
+
+    Slot 按身份比较与哈希：内容相同的两个 Slot 仍是不同资源，可作为字典键或集合成员。
 
     Attributes:
-        id: 当前对象的唯一标识。
-        _values: 当前容器拥有的数据映射。
-        _execution_lock: 保证同一 Slot 的 Graph 执行串行化的锁。
+        id: Slot 标识，缺省为随机 UUID 字符串；同一池内唯一。
+        _values: 按名称保存的资源，由 Slot 独占持有。
+        _execution_lock: 串行化同一 Slot 上 Graph execution 的非重入锁，只由 lease 使用。
     """
+
+    __eq__ = object.__eq__
+    __hash__ = object.__hash__
 
     def __init__(
         self,
@@ -116,11 +125,14 @@ class Slot(MutableMapping[str, Any]):
         *,
         id: str | None = None,
     ) -> None:
-        """创建可沿逻辑执行链共享的本地资源映射与串行执行锁。
+        """创建 Slot，并复制初始资源映射。
 
         Args:
-            values: 当前操作处理的值集合或字段映射。
-            id: 对象标识，允许缺省时由实现生成。
+            values: 初始资源；只复制顶层映射，不复制资源对象。
+            id: Slot 标识；None 时生成随机 UUID。
+
+        Raises:
+            ValueError: id 为空字符串。
         """
 
         self.id = require_non_empty_string(
@@ -128,63 +140,43 @@ class Slot(MutableMapping[str, Any]):
             "slot id",
         )
         self._values: dict[str, Any] = {} if values is None else dict(values)
-        self._execution_lock = RLock()
+        self._execution_lock = Lock()
 
     def __getitem__(self, key: str) -> Any:
-        """读取当前 Slot 中按名称保存的资源。
+        """按名称读取资源。
 
-        Args:
-            key: 关联记录或容器条目的键。
-
-        Returns:
-            指定名称或索引对应的容器条目。
+        Raises:
+            KeyError: 名称不存在。
         """
 
         return self._values[key]
 
     def __setitem__(self, key: str, value: Any) -> None:
-        """按名称保存资源，供同一逻辑执行链继续使用。
-
-        Args:
-            key: 关联记录或容器条目的键。
-            value: 当前操作处理的输入值。
-        """
+        """按名称保存资源，供同一逻辑执行链的后续 Work 使用。"""
 
         self._values[key] = value
 
     def __delitem__(self, key: str) -> None:
-        """移除当前 Slot 中指定名称的资源。
+        """移除指定名称的资源。
 
-        Args:
-            key: 关联记录或容器条目的键。
+        Raises:
+            KeyError: 名称不存在。
         """
 
         del self._values[key]
 
     def __iter__(self) -> Iterator[str]:
-        """迭代当前 Slot 的资源名称。
-
-        Returns:
-            遍历当前对象内容的独立迭代入口。
-        """
+        """迭代资源名称。"""
 
         return iter(self._values)
 
     def __len__(self) -> int:
-        """返回当前容器中保存的条目数量。
-
-        Returns:
-            当前容器条目数量。
-        """
+        """返回资源数量。"""
 
         return len(self._values)
 
     def __repr__(self) -> str:
-        """返回包含当前内容的调试表示。
-
-        Returns:
-            包含当前对象内容的调试字符串。
-        """
+        """返回只包含 id 的调试表示，不展开资源内容。"""
 
         return f"Slot(id={self.id!r})"
 
@@ -193,11 +185,11 @@ class SlotPool:
     """管理一组同构 Slot；同一个池可以被多个 Consumer 共享。
 
     Attributes:
-        _slots: 资源池拥有的全部 Slot。
-        _available: 尚未租出的执行槽集合。
-        _condition: 协调共享状态访问及同步等待的锁或条件变量。
-        _listeners: 资源归还时触发的可用通知函数。
-        _closed: 当前组件是否已停止接受新工作。
+        _slots: 池拥有的全部 Slot，构造后不变。
+        _available: 尚未租出的 Slot，按归还顺序先进先出。
+        _condition: 保护可用队列、订阅与关闭状态，并唤醒阻塞的 acquire。
+        _listeners: 订阅令牌到归还通知函数的映射，按订阅顺序调用。
+        _closed: 是否已关闭；关闭后拒绝申请与订阅。
     """
 
     def __init__(
@@ -207,16 +199,16 @@ class SlotPool:
         slots: Iterable[Slot] | None = None,
         factory: Callable[[], Slot] | None = None,
     ) -> None:
-        """创建固定容量的本地执行资源池。
+        """用固定数量的新 Slot 或调用方提供的 Slot 创建池。
 
         Args:
-            size: 资源池容量；使用 slots 时必须省略。
-            slots: 提供本地执行槽的资源池能力。
-            factory: 创建默认值或可替换资源的工厂。
+            size: 新建 Slot 的数量，至少为 1；与 slots 互斥。
+            slots: 直接托管的 Slot，至少一个且实例与 id 均不重复。
+            factory: 创建单个 Slot 的无参函数，默认 `Slot`；只能与 size 一起使用。
 
         Raises:
-            TypeError: 参数类型或接口实现不符合当前契约。
-            ValueError: 参数值或字段组合不合法。
+            TypeError: 参数组合互斥、size 不是 int、factory 不可调用或元素不是 Slot。
+            ValueError: size 小于 1、slots 为空，或包含重复实例或重复 id。
         """
 
         if slots is not None and size is not None:
@@ -247,32 +239,24 @@ class SlotPool:
         self._slots = created
         self._available = deque(created)
         self._condition = Condition(RLock())
-        self._listeners: list[Callable[[], None]] = []
+        self._listeners: dict[object, Callable[[], None]] = {}
         self._closed = False
 
     @property
     def size(self) -> int:
-        """返回执行槽池的固定容量。
-
-        Returns:
-            资源池的固定容量。
-        """
+        """池的固定容量。"""
 
         return len(self._slots)
 
     @property
     def available(self) -> int:
-        """返回当前可申请的执行槽数量。
-
-        Returns:
-            当前可供申请的空闲 Slot 数量。
-        """
+        """当前未租出的 Slot 数量。"""
 
         with self._condition:
             return len(self._available)
 
     def close(self) -> None:
-        """关闭资源池并唤醒等待方，允许在途引用稍后归还。"""
+        """关闭池并唤醒等待方；在途 lease 仍可稍后归还，重复调用无作用。"""
 
         with self._condition:
             if self._closed:
@@ -281,13 +265,13 @@ class SlotPool:
             self._condition.notify_all()
 
     def try_acquire(self) -> SlotLease | None:
-        """立即申请一个根执行链引用；池耗尽返回 None，关闭后抛错。
+        """立即申请一个根执行链 lease。
 
         Returns:
-            调用方负责释放的 Slot lease；没有空闲资源时返回 None。
+            持有一个引用的 lease；池耗尽时返回 None。
 
         Raises:
-            RuntimeError: 当前生命周期状态或操作顺序不允许此操作。
+            RuntimeError: 池已关闭。
         """
 
         with self._condition:
@@ -298,50 +282,53 @@ class SlotPool:
             return _SlotLease(self, self._available.popleft())
 
     def subscribe_available(self, listener: Callable[[], None]) -> Callable[[], None]:
-        """订阅归还通知并返回幂等取消函数；通知不预留 Slot。
+        """订阅 Slot 归还通知；通知不预留 Slot。
+
+        每次订阅独立登记：同一函数订阅多次会收到多次通知，各自的注销函数只移除对应
+        那一次订阅。通知在归还 Slot 的线程上、释放池锁后调用，抛出的 Exception 被记录。
 
         Args:
-            listener: 资源可用时调用的通知函数。
+            listener: Slot 归还后调用的无参函数。
 
         Returns:
-            用于取消当前可用通知订阅的函数。
+            只注销本次订阅的幂等函数。
 
         Raises:
-            RuntimeError: 当前生命周期状态或操作顺序不允许此操作。
-            TypeError: 参数类型或接口实现不符合当前契约。
+            TypeError: listener 不可调用。
+            RuntimeError: 池已关闭。
         """
 
         if not callable(listener):
             raise TypeError("slot pool listener must be callable")
+        token = object()
         with self._condition:
             if self._closed:
                 raise RuntimeError("slot pool is closed")
-            self._listeners.append(listener)
+            self._listeners[token] = listener
 
         def unsubscribe() -> None:
-            """移除当前资源可用回调，重复取消不会产生额外作用。"""
+            """移除本次订阅；重复调用无作用。"""
 
             with self._condition:
-                if listener in self._listeners:
-                    self._listeners.remove(listener)
+                self._listeners.pop(token, None)
 
         return unsubscribe
 
     def acquire(self, timeout: float | None = None) -> SlotLease:
-        """等待一个根执行链引用；不得在 Consumer 执行线程内等待。
+        """阻塞等待一个根执行链 lease；不得在 Consumer 执行线程内等待。
 
         Args:
-            timeout: 等待或执行时限，单位秒；None 表示不设置时限。
+            timeout: 最长等待秒数；None 表示一直等待，0 表示不等待。
 
         Returns:
-            调用方负责释放的 Slot lease。
+            持有一个引用的 lease，调用方负责释放。
 
         Raises:
-            RuntimeError: 当前生命周期状态或操作顺序不允许此操作。
-            TimeoutError: 等待未在指定时限内完成。
+            RuntimeError: 池已关闭或在等待期间关闭。
+            TimeoutError: timeout 内没有可用 Slot。
         """
 
-        _validate_timeout(timeout)
+        validate_timeout(timeout)
         deadline = None if timeout is None else time.monotonic() + timeout
         with self._condition:
             while not self._available:
@@ -356,14 +343,11 @@ class SlotPool:
             return _SlotLease(self, self._available.popleft())
 
     def _release(self, slot: Slot) -> None:
-        """归还池中的执行槽，并通知等待资源的调用方。
-
-        Args:
-            slot: 当前逻辑执行链使用的本地执行槽。
+        """归还 Slot，唤醒一个阻塞的 acquire，并在锁外调用全部归还订阅。
 
         Raises:
-            RuntimeError: 当前生命周期状态或操作顺序不允许此操作。
-            ValueError: 参数值或字段组合不合法。
+            ValueError: Slot 不属于本池。
+            RuntimeError: Slot 已在可用队列中。
         """
 
         with self._condition:
@@ -373,7 +357,7 @@ class SlotPool:
                 raise RuntimeError("Slot is already available")
             self._available.append(slot)
             self._condition.notify()
-            listeners = tuple(self._listeners)
+            listeners = tuple(self._listeners.values())
         for listener in listeners:
             try:
                 listener()
@@ -382,25 +366,20 @@ class SlotPool:
 
 
 class _SlotLease:
-    """对执行链所持 Slot 做内部引用计数，最后一个 Work 结束时归还。
+    """SlotPool 的默认 lease：对同一执行链的 Slot 做引用计数，最后一个引用归还。
 
     Attributes:
-        __slots__: 实例允许保存的字段名称，限制动态增加属性。
-        _slot: 当前逻辑执行链的本地执行资源。
-        _pool: lease 归还资源时对应的 SlotPool。
-        _references: 当前 lease 尚未释放的引用数量。
-        _lock: 保护当前组件共享状态的进程内互斥锁。
+        __slots__: 固定实例字段。
+        _slot: 本 lease 租用的 Slot。
+        _pool: 最后一个引用释放时归还的池。
+        _references: 尚未释放的引用数量；为 0 后 lease 失效。
+        _lock: 保护引用计数的锁。
     """
 
     __slots__ = ("_lock", "_pool", "_references", "_slot")
 
     def __init__(self, pool: SlotPool, slot: Slot) -> None:
-        """为指定池中的 Slot 创建拥有一个引用的本地 lease。
-
-        Args:
-            pool: 负责管理 Slot 生命周期的本地资源池。
-            slot: 当前逻辑执行链使用的本地执行槽。
-        """
+        """创建持有一个引用的 lease。"""
 
         self._slot = slot
         self._pool = pool
@@ -409,13 +388,10 @@ class _SlotLease:
 
     @property
     def slot(self) -> Slot:
-        """返回当前 lease 关联的本地执行槽。
-
-        Returns:
-            当前逻辑链使用的本地 Slot。
+        """本 lease 租用的 Slot。
 
         Raises:
-            RuntimeError: 当前生命周期状态或操作顺序不允许此操作。
+            RuntimeError: 全部引用已释放。
         """
 
         with self._lock:
@@ -425,10 +401,13 @@ class _SlotLease:
 
     @contextmanager
     def execution(self) -> Iterator[Slot]:
-        """在 lease 保护下串行使用同一个 Slot 的执行资源。
+        """保留临时引用并独占 Slot 的执行锁，语义见 `SlotLease.execution`。
 
         Yields:
-            当前 lease 的 Slot；作用域内持有引用并串行访问其执行资源。
+            本 lease 租用的 Slot。
+
+        Raises:
+            RuntimeError: 全部引用已释放。
         """
 
         self.retain()
@@ -439,10 +418,10 @@ class _SlotLease:
             self.release()
 
     def retain(self) -> None:
-        """为同一逻辑链新增一个必须由接管方释放的引用。
+        """增加一个必须由接管方释放的引用。
 
         Raises:
-            RuntimeError: 当前生命周期状态或操作顺序不允许此操作。
+            RuntimeError: 全部引用已释放。
         """
 
         with self._lock:
@@ -451,10 +430,10 @@ class _SlotLease:
             self._references += 1
 
     def release(self) -> None:
-        """释放当前持有的 lease 引用，最后一个引用结束时归还 Slot。
+        """释放一个引用；最后一个引用释放后把 Slot 归还给池。
 
         Raises:
-            RuntimeError: 当前生命周期状态或操作顺序不允许此操作。
+            RuntimeError: 全部引用已释放。
         """
 
         slot: Slot | None = None

@@ -1,14 +1,14 @@
-"""连接不同 Graph 的领域事件。"""
+"""连接不同 Graph 的领域事件与节点调用上下文。"""
 
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, MutableMapping
-from copy import deepcopy
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, TypeVar
 
-from .core import require_non_empty_string
+from .._validation import require_non_empty_string
+from .options import snapshot_options
 from .slots import Slot
 
 
@@ -16,9 +16,13 @@ from .slots import Slot
 class Event:
     """按类型路由并携带领域 payload 的不可变消息。
 
+    Event 按值比较：type 与 payload 都相等时两个 Event 相等。哈希同样基于这两个字段，
+    因此只有 payload 可哈希时 Event 才可哈希；payload 为 dict 等可变容器时 ``hash()``
+    抛出 TypeError。Runtime 不比较或去重 Event，不依赖其可哈希性。
+
     Attributes:
-        type: 领域事件的路由类型。
-        payload: 领域事件携带的业务数据。
+        type: 领域事件的路由类型，非空字符串。
+        payload: 领域事件携带的业务数据，默认 None。
     """
 
     type: str
@@ -34,143 +38,51 @@ Emit = Callable[[Event], None]
 _C = TypeVar("_C", bound="Context")  # 保留领域工厂返回的具体 Context 子类类型。
 
 
-def snapshot_options(options: Mapping[str, Any] | None) -> dict[str, Any]:
-    """复制执行配置，避免调用方在提交后修改配置。
-
-    Args:
-        options: 使用领域命名空间键的配置映射，None 表示空配置。
-
-    Returns:
-        与输入独立的深复制字典。
-
-    Raises:
-        TypeError: 配置不是映射，或配置值无法深复制。
-        ValueError: 配置键不是非空字符串。
-    """
-
-    if options is None:
-        return {}
-    if not isinstance(options, Mapping):
-        raise TypeError("options must be a mapping or None")
-    for key in options:
-        require_non_empty_string(key, "option key")
-    return deepcopy(dict(options))
-
-
 class Context:
     """向当前 Node 暴露事件、Slot 和协作式执行检查点。
 
-    领域工厂通过 Graph(context_factory=...) 装配。领域类型通过 parent 组合基础上下文，
-    自行定义构造参数和 make 逻辑；继承只复用执行能力的转发接口。
+    公开构造只接受 parent：领域类型通过 ``Context(parent=base)`` 或
+    ``super().__init__(parent=base)`` 组合引擎绑定的基础上下文，全部执行能力逐级委托给
+    parent，不复制其状态。基础上下文由执行器通过内部的 ``bind_context`` 创建。
     每次节点调用创建独立实例；附加字段由工厂或领域节点绑定，不自动跨节点或 execution 传播。
 
     Attributes:
-        __slots__: 实例允许保存的字段名称，限制动态增加属性。
-        _emit: 事件发布回调。
-        _slot: 当前逻辑执行链的本地执行资源。
-        _checkpoint: 当前执行的协作式控制检查函数。
-        _is_cancelled: 查询执行取消状态的函数。
-        _local: 按作用域和命名空间隔离的执行局部存储。
-        _finalizers: 当前执行静止阶段的回调集合。
-        _scope: 当前节点或插件的状态隔离作用域。
-        _options: 当前节点调用独立持有的执行配置，顶层只读。
-        _parent: 组合模式下借用的基础上下文，执行能力完全委托给它；根上下文为 None。
+        __slots__: 限制本类只保存 parent；未声明 ``__slots__`` 的领域子类仍可附加字段。
+        _parent: 被组合的基础上下文，执行能力完全委托给它。
     """
 
-    __slots__ = (
-        "_checkpoint",
-        "_emit",
-        "_finalizers",
-        "_is_cancelled",
-        "_local",
-        "_scope",
-        "_slot",
-        "_options",
-        "_parent",
-    )
+    __slots__ = ("_parent",)
 
-    def __init__(
-        self,
-        emit: Emit | None = None,
-        slot: Slot | None = None,
-        *,
-        checkpoint: Callable[[], None] | None = None,
-        is_cancelled: Callable[[], bool] | None = None,
-        local: MutableMapping[tuple[str, str], MutableMapping[str, Any]] | None = None,
-        finalizers: list[Callable[[], None]] | None = None,
-        scope: str = "",
-        options: Mapping[str, Any] | None = None,
-        parent: Context | None = None,
-    ) -> None:
-        """绑定 Runtime 的内部事件接收函数。
+    def __init__(self, *, parent: Context) -> None:
+        """组合基础上下文的执行能力。
 
         Args:
-            emit: 发布跨图事件的回调。
-            slot: 当前逻辑执行链使用的本地执行槽。
-            checkpoint: 协作式取消和超时检查函数。
-            is_cancelled: 查询当前执行是否已经请求取消的回调。
-            local: 按节点和插件命名空间隔离的执行局部存储。
-            finalizers: 静止阶段按注册顺序调用的回调集合。
-            scope: 当前回调或状态所属的隔离作用域。
-            options: 本次执行配置；深复制后顶层只读，不随 emit 继承。
-            parent: 借用的基础上下文；提供时只组合其执行能力，不接受其他绑定参数。
+            parent: 被组合的上下文，通常是工厂收到的基础 Context。
 
         Raises:
-            TypeError: 参数类型或接口实现不符合当前契约。
+            TypeError: parent 不是 Context。
         """
 
+        if not isinstance(parent, Context):
+            raise TypeError("parent must be a Context")
         self._parent = parent
-        if parent is not None:
-            if not isinstance(parent, Context):
-                raise TypeError("parent must be a Context")
-            if (
-                any(
-                    value is not None
-                    for value in (
-                        emit,
-                        slot,
-                        checkpoint,
-                        is_cancelled,
-                        local,
-                        finalizers,
-                        options,
-                    )
-                )
-                or scope != ""
-            ):
-                raise TypeError("parent cannot be combined with execution bindings")
-            return
-        if not callable(emit):
-            raise TypeError("context emitter must be callable")
-        if slot is not None and not isinstance(slot, Slot):
-            raise TypeError("context slot must be a Slot or None")
-        self._emit = emit
-        self._slot = slot
-        self._checkpoint = _noop if checkpoint is None else checkpoint
-        self._is_cancelled = _false if is_cancelled is None else is_cancelled
-        self._local = {} if local is None else local
-        self._finalizers = [] if finalizers is None else finalizers
-        self._scope = scope
-        self._options = MappingProxyType(snapshot_options(options))
-        if not callable(self._checkpoint) or not callable(self._is_cancelled):
-            raise TypeError("context control callbacks must be callable")
 
     @classmethod
     def make(cls: type[_C], base: Context, inputs: Mapping[str, Any]) -> _C:
-        """组合当前节点的基础上下文，创建默认的能力转发对象。
+        """默认 Context 工厂：返回委托给 base 的新实例。
 
         领域工厂可以独立实现本方法并调用自己的构造器；构造器通过
-        super().__init__(parent=base) 组合执行能力，无需接受底层绑定参数。
+        ``super().__init__(parent=base)`` 组合执行能力。
 
         Args:
-            base: 引擎为本次调用绑定的执行能力，不包含 Runtime 内部工作对象。
-            inputs: 本次 firing 选中的只读端口映射，位于 Hook enter 转换之前。
+            base: 引擎为本次 firing 绑定的基础上下文。
+            inputs: 本次 firing 选中的只读端口映射，位于 Hook enter 转换之前；默认实现不读取。
 
         Returns:
-            当前类的新实例，执行能力委托给 base，不复制或重新初始化其状态。
+            当前类的新实例，执行能力委托给 base。
 
         Raises:
-            TypeError: 基础上下文或输入类型非法，或使用默认工厂的类型不接受 parent。
+            TypeError: base 不是 Context、inputs 不是映射，或当前类的构造器不接受 parent。
         """
 
         if not isinstance(base, Context):
@@ -181,23 +93,23 @@ class Context:
 
     @property
     def options(self) -> Mapping[str, Any]:
-        """读取本次执行配置；嵌套值的修改仅影响当前节点调用。
+        """返回本次节点调用的执行配置快照。
 
         Returns:
-            顶层只读的领域配置映射，不包含运行时资源。
+            顶层只读的配置映射；嵌套值是本次 firing 独立的深复制，修改仅影响当前调用。
         """
 
-        return self._options if self._parent is None else self._parent.options
+        return self._parent.options
 
     @property
     def slot(self) -> Slot | None:
-        """返回随当前逻辑执行链传递的状态槽。
+        """返回随当前逻辑执行链传递的 Slot。
 
         Returns:
-            当前逻辑链使用的本地 Slot。
+            当前逻辑链使用的 Slot；直接执行且未提供 Slot 时为 None。
         """
 
-        return self._slot if self._parent is None else self._parent.slot
+        return self._parent.slot
 
     def emit(self, event_type: str, payload: Any = None) -> Event:
         """向 Runtime 提交一项跨 Graph 领域事件。
@@ -208,78 +120,221 @@ class Context:
 
         Returns:
             事件传输已经接受的 Event 实例。
+
+        Raises:
+            TypeError: event_type 不是字符串。
+            ValueError: event_type 为空。
         """
 
-        if self._parent is not None:
-            return self._parent.emit(event_type, payload)
-        event = Event(event_type, payload)
-        self._emit(event)
-        return event
+        return self._parent.emit(event_type, payload)
 
     @property
     def cancelled(self) -> bool:
         """返回当前 execution 是否已经收到取消请求。
 
         Returns:
-            满足当前操作的判断条件时返回 True，否则返回 False。
+            已请求取消时返回 True。
         """
 
-        return self._is_cancelled() if self._parent is None else self._parent.cancelled
+        return self._parent.cancelled
 
     def checkpoint(self) -> None:
-        """让同步 Node 协作式响应取消、总超时和单 Node 超时。"""
+        """让同步 Node 协作式响应取消、总超时和单 Node 超时。
 
-        if self._parent is not None:
-            self._parent.checkpoint()
-        else:
-            self._checkpoint()
+        Raises:
+            ExecutionControlError: 当前 execution 已取消、超时或超过 Node 时限。
+        """
+
+        self._parent.checkpoint()
 
     def state(self, namespace: str) -> MutableMapping[str, Any]:
-        """返回当前 execution 内、按插件命名空间隔离的临时状态。
+        """返回当前 execution 内、按 Node 与命名空间隔离的临时状态。
 
         Args:
             namespace: 当前领域组件的状态命名空间。
 
         Returns:
-            当前作用域与命名空间对应的可变执行局部映射。
-        """
-
-        if self._parent is not None:
-            return self._parent.state(namespace)
-        namespace = require_non_empty_string(namespace, "context state namespace")
-        scoped = (self._scope, namespace)
-        return self._local.setdefault(scoped, {})
-
-    def on_quiescence(self, callback: Callable[[], None]) -> None:
-        """注册一次 execution 静止后的校验或清理回调。
-
-        Args:
-            callback: 在对应生命周期边界调用的函数。
+            当前 Node 作用域与命名空间对应的可变映射，同一 execution 内重复调用返回同一对象。
 
         Raises:
-            TypeError: 参数类型或接口实现不符合当前契约。
+            TypeError: namespace 不是字符串。
+            ValueError: namespace 为空。
         """
 
-        if self._parent is not None:
-            self._parent.on_quiescence(callback)
-            return
+        return self._parent.state(namespace)
+
+    def on_quiescence(self, callback: Callable[[], None]) -> None:
+        """注册本次 execution 数据流自然静止时运行的校验或清理回调。
+
+        仅当 Graph 不再有可触发的 Node 且没有残留输入时，执行器在 execution 成功结束前按注册顺序
+        同步调用全部回调，包括回调运行期间新注册的回调；每个回调前检查取消与超时。Node 失败、取消、
+        超时、步数限制、残留输入或 Hook 以 StopGraph 停止时不调用。回调抛出的执行控制异常原样传播；
+        其他 ExecutionError 补齐 graph 后传播；普通异常包装为带 graph 的 ExecutionError。首个失败
+        终止后续回调并使 execution 失败。
+
+        Args:
+            callback: 无参回调，返回值被忽略。
+
+        Raises:
+            TypeError: callback 不可调用。
+        """
+
+        self._parent.on_quiescence(callback)
+
+
+class _BoundContext(Context):
+    """执行器为一次 Node firing 绑定的根上下文，直接持有执行能力。
+
+    覆盖 Context 的全部能力接口，不读取继承的 ``_parent`` 槽位。
+
+    Attributes:
+        _emit: 接收已构造 Event 的发布回调。
+        _slot: 当前逻辑执行链的 Slot；没有时为 None。
+        _checkpoint: 协作式取消与超时检查函数。
+        _is_cancelled: 查询 execution 取消状态的函数。
+        _local: execution 共享、按 (作用域, 命名空间) 索引的状态存储；由执行器拥有。
+        _finalizers: execution 共享的静止回调列表；由执行器拥有并调用。
+        _scope: 当前 Node 的状态隔离作用域。
+        _options: 本次 firing 独立深复制的执行配置，顶层只读。
+    """
+
+    __slots__ = (
+        "_checkpoint",
+        "_emit",
+        "_finalizers",
+        "_is_cancelled",
+        "_local",
+        "_options",
+        "_scope",
+        "_slot",
+    )
+
+    def __init__(
+        self,
+        emit: Emit,
+        slot: Slot | None,
+        checkpoint: Callable[[], None],
+        is_cancelled: Callable[[], bool],
+        local: MutableMapping[tuple[str, str], MutableMapping[str, Any]],
+        finalizers: list[Callable[[], None]],
+        scope: str,
+        options: Mapping[str, Any] | None,
+    ) -> None:
+        """保存已由 bind_context 校验的执行绑定。"""
+
+        self._emit = emit
+        self._slot = slot
+        self._checkpoint = checkpoint
+        self._is_cancelled = is_cancelled
+        self._local = local
+        self._finalizers = finalizers
+        self._scope = scope
+        self._options = MappingProxyType(snapshot_options(options))
+
+    @property
+    def options(self) -> Mapping[str, Any]:
+        """返回本次 firing 的只读配置快照。"""
+
+        return self._options
+
+    @property
+    def slot(self) -> Slot | None:
+        """返回绑定的 Slot。"""
+
+        return self._slot
+
+    def emit(self, event_type: str, payload: Any = None) -> Event:
+        """构造 Event 并交给绑定的发布回调。"""
+
+        event = Event(event_type, payload)
+        self._emit(event)
+        return event
+
+    @property
+    def cancelled(self) -> bool:
+        """查询绑定的取消状态。"""
+
+        return self._is_cancelled()
+
+    def checkpoint(self) -> None:
+        """调用绑定的协作式检查函数。"""
+
+        self._checkpoint()
+
+    def state(self, namespace: str) -> MutableMapping[str, Any]:
+        """返回 (作用域, namespace) 对应的状态映射，不存在时创建。"""
+
+        namespace = require_non_empty_string(namespace, "context state namespace")
+        return self._local.setdefault((self._scope, namespace), {})
+
+    def on_quiescence(self, callback: Callable[[], None]) -> None:
+        """把回调追加到 execution 共享的静止回调列表。"""
+
         if not callable(callback):
             raise TypeError("quiescence callback must be callable")
         self._finalizers.append(callback)
 
 
-def _noop() -> None:
-    """提供不执行额外控制检查的默认回调。"""
+def bind_context(
+    emit: Emit,
+    slot: Slot | None,
+    *,
+    checkpoint: Callable[[], None] | None = None,
+    is_cancelled: Callable[[], bool] | None = None,
+    local: MutableMapping[tuple[str, str], MutableMapping[str, Any]] | None = None,
+    finalizers: list[Callable[[], None]] | None = None,
+    scope: str = "",
+    options: Mapping[str, Any] | None = None,
+) -> Context:
+    """为一次 Node firing 创建直接持有执行能力的基础 Context。
 
-    return None
+    仅供执行器与替代 GraphExecutor 使用，不属于顶层 API。
+
+    Args:
+        emit: 接收已构造 Event 的发布回调。
+        slot: 当前逻辑执行链的 Slot；没有时为 None。
+        checkpoint: 协作式取消与超时检查函数；None 表示不检查。
+        is_cancelled: 查询取消状态的函数；None 表示始终未取消。
+        local: execution 共享的状态存储，按 (作用域, 命名空间) 索引；None 时新建独立存储。
+        finalizers: execution 共享的静止回调列表，调用方负责执行；None 时新建独立列表。
+        scope: 当前 Node 的状态隔离作用域，通常为 Node ID。
+        options: 执行配置；深复制后顶层只读。
+
+    Returns:
+        绑定上述能力的基础 Context。
+
+    Raises:
+        TypeError: emit、checkpoint 或 is_cancelled 不可调用，slot 不是 Slot 或 None，
+            options 不是映射或其值无法深复制。
+        ValueError: options 的键不是非空字符串。
+    """
+
+    if not callable(emit):
+        raise TypeError("context emitter must be callable")
+    if slot is not None and not isinstance(slot, Slot):
+        raise TypeError("context slot must be a Slot or None")
+    checkpoint = _noop if checkpoint is None else checkpoint
+    is_cancelled = _false if is_cancelled is None else is_cancelled
+    if not callable(checkpoint) or not callable(is_cancelled):
+        raise TypeError("context control callbacks must be callable")
+    return _BoundContext(
+        emit,
+        slot,
+        checkpoint,
+        is_cancelled,
+        {} if local is None else local,
+        [] if finalizers is None else finalizers,
+        scope,
+        options,
+    )
+
+
+def _noop() -> None:
+    """不执行任何检查的默认 checkpoint。"""
 
 
 def _false() -> bool:
-    """提供默认的未取消状态。
-
-    Returns:
-        固定值 False。
-    """
+    """始终报告未取消的默认取消查询。"""
 
     return False
 

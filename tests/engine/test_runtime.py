@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Mapping
-from typing import Any, cast
+from threading import Event as ThreadEvent
 from threading import Lock, current_thread
+from typing import Any, cast
 
 import pytest
 
 from interlace import (
     Context,
     Event,
+    ExecutionStatus,
     Graph,
     InputPolicy,
     Node,
@@ -28,7 +30,8 @@ from interlace.engine.errors import (
     InvalidOutputError,
     PortValueTypeError,
 )
-from interlace.runtime import GraphWorker, LocalRuntimePlugin
+from interlace.engine.observation import RuntimeEvent, RuntimeEventKind
+from interlace.runtime import EventRouter, GraphWorker, LocalRuntimePlugin
 from interlace.spi import Work
 
 
@@ -152,15 +155,7 @@ def test_runtime_executes_self_loop_until_node_stops_emitting_feedback() -> None
         output_ports = Ports(again=int, done=int)
 
         def execute(self, inputs, context: Context) -> Output:
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-
-            Returns:
-                测试节点或替代执行器产生的返回值。
-            """
+            """记录访问值，未到 4 时加一回到 again，否则输出到 done。"""
 
             del context
             value = inputs["value"]
@@ -198,15 +193,7 @@ def test_runtime_does_not_impose_cycle_step_limit() -> None:
         output_ports = Ports(again=int, done=int)
 
         def execute(self, inputs, context: Context) -> Output:
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-
-            Returns:
-                测试节点或替代执行器产生的返回值。
-            """
+            """未到 10000 时加一回到 again，否则输出到 done。"""
 
             del context
             value = inputs["value"]
@@ -244,15 +231,7 @@ def test_runtime_executes_cycle_across_multiple_nodes() -> None:
         output_ports = Ports(continue_=int, done=int)
 
         def execute(self, inputs, context: Context) -> Output:
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-
-            Returns:
-                测试节点或替代执行器产生的返回值。
-            """
+            """记录检查值，小于 3 时进入 continue_，否则输出到 done。"""
 
             del context
             value = inputs["value"]
@@ -273,15 +252,7 @@ def test_runtime_executes_cycle_across_multiple_nodes() -> None:
         output_ports = Ports(value=int)
 
         def execute(self, inputs, context: Context) -> Output:
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-
-            Returns:
-                测试节点或替代执行器产生的返回值。
-            """
+            """记录本次递增，并输出加一后的值。"""
 
             del context
             value = inputs["value"]
@@ -326,15 +297,7 @@ def test_runtime_executes_cycle_inside_execution_plan() -> None:
         output_ports = Ports(again=int, done=int)
 
         def execute(self, inputs, context: Context) -> Output:
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-
-            Returns:
-                测试节点或替代执行器产生的返回值。
-            """
+            """小于 2 时加一回到 again，否则输出到 done。"""
 
             del context
             value = inputs["value"]
@@ -374,15 +337,7 @@ def test_cycle_scheduler_does_not_starve_ready_branch() -> None:
         output_ports = Ports(again=int, observe=int, done=int)
 
         def execute(self, inputs, context: Context):
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-
-            Returns:
-                测试节点或替代执行器产生的返回值。
-            """
+            """小于 3 时同时回到 again 并输出观察值，否则输出到 done。"""
 
             del context
             value = inputs["value"]
@@ -406,12 +361,7 @@ def test_cycle_scheduler_does_not_starve_ready_branch() -> None:
         output_ports = Ports()
 
         def execute(self, inputs, context: Context) -> None:
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-            """
+            """记录收到的观察值，不产生输出。"""
 
             del context
             calls.append(f"observe:{inputs['value']}")
@@ -454,15 +404,7 @@ def test_cycle_quiescence_reports_incomplete_inputs() -> None:
         output_ports = Ports(again=int, partial=int, absent=int, done=int)
 
         def execute(self, inputs, context: Context):
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-
-            Returns:
-                测试节点或替代执行器产生的返回值。
-            """
+            """小于 2 时回到 again 并产生 partial 输出，否则输出到 done。"""
 
             del context
             value = inputs["value"]
@@ -487,12 +429,7 @@ def test_cycle_quiescence_reports_incomplete_inputs() -> None:
         input_policy = InputPolicy.ALL
 
         def execute(self, inputs, context: Context) -> None:
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-            """
+            """不产生输出，让对应 ALL 输入保持不完整。"""
 
             del inputs, context
 
@@ -506,7 +443,7 @@ def test_cycle_quiescence_reports_incomplete_inputs() -> None:
 
     with Runtime() as runtime:
         runtime.register("incomplete-cycle.graph", graph)
-        with pytest.raises(IncompleteInputsError, match="join.left"):
+        with pytest.raises(IncompleteInputsError, match=r"join.left"):
             runtime.run("incomplete-cycle.graph", 0)
 
 
@@ -527,15 +464,7 @@ def test_runtime_executes_different_plans_from_one_graph() -> None:
         output_ports = Ports(value=int)
 
         def execute(self, inputs, context: Context) -> Output:
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-
-            Returns:
-                测试节点或替代执行器产生的返回值。
-            """
+            """记录调用并原样转发输入值。"""
 
             del context
             calls.append("source")
@@ -563,15 +492,7 @@ def test_runtime_executes_different_plans_from_one_graph() -> None:
             self.name = name
 
         def execute(self, inputs, context: Context) -> Output:
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-
-            Returns:
-                测试节点或替代执行器产生的返回值。
-            """
+            """记录分支名，并输出带分支名前缀的结果。"""
 
             del context
             calls.append(self.name)
@@ -613,12 +534,7 @@ def test_runtime_rejects_plan_from_another_graph() -> None:
         input_policy = InputPolicy.ON_START
 
         def execute(self, inputs, context: Context) -> None:
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-            """
+            """只作为入口启动，不产生输出。"""
 
             del inputs, context
 
@@ -647,15 +563,7 @@ def test_single_port_receives_complete_mapping_payload() -> None:
         output_ports = Ports(result=dict)
 
         def execute(self, inputs, context: Context) -> Output:
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-
-            Returns:
-                测试节点或替代执行器产生的返回值。
-            """
+            """把映射入口中的 task 值输出为结果。"""
 
             del context
             return Output(inputs["task"], "result")
@@ -671,11 +579,7 @@ def test_single_port_receives_complete_mapping_payload() -> None:
 
 @pytest.mark.parametrize("node", ["sync", "async"])
 def test_runtime_classifies_invalid_node_results(node: str) -> None:
-    """同步和异步 Node 的非法返回值都使用公共输出协议错误。
-
-    Args:
-        node: 节点实例或作用域中的节点 ID，以接口类型为准。
-    """
+    """同步和异步 Node 的非法返回值都使用公共输出协议错误。"""
 
     class InvalidSync(Node):
         """当前契约测试使用的 InvalidSync 替代实现。
@@ -691,15 +595,7 @@ def test_runtime_classifies_invalid_node_results(node: str) -> None:
         input_policy = InputPolicy.ON_START
 
         def execute(self, inputs, context: Context):
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-
-            Returns:
-                测试节点或替代执行器产生的返回值。
-            """
+            """违规地同步返回非 Output 值。"""
 
             del inputs, context
             return cast(Any, 1)  # 验证同步 Node 的非法返回值。
@@ -718,15 +614,7 @@ def test_runtime_classifies_invalid_node_results(node: str) -> None:
         input_policy = InputPolicy.ON_START
 
         async def execute(self, inputs, context: Context):
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-
-            Returns:
-                测试节点或替代执行器产生的返回值。
-            """
+            """违规地异步返回非 Output 值。"""
 
             del inputs, context
             return cast(Any, ["not-an-output"])  # 验证异步 Node 的非法返回值。
@@ -766,12 +654,7 @@ def test_context_emit_routes_to_another_graph() -> None:
         output_ports = Ports()
 
         def execute(self, inputs, context: Context) -> None:
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-            """
+            """把输入值作为 value.created 事件发布。"""
 
             context.emit("value.created", inputs["value"])
 
@@ -787,12 +670,7 @@ def test_context_emit_routes_to_another_graph() -> None:
         output_ports = Ports()
 
         def execute(self, inputs, context: Context) -> None:
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-            """
+            """记录事件路由过来的值。"""
 
             del context
             received.append(inputs["value"])
@@ -833,12 +711,7 @@ def test_runtime_keeps_observe_separate_from_combined_on() -> None:
         output_ports = Ports()
 
         def execute(self, inputs, context: Context) -> None:
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-            """
+            """记录事件路由过来的值。"""
 
             del context
             received.append(inputs["value"])
@@ -875,12 +748,7 @@ def test_runtime_on_forwards_subscription() -> None:
         output_ports = Ports()
 
         def execute(self, inputs, context: Context) -> None:
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-            """
+            """消费事件但不做处理。"""
 
             del inputs, context
 
@@ -910,12 +778,7 @@ def test_runtime_on_does_not_leave_route_when_consumer_setup_fails() -> None:
         output_ports = Ports()
 
         def execute(self, inputs, context: Context) -> None:
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-            """
+            """消费事件但不做处理。"""
 
             del inputs, context
 
@@ -954,15 +817,7 @@ def test_event_is_committed_even_if_source_node_later_fails() -> None:
         output_ports = Ports()
 
         def execute(self, inputs, context: Context) -> None:
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-
-            Raises:
-                ValueError: 参数值或字段组合不合法。
-            """
+            """先发布 value.committed 事件，再抛出业务异常。"""
 
             context.emit("value.committed", inputs["value"])
             raise ValueError("boom")
@@ -995,12 +850,7 @@ def test_runtime_dispatches_each_event_without_domain_deduplication() -> None:
         output_ports = Ports()
 
         def execute(self, inputs, context: Context) -> None:
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-            """
+            """记录事件路由过来的值。"""
 
             del context
             received.append(inputs["value"])
@@ -1035,12 +885,7 @@ def test_queue_concurrency_limits_graph_executions() -> None:
         output_ports = Ports()
 
         async def execute(self, inputs, context: Context) -> None:
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-            """
+            """统计同时运行的执行数，并异步休眠 20 毫秒。"""
 
             nonlocal active, maximum
             del inputs, context
@@ -1086,12 +931,7 @@ def test_event_can_drive_a_chain_of_graphs() -> None:
         output_ports = Ports()
 
         def execute(self, inputs, context: Context) -> None:
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-            """
+            """把输入值作为 relayed 事件转发。"""
 
             context.emit("relayed", inputs["value"])
 
@@ -1107,12 +947,7 @@ def test_event_can_drive_a_chain_of_graphs() -> None:
         output_ports = Ports()
 
         def execute(self, inputs, context: Context) -> None:
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-            """
+            """记录事件路由过来的值。"""
 
             del context
             received.append(inputs["value"])
@@ -1147,12 +982,7 @@ def test_slot_follows_work_across_consumers() -> None:
         output_ports = Ports()
 
         def execute(self, inputs, context: Context) -> None:
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-            """
+            """把值写入 Slot，记录 Slot 与线程，再发布 slot.forwarded 事件。"""
 
             assert context.slot is not None
             context.slot["value"] = inputs["value"]
@@ -1171,12 +1001,7 @@ def test_slot_follows_work_across_consumers() -> None:
         output_ports = Ports()
 
         def execute(self, inputs, context: Context) -> None:
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-            """
+            """确认 Slot 携带源图写入的值，并记录 Slot 与线程。"""
 
             assert context.slot is not None
             assert context.slot["value"] == inputs["value"]
@@ -1234,12 +1059,7 @@ def test_default_slot_pool_matches_consumer_concurrency() -> None:
         output_ports = Ports()
 
         async def execute(self, inputs, context: Context) -> None:
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-            """
+            """记录 Slot ID 并统计同时运行的执行数。"""
 
             nonlocal active, maximum
             del inputs
@@ -1289,12 +1109,7 @@ def test_slot_lease_waits_for_all_event_branches() -> None:
         output_ports = Ports()
 
         def execute(self, inputs, context: Context) -> None:
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-            """
+            """向左右两个分支各发布一个事件。"""
 
             assert context.slot is not None
             context.emit("branch.left", inputs["value"])
@@ -1322,12 +1137,7 @@ def test_slot_lease_waits_for_all_event_branches() -> None:
             self.name = name
 
         def execute(self, inputs, context: Context) -> None:
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-            """
+            """记录分支名与所用的 Slot ID。"""
 
             del inputs
             assert context.slot is not None
@@ -1367,15 +1177,7 @@ def test_failed_work_releases_its_slot() -> None:
         output_ports = Ports()
 
         def execute(self, inputs, context: Context) -> None:
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-
-            Raises:
-                ValueError: 参数值或字段组合不合法。
-            """
+            """在携带 Slot 的工作中抛出业务异常。"""
 
             del inputs, context
             raise ValueError("broken slot work")
@@ -1393,82 +1195,91 @@ def test_failed_work_releases_its_slot() -> None:
 
 
 def test_rejected_emitted_event_releases_its_retained_slot() -> None:
-    """Emitter 拒绝接管 Event 时回滚为它保留的 Slot 引用。"""
+    """Emitter 拒绝 Node 发出的 Event 时，Work 失败且其 Slot 归还池。"""
 
-    def reject(event) -> None:
-        """创建拒绝本次投递的交付决定。
-
-        Args:
-            event: 需要发布、观察或处理的事件。
-
-        Raises:
-            ValueError: 参数值或字段组合不合法。
-        """
-
-        del event
-        raise ValueError("rejected event")
-
-    slots = SlotPool(1)
-    lease = slots.acquire()
-    worker = GraphWorker(
-        consumer=memory.TaskBackend(),
-        emit=reject,
-        close_injected=True,
-    )
-
-    with pytest.raises(ValueError, match="rejected event"):
-        worker._emit_with_lease(lease, Event("rejected"))
-
-    lease.release()
-    assert slots.available == 1
-    worker.close()
-
-
-def test_failed_event_dispatch_releases_forwarded_slot_once() -> None:
-    """EventBus 失败后 Router 与 Worker 交接 lease 时不会重复释放。"""
-
-    class Relay(Node):
-        """当前契约测试使用的 Relay 替代实现。
+    class Emit(Node):
+        """发出一个会被 Emitter 拒绝的跨图事件。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            input_ports: 接收整数入口值的端口。
+            output_ports: 无输出端口。
         """
 
         input_ports = Ports(value=int)
         output_ports = Ports()
 
         def execute(self, inputs, context: Context) -> None:
-            """执行当前测试场景的节点行为，供外层契约断言检查。
+            """发出携带入口值的 rejected 事件。
 
             Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
+                inputs: 包含 value 端口的输入映射。
+                context: 当前 Node firing 的上下文。
             """
 
             context.emit("rejected", inputs["value"])
 
     def reject(event) -> None:
-        """创建拒绝本次投递的交付决定。
+        """拒绝接管任何事件。
 
         Args:
-            event: 需要发布、观察或处理的事件。
+            event: Node 发出的事件。
 
         Raises:
-            ValueError: 参数值或字段组合不合法。
+            ValueError: 总是抛出。
         """
 
         del event
         raise ValueError("rejected event")
 
     slots = SlotPool(1)
+    tasks = memory.TaskBackend()
+    worker = GraphWorker(consumer=tasks, emit=reject, close_injected=True)
+    worker.register("emit.graph", Graph(entrypoint="emit").add(emit=Emit()))
+    worker.consume("emit", slots=slots)
+    work = Work("emit.graph", 1)
+    tasks.submit("emit", work)
+
+    with pytest.raises(Exception, match="rejected event"):
+        worker.wait_idle(2)
+    assert worker.get_execution(work.id).status is ExecutionStatus.FAILED
+    assert slots.available == 1
+    worker.close()
+    slots.close()
+
+
+def test_failed_event_dispatch_releases_forwarded_slot_once() -> None:
+    """Work 投递失败后 Router 与 Worker 交接 lease 时不会重复释放。"""
+
+    class Relay(Node):
+        """把入口值转发为 rejected 事件。
+
+        Attributes:
+            input_ports: 接收整数入口值的端口。
+            output_ports: 无输出端口。
+        """
+
+        input_ports = Ports(value=int)
+        output_ports = Ports()
+
+        def execute(self, inputs, context: Context) -> None:
+            """发出携带入口值的 rejected 事件。
+
+            Args:
+                inputs: 包含 value 端口的输入映射。
+                context: 当前 Node firing 的上下文。
+            """
+
+            context.emit("rejected", inputs["value"])
+
+    slots = SlotPool(1)
     runtime = Runtime()
     runtime.register("relay.graph", Graph(entrypoint="relay").add(relay=Relay()))
-    runtime.observe("rejected", reject)
+    # rejected 路由到没有消费者的通道，本地延续投递必然失败。
+    runtime.route("rejected", graph="relay.graph", queue="nobody")
     runtime.on("relay", graph="relay.graph", queue="relay", slots=slots)
     runtime.emit("relay", 1)
 
-    with pytest.raises(Exception, match="rejected event"):
+    with pytest.raises(Exception, match="no active consumers"):
         runtime.wait_idle()
     assert slots.available == 1
     runtime.close()
@@ -1491,12 +1302,7 @@ def test_waiting_roots_do_not_starve_slot_continuations() -> None:
         output_ports = Ports()
 
         def execute(self, inputs, context: Context) -> None:
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-            """
+            """把输入值作为 continued 事件转发。"""
 
             context.emit("continued", inputs["value"])
 
@@ -1512,12 +1318,7 @@ def test_waiting_roots_do_not_starve_slot_continuations() -> None:
         output_ports = Ports()
 
         def execute(self, inputs, context: Context) -> None:
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-            """
+            """记录事件路由过来的值。"""
 
             del context
             received.append(inputs["value"])
@@ -1567,12 +1368,7 @@ def test_shared_pool_works_when_consumer_and_slot_sizes_differ() -> None:
         output_ports = Ports()
 
         async def execute(self, inputs, context: Context) -> None:
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-            """
+            """统计同时持有 Slot 的执行数，并异步休眠 10 毫秒。"""
 
             nonlocal active, maximum
             del inputs
@@ -1621,12 +1417,7 @@ def test_multiple_routes_retain_one_slot_until_every_work_finishes() -> None:
         output_ports = Ports()
 
         def execute(self, inputs, context: Context) -> None:
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-            """
+            """把输入值作为 fanout 事件发布。"""
 
             context.emit("fanout", inputs["value"])
 
@@ -1652,12 +1443,7 @@ def test_multiple_routes_retain_one_slot_until_every_work_finishes() -> None:
             self.name = name
 
         def execute(self, inputs, context: Context) -> None:
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-            """
+            """记录节点名与所用的 Slot ID。"""
 
             del inputs
             assert context.slot is not None
@@ -1715,12 +1501,7 @@ def test_returned_slot_keeps_state_for_later_root_work() -> None:
         output_ports = Ports()
 
         def execute(self, inputs, context: Context) -> None:
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-            """
+            """在 Slot 中累加复用次数并记录。"""
 
             del inputs
             assert context.slot is not None
@@ -1754,15 +1535,7 @@ def test_runtime_reports_incomplete_join() -> None:
 
     class LeftOnly(Split):
         def execute(self, inputs, context: Context):
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-
-            Returns:
-                测试节点或替代执行器产生的返回值。
-            """
+            """只输出到 left 端口。"""
 
             del context
             return Output(inputs["value"], "left")
@@ -1939,3 +1712,242 @@ def test_mixed_node_styles_preserve_outputs_events_options_and_slot() -> None:
     assert seen_options == [{"pipeline.rules": ["initial"]}] * 3
     assert len(seen_slots) == 4
     assert all(slot is seen_slots[0] for slot in seen_slots)
+
+
+class Gate(Node):
+    """首次执行等待测试放行，可按需让第一次执行失败。
+
+    Attributes:
+        entered: 首次执行开始时设置的线程事件。
+        release: 放行首次执行的线程事件。
+        fail_first: 首次执行放行后是否抛出异常。
+        calls: 已开始的执行次数，仅供本实例的测试读取。
+    """
+
+    def __init__(self, *, fail_first: bool = False) -> None:
+        """创建尚未执行的闸门节点。
+
+        Args:
+            fail_first: 首次执行放行后是否抛出 ValueError。
+        """
+
+        self.entered = ThreadEvent()
+        self.release = ThreadEvent()
+        self.fail_first = fail_first
+        self.calls = 0
+
+    def execute(self, inputs, context: Context) -> None:
+        """首次执行阻塞到放行，之后的执行立即完成。
+
+        Args:
+            inputs: 未使用的入口数据。
+            context: 未使用的执行上下文。
+
+        Raises:
+            ValueError: fail_first 为 True 时的首次执行。
+        """
+
+        del inputs, context
+        self.calls += 1
+        if self.calls > 1:
+            return
+        self.entered.set()
+        assert self.release.wait(2)
+        if self.fail_first:
+            raise ValueError("first attempt failed")
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_execution_finished_is_published_before_waiters_wake(fail: bool) -> None:
+    """run 返回前 execution.finished 已发布，发布时 Execution 尚未写入终态。
+
+    Args:
+        fail: 是否让 Graph 执行失败。
+    """
+
+    class Finish(Node):
+        """立即完成或失败的节点。"""
+
+        def execute(self, inputs, context: Context) -> None:
+            """按参数完成或抛出异常。
+
+            Args:
+                inputs: 未使用的入口数据。
+                context: 未使用的执行上下文。
+
+            Raises:
+                ValueError: fail 为 True。
+            """
+
+            del inputs, context
+            if fail:
+                raise ValueError("graph failed")
+
+    finished: list[tuple[RuntimeEvent, bool]] = []
+    with Runtime() as runtime:
+        runtime.register("finish", Graph(entrypoint="node").add("node", Finish()))
+
+        def observe(event: RuntimeEvent) -> None:
+            """记录终态事件及发布时 Execution 是否已经结束。
+
+            Args:
+                event: Worker 发布的生命周期事件。
+            """
+
+            if event.kind is RuntimeEventKind.EXECUTION_FINISHED:
+                assert event.execution_id is not None
+                execution = runtime.get_execution(event.execution_id)
+                finished.append((event, execution.done))
+
+        handle = runtime.observe_runtime(observe)
+        if fail:
+            with pytest.raises(Exception, match="graph failed"):
+                runtime.run("finish")
+        else:
+            assert runtime.run("finish") == ()
+        handle.detach()
+
+    assert len(finished) == 1
+    event, done_at_publish = finished[0]
+    assert not done_at_publish
+    assert event.status == ("failed" if fail else "succeeded")
+    assert event.error_type == ("ExecutionError" if fail else None)
+
+
+def test_redelivered_work_replaces_finished_record_and_rejects_active_duplicate() -> (
+    None
+):
+    """同一 Work.id 在前次执行进行中被拒绝，结束后重投递替换保留记录。"""
+
+    node = Gate(fail_first=True)
+    tasks = memory.TaskBackend()
+    worker = GraphWorker(consumer=tasks, close_injected=True)
+    results: list[tuple[str | None, int]] = []
+    rejected = ThreadEvent()
+
+    def observe(event: RuntimeEvent) -> None:
+        """记录每次交付的结论与尝试序号。
+
+        Args:
+            event: Worker 发布的生命周期事件。
+        """
+
+        if event.kind is RuntimeEventKind.WORK_FINISHED:
+            results.append((event.status, event.attributes["attempt"]))
+            if event.status == "rejected":
+                rejected.set()
+
+    worker.observe_runtime(observe)
+    worker.register("gate", Graph(entrypoint="node").add("node", node))
+    worker.consume("gate", concurrency=2)
+    work = Work("gate")
+    try:
+        tasks.submit("gate", work)
+        assert node.entered.wait(1)
+        first = worker.get_execution(work.id)
+        # 前次执行仍在进行，同一 Work 的并发交付被拒绝，不覆盖活跃记录。
+        tasks.submit("gate", work)
+        assert rejected.wait(1)
+        assert results == [("rejected", 1)]
+        assert worker.get_execution(work.id) is first
+    finally:
+        node.release.set()
+    # 后端先传播首个失败，即重复交付的拒绝原因。
+    with pytest.raises(InterlaceRuntimeError, match="still active"):
+        worker.wait_idle(2)
+    assert first.status is ExecutionStatus.FAILED
+
+    tasks.submit("gate", work)
+    worker.wait_idle(2)
+    retried = worker.get_execution(work.id)
+    assert retried is not first
+    assert retried.status is ExecutionStatus.SUCCEEDED
+    assert [item.id for item in worker.executions()] == [work.id]
+    worker.close()
+
+
+def test_history_limit_and_direct_workers_are_constructor_parameters() -> None:
+    """Execution 记录上限与直接执行线程数通过构造参数配置并校验。"""
+
+    tasks = memory.TaskBackend()
+    try:
+        for invalid in (0, -1):
+            with pytest.raises(ValueError, match="history_limit"):
+                GraphWorker(consumer=tasks, history_limit=invalid)
+            with pytest.raises(ValueError, match="direct_workers"):
+                GraphWorker(consumer=tasks, direct_workers=invalid)
+        with pytest.raises(TypeError, match="history_limit"):
+            GraphWorker(consumer=tasks, history_limit=True)
+    finally:
+        tasks.close()
+
+    node = Gate()
+    plugin = LocalRuntimePlugin(history_limit=1, direct_workers=1)
+    with Runtime(plugins=(plugin,)) as runtime:
+        runtime.register("gate", Graph(entrypoint="node").add("node", node))
+        blocked = runtime.start("gate")
+        assert node.entered.wait(1)
+        # 单线程直接执行池中，第二次执行排在阻塞执行之后；未结束记录不被淘汰。
+        queued = runtime.start("gate")
+        assert queued.status is ExecutionStatus.PENDING
+        assert runtime.executions() == (blocked, queued)
+        node.release.set()
+        runtime.wait_idle(2)
+        assert runtime.executions() == (queued,)
+        with pytest.raises(InterlaceRuntimeError, match="unknown execution"):
+            runtime.get_execution(blocked.id)
+
+
+def test_on_rolls_back_only_the_consumer_it_created_when_route_fails() -> None:
+    """route 失败时 on 撤销本次新建的消费者，保留此前已有的消费者。"""
+
+    class FailingRouter(EventRouter):
+        """在测试放行前拒绝所有 route 的 Router。
+
+        Attributes:
+            failing: 为 True 时 route 抛出 RuntimeError。
+        """
+
+        failing = True
+
+        def route(self, *args: Any, **kwargs: Any) -> Any:
+            """按 failing 拒绝或委托给 EventRouter.route。
+
+            Args:
+                *args: 透传给 EventRouter.route 的位置参数。
+                **kwargs: 透传给 EventRouter.route 的关键字参数。
+
+            Returns:
+                EventRouter.route 的返回值。
+
+            Raises:
+                RuntimeError: failing 为 True。
+            """
+
+            if self.failing:
+                raise RuntimeError("route rejected")
+            return super().route(*args, **kwargs)
+
+    bus = memory.EventBus()
+    tasks = memory.TaskBackend()
+    router = FailingRouter(events=bus, publisher=tasks)
+    worker = GraphWorker(consumer=tasks, emit=router.publish)
+    try:
+        with Runtime(router=router, worker=worker) as runtime:
+            with pytest.raises(RuntimeError, match="route rejected"):
+                runtime.on("value", graph="graph", queue="fresh")
+            with pytest.raises(Exception, match="no active consumers"):
+                tasks.submit("fresh", Work("graph"))
+
+            runtime.consume("kept")
+            with pytest.raises(RuntimeError, match="route rejected"):
+                runtime.on("value", graph="graph", queue="kept")
+            with pytest.raises(InterlaceRuntimeError, match="local concurrency 1"):
+                runtime.consume("kept", concurrency=2)
+
+            router.failing = False
+            # 首次失败没有遗留 concurrency=1 的消费者，因此可以换用新配置。
+            runtime.on("value", graph="graph", queue="fresh", concurrency=2)
+    finally:
+        tasks.close()
+        bus.close()

@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 from threading import enumerate as enumerate_threads
 
 import pytest
 
-from interlace import Graph, Node, Output, Ports, Runtime
+from interlace import Event, Graph, Node, Output, Ports, Runtime
 from interlace.adapters import memory
 from interlace.engine.executor import Engine
 from interlace.engine.hooks import NodeCall
@@ -27,6 +28,7 @@ from interlace.plugins import (
     PluginHost,
 )
 from interlace.runtime import EventRouter, GraphWorker, LocalRuntimePlugin
+from interlace.spi import DeliveryResult, Work
 
 
 def test_multiple_plugins_can_contribute_each_extension_kind() -> None:
@@ -36,14 +38,7 @@ def test_multiple_plugins_can_contribute_each_extension_kind() -> None:
     calls: list[str] = []
 
     def record_call(call: NodeCall) -> NodeCall:
-        """记录当前装配或调用路径，验证组件经过约定入口。
-
-        Args:
-            call: Hook 当前处理的节点调用记录。
-
-        Returns:
-            当前测试回调收集或构造的结果。
-        """
+        """记录 Hook 经过的节点 ID，并原样返回调用记录。"""
 
         calls.append(call.node_id)
         return call
@@ -90,11 +85,7 @@ def test_aggregate_declarations_cannot_be_fulfilled_by_singletons() -> None:
 
     class WrongKind(RecordingPlugin):
         def setup(self, context):
-            """在插件装配阶段登记声明的能力或贡献。
-
-            Args:
-                context: 当前调用的执行或插件上下文。
-            """
+            """把声明为聚合贡献的 example/items 错误地作为单例能力提供。"""
 
             context.provide("example/items", object())
 
@@ -125,33 +116,19 @@ def test_failed_runtime_construction_does_not_leave_runner_threads(stage) -> Non
     """验证 Runtime 构造失败后不遗留运行器线程。
 
     Args:
-        stage: 当前用例使用的 stage 夹具或参数化输入。
+        stage: 构造失败的阶段：依赖校验、插件 setup 或插件 start。
     """
 
     class Broken(RecordingPlugin):
         def setup(self, context):
-            """在插件装配阶段登记声明的能力或贡献。
-
-            Args:
-                context: 当前调用的执行或插件上下文。
-
-            Raises:
-                RuntimeError: 当前生命周期状态或操作顺序不允许此操作。
-            """
+            """stage 为 setup 时抛出 RuntimeError，否则按 RecordingPlugin 记录装配。"""
 
             if stage == "setup":
                 raise RuntimeError("setup failed")
             super().setup(context)
 
         def start(self, context):
-            """启动已经装配的组件或提交一次新的执行。
-
-            Args:
-                context: 当前调用的执行或插件上下文。
-
-            Raises:
-                RuntimeError: 当前生命周期状态或操作顺序不允许此操作。
-            """
+            """stage 为 start 时抛出 RuntimeError，否则不做任何事。"""
 
             if stage == "start":
                 raise RuntimeError("start failed")
@@ -169,7 +146,7 @@ def test_failed_runtime_construction_does_not_leave_runner_threads(stage) -> Non
     for _ in range(3):
         with pytest.raises(
             (ValueError, RuntimeError),
-            match="missing required plugin|setup failed|start failed",
+            match=r"missing required plugin|setup failed|start failed",
         ):
             Runtime(plugins=(plugin,))
     after = {
@@ -181,28 +158,20 @@ def test_failed_runtime_construction_does_not_leave_runner_threads(stage) -> Non
 
 
 def test_builtin_setup_rolls_back_partially_created_components(monkeypatch) -> None:
-    """验证默认插件回滚部分创建的底层组件。
-
-    Args:
-        monkeypatch: 当前用例使用的 monkeypatch 夹具或参数化输入。
-    """
+    """验证默认插件在任务后端构造失败时关闭已创建的事件总线。"""
 
     bus = memory.EventBus()
     closed = []
     original_close = bus.close
 
     def close():
-        """结束当前组件的生命周期并释放其拥有的资源。"""
+        """记录事件总线被关闭，再调用原始 close。"""
 
         closed.append(True)
         original_close()
 
     def broken_tasks():
-        """模拟任务组件创建失败，验证部分装配资源回滚。
-
-        Raises:
-            RuntimeError: 当前生命周期状态或操作顺序不允许此操作。
-        """
+        """替代 TaskBackend 构造函数，总是抛出 RuntimeError 模拟构造失败。"""
 
         raise RuntimeError("task construction failed")
 
@@ -224,9 +193,9 @@ def test_hook_contribution_validates_hook_and_phase_before_registration(
     """验证 Hook 贡献注册前检查对象和阶段。
 
     Args:
-        hook: 节点 Hook 对象或单阶段回调。
-        phase: 函数 Hook 对应的执行阶段。
-        error: 需要传播、记录或用于恢复的异常。
+        hook: 非 Hook 对象，或合法的单阶段回调。
+        phase: 函数 Hook 的执行阶段；非法值应触发 ValueError。
+        error: 构造 NodeHookContribution 时期望抛出的异常类型。
     """
 
     with pytest.raises(error):
@@ -234,12 +203,12 @@ def test_hook_contribution_validates_hook_and_phase_before_registration(
 
 
 class RecordingPlugin:
-    """当前契约测试使用的 RecordingPlugin 替代实现。
+    """把 setup/start/stop 按 ``阶段:插件标识`` 记录到共享列表的测试插件。
 
     Attributes:
-        descriptor: 插件身份、依赖和能力声明。
-        events: 测试记录的事件或注入的事件总线。
-        capability: 当前贡献所属的能力类别。
+        descriptor: 由构造参数生成的插件描述，版本固定为 1.0.0。
+        events: 多个插件共享的生命周期记录列表，用于断言调用顺序。
+        capability: setup 时以插件标识为值提供的能力；None 表示不提供。
     """
 
     def __init__(
@@ -251,14 +220,11 @@ class RecordingPlugin:
         requires_capabilities: tuple[str, ...] = (),
         capability: str | None = None,
     ) -> None:
-        """初始化实例及其依赖，建立当前对象独立维护的状态。
+        """按插件标识和依赖声明构造描述符，并保存共享记录列表。
 
         Args:
-            plugin_id: 带命名空间的插件标识。
-            events: 注入的事件传输实现。
-            requires: 当前插件依赖的插件标识集合。
-            requires_capabilities: 当前插件要求宿主已提供的能力集合。
-            capability: 需要提供、取得或移除的能力名称。
+            events: 追加生命周期记录的共享列表。
+            capability: 需要在 setup 中提供的能力；None 表示不提供。
         """
 
         provides = () if capability is None else (capability,)
@@ -273,32 +239,20 @@ class RecordingPlugin:
         self.capability = capability
 
     def setup(self, context) -> None:
-        """在插件装配阶段登记声明的能力或贡献。
-
-        Args:
-            context: 当前调用的执行或插件上下文。
-        """
+        """记录 setup，并在声明了能力时以插件标识作为能力值提供。"""
 
         self.events.append(f"setup:{self.descriptor.id}")
         if self.capability is not None:
             context.provide(self.capability, self.descriptor.id)
 
     def start(self, context) -> None:
-        """启动已经装配的组件或提交一次新的执行。
-
-        Args:
-            context: 当前调用的执行或插件上下文。
-        """
+        """记录 start。"""
 
         del context
         self.events.append(f"start:{self.descriptor.id}")
 
     def stop(self, context) -> None:
-        """停止插件并释放其拥有的资源。
-
-        Args:
-            context: 当前调用的执行或插件上下文。
-        """
+        """记录 stop。"""
 
         del context
         self.events.append(f"stop:{self.descriptor.id}")
@@ -372,10 +326,10 @@ def test_host_rejects_incompatible_plugin_api(api_version: str) -> None:
     """
 
     class FuturePlugin:
-        """当前契约测试使用的 FuturePlugin 替代实现。
+        """声明不兼容 SPI 版本的最小插件，宿主构造时即应拒绝。
 
         Attributes:
-            descriptor: 插件身份、依赖和能力声明。
+            descriptor: 携带参数化 api_version 的插件描述。
         """
 
         descriptor = PluginDescriptor(
@@ -383,29 +337,17 @@ def test_host_rejects_incompatible_plugin_api(api_version: str) -> None:
         )
 
         def setup(self, context):
-            """在插件装配阶段登记声明的能力或贡献。
-
-            Args:
-                context: 当前调用的执行或插件上下文。
-            """
+            """满足插件协议的空 setup；版本校验失败后不会被调用。"""
 
             del context
 
         def start(self, context):
-            """启动已经装配的组件或提交一次新的执行。
-
-            Args:
-                context: 当前调用的执行或插件上下文。
-            """
+            """满足插件协议的空 start。"""
 
             del context
 
         def stop(self, context):
-            """停止插件并释放其拥有的资源。
-
-            Args:
-                context: 当前调用的执行或插件上下文。
-            """
+            """满足插件协议的空 stop。"""
 
             del context
 
@@ -421,14 +363,7 @@ def test_setup_failure_rolls_back_configured_plugins() -> None:
 
     class Broken(RecordingPlugin):
         def setup(self, context) -> None:
-            """在插件装配阶段登记声明的能力或贡献。
-
-            Args:
-                context: 当前调用的执行或插件上下文。
-
-            Raises:
-                RuntimeError: 当前生命周期状态或操作顺序不允许此操作。
-            """
+            """记录 setup 后抛出 RuntimeError，模拟装配中途失败。"""
 
             super().setup(context)
             raise RuntimeError("setup failed")
@@ -446,14 +381,7 @@ def test_start_failure_rolls_back_plugins_in_reverse_order() -> None:
 
     class Broken(RecordingPlugin):
         def start(self, context) -> None:
-            """启动已经装配的组件或提交一次新的执行。
-
-            Args:
-                context: 当前调用的执行或插件上下文。
-
-            Raises:
-                RuntimeError: 当前生命周期状态或操作顺序不允许此操作。
-            """
+            """记录 start 后抛出 RuntimeError，模拟启动中途失败。"""
 
             super().start(context)
             raise RuntimeError("start failed")
@@ -474,11 +402,7 @@ def test_host_rejects_declared_but_missing_capability() -> None:
 
     class Missing(RecordingPlugin):
         def setup(self, context) -> None:
-            """在插件装配阶段登记声明的能力或贡献。
-
-            Args:
-                context: 当前调用的执行或插件上下文。
-            """
+            """不提供任何能力，使声明的 example/value 落空。"""
 
             del context
 
@@ -495,14 +419,7 @@ def test_stop_failure_does_not_skip_remaining_plugins() -> None:
 
     class BrokenStop(RecordingPlugin):
         def stop(self, context) -> None:
-            """停止插件并释放其拥有的资源。
-
-            Args:
-                context: 当前调用的执行或插件上下文。
-
-            Raises:
-                RuntimeError: 当前生命周期状态或操作顺序不允许此操作。
-            """
+            """记录 stop 后抛出消息含插件标识的 RuntimeError。"""
 
             super().stop(context)
             raise RuntimeError(f"stop failed: {self.descriptor.id}")
@@ -524,10 +441,10 @@ def test_contributions_reject_duplicate_names_and_freeze_after_start() -> None:
     """验证贡献名称唯一且宿主启动后冻结注册。"""
 
     class Contributions:
-        """当前契约测试使用的 Contributions 替代实现。
+        """在 setup 与 start 中直接断言贡献注册规则的插件。
 
         Attributes:
-            descriptor: 插件身份、依赖和能力声明。
+            descriptor: 声明聚合贡献 example/items 的插件描述。
         """
 
         descriptor = PluginDescriptor(
@@ -537,32 +454,20 @@ def test_contributions_reject_duplicate_names_and_freeze_after_start() -> None:
         )
 
         def setup(self, context) -> None:
-            """在插件装配阶段登记声明的能力或贡献。
-
-            Args:
-                context: 当前调用的执行或插件上下文。
-            """
+            """贡献 example/item，并断言同名再次贡献抛出 ValueError。"""
 
             context.contribute("example/items", "example/item", object())
             with pytest.raises(ValueError, match="already exists"):
                 context.contribute("example/items", "example/item", object())
 
         def start(self, context) -> None:
-            """启动已经装配的组件或提交一次新的执行。
-
-            Args:
-                context: 当前调用的执行或插件上下文。
-            """
+            """断言宿主启动阶段追加贡献因注册已冻结而抛出 RuntimeError。"""
 
             with pytest.raises(RuntimeError, match="frozen"):
                 context.contribute("example/items", "example/late", object())
 
         def stop(self, context) -> None:
-            """停止插件并释放其拥有的资源。
-
-            Args:
-                context: 当前调用的执行或插件上下文。
-            """
+            """空 stop，本插件没有需要释放的资源。"""
 
             del context
 
@@ -573,11 +478,11 @@ def test_runtime_role_validation_failure_closes_started_plugin_host() -> None:
     """验证角色校验失败时关闭已经启动的插件宿主。"""
 
     class InvalidRoles:
-        """当前契约测试使用的 InvalidRoles 替代实现。
+        """以普通 object 冒充路由与执行角色的插件，触发 Runtime 角色校验失败。
 
         Attributes:
-            descriptor: 插件身份、依赖和能力声明。
-            stopped: 测试插件是否已经停止。
+            descriptor: 声明提供事件路由与 Graph Worker 能力的插件描述。
+            stopped: 宿主是否已调用 stop，用于断言校验失败后宿主被关闭。
         """
 
         descriptor = PluginDescriptor(
@@ -587,35 +492,23 @@ def test_runtime_role_validation_failure_closes_started_plugin_host() -> None:
         )
 
         def __init__(self) -> None:
-            """初始化实例及其依赖，建立当前对象独立维护的状态。"""
+            """初始化为尚未停止。"""
 
             self.stopped = False
 
         def setup(self, context) -> None:
-            """在插件装配阶段登记声明的能力或贡献。
-
-            Args:
-                context: 当前调用的执行或插件上下文。
-            """
+            """用普通 object 提供路由与执行角色，使后续角色类型校验失败。"""
 
             context.provide(CAP_EVENT_ROUTER, object())
             context.provide(CAP_GRAPH_WORKER, object())
 
         def start(self, context) -> None:
-            """启动已经装配的组件或提交一次新的执行。
-
-            Args:
-                context: 当前调用的执行或插件上下文。
-            """
+            """空 start；失败发生在宿主启动之后的角色校验。"""
 
             del context
 
         def stop(self, context) -> None:
-            """停止插件并释放其拥有的资源。
-
-            Args:
-                context: 当前调用的执行或插件上下文。
-            """
+            """标记插件已被宿主停止。"""
 
             del context
             self.stopped = True
@@ -628,55 +521,40 @@ def test_runtime_role_validation_failure_closes_started_plugin_host() -> None:
 
 
 class AnySelector:
+    """选择首个有可用 token 的端口的输入选择器。"""
+
     def select(self, ports, available, config):
-        """仅根据端口名称和可用 token 数量选择本次输入组合。
-
-        Args:
-            ports: 保持声明顺序的输入端口名称。
-            available: 各端口当前可消费的 token 数量。
-            config: 当前具名策略的参数映射。
-
-        Returns:
-            符合当前可用条件的选择结果，没有可执行输入时不触发。
-        """
+        """按声明顺序返回首个有可用 token 的端口单元组；全部为空时返回 None。"""
 
         del config
         return next(((port,) for port in ports if available[port]), None)
 
 
 class Source(Node):
-    """当前契约测试使用的 Source 替代实现。
+    """把 value 输入原样输出到 value 端口的入口节点。
 
     Attributes:
-        input_ports: 节点声明的输入端口及其类型。
-        output_ports: 节点声明的输出端口及其类型。
+        input_ports: 唯一的 str 类型输入端口 value。
+        output_ports: 唯一的 str 类型输出端口 value。
     """
 
     input_ports = Ports(value=str)
     output_ports = Ports(value=str)
 
     def execute(self, inputs, context):
-        """执行当前测试场景的节点行为，供外层契约断言检查。
-
-        Args:
-            inputs: 入口数据或按端口名称组织的输入映射。
-            context: 当前调用的执行或插件上下文。
-
-        Returns:
-            测试节点或替代执行器产生的返回值。
-        """
+        """把 value 输入原样输出到 value 端口。"""
 
         del context
         return Output(inputs["value"], "value")
 
 
 class Target(Node):
-    """当前契约测试使用的 Target 替代实现。
+    """使用插件贡献的 example.plugin/any 选择器、原样转发 value 的节点。
 
     Attributes:
-        input_ports: 节点声明的输入端口及其类型。
-        output_ports: 节点声明的输出端口及其类型。
-        input_policy: 仅依据端口和 token 数量生效的输入策略。
+        input_ports: 唯一的 str 类型输入端口 value。
+        output_ports: 唯一的 str 类型输出端口 value。
+        input_policy: 引用插件贡献的选择器，Graph 冻结时该名称必须已注册。
     """
 
     input_ports = Ports(value=str)
@@ -684,15 +562,7 @@ class Target(Node):
     input_policy = PolicyRef("example.plugin/any")
 
     def execute(self, inputs, context):
-        """执行当前测试场景的节点行为，供外层契约断言检查。
-
-        Args:
-            inputs: 入口数据或按端口名称组织的输入映射。
-            context: 当前调用的执行或插件上下文。
-
-        Returns:
-            测试节点或替代执行器产生的返回值。
-        """
+        """把 value 输入转发到 value 端口；大写转换（如有）由贡献的 exit Hook 完成。"""
 
         del context
         return Output(inputs["value"], "value")
@@ -734,7 +604,7 @@ def test_default_runtime_is_composed_by_the_builtin_plugin() -> None:
 
     with Runtime() as runtime:
         assert runtime.plugin_host is not None
-        assert runtime.plugin_host.descriptors == (LocalRuntimePlugin.descriptor,)
+        assert runtime.plugin_host.descriptors == (LocalRuntimePlugin().descriptor,)
 
 
 @pytest.mark.parametrize("scoped", [False, True])
@@ -766,13 +636,10 @@ def test_host_releases_contributed_hooks_from_injected_executor(
         """在启动期间触发延迟 Hook 绑定的测试插件。"""
 
         def start(self, context) -> None:
-            """注册 Graph 以触发延迟 Hook，然后按用例决定是否失败。
-
-            Args:
-                context: 宿主提供的能力注册上下文。
+            """经 Graph Worker 注册 work，触发延迟 Hook 绑定。
 
             Raises:
-                RuntimeError: 当前用例要求模拟启动失败。
+                RuntimeError: fail_start 为真时在注册之后抛出。
             """
 
             worker = context.require(CAP_GRAPH_WORKER)
@@ -805,7 +672,7 @@ def test_standard_contributions_require_runtime_roles() -> None:
     plugin = ContributionPlugin(
         "example/observer", observers={"example/trace": lambda event: None}
     )
-    with pytest.raises(LookupError, match="graph-worker.*unavailable"):
+    with pytest.raises(LookupError, match=r"event-router.*unavailable"):
         PluginHost((plugin,)).start()
 
 
@@ -819,23 +686,16 @@ def test_host_releases_selectors_from_shared_policy_registry() -> None:
         """通过闭包提供每轮独立角色和共享 selector 注册表。"""
 
         def setup(self, context) -> None:
-            """提供本轮角色，selector 由宿主随后统一安装。
-
-            Args:
-                context: 宿主提供的 capability 注册上下文。
-            """
+            """提供本轮角色，selector 由宿主随后统一安装。"""
 
             context.provide(CAP_EVENT_ROUTER, router)
             context.provide(CAP_GRAPH_WORKER, worker)
 
         def start(self, context) -> None:
-            """冻结依赖贡献的 Graph，并按用例要求模拟启动失败。
-
-            Args:
-                context: 宿主提供的 capability 注册上下文。
+            """注册依赖贡献选择器的 Graph，使其在本轮冻结。
 
             Raises:
-                RuntimeError: 当前轮次要求模拟启动失败。
+                RuntimeError: fail_start 为真时在注册之后抛出。
             """
 
             del context
@@ -844,11 +704,7 @@ def test_host_releases_selectors_from_shared_policy_registry() -> None:
                 raise RuntimeError("selector consumer failed")
 
         def stop(self, context) -> None:
-            """关闭本轮创建的角色，保留调用方共享资源。
-
-            Args:
-                context: 宿主提供的 capability 注册上下文。
-            """
+            """关闭本轮创建的角色，保留调用方共享的任务后端与注册表。"""
 
             del context
             worker.close()
@@ -910,11 +766,7 @@ def test_contribution_installation_failure_removes_observer_registrations() -> N
         """向宿主提供调用方创建的两个角色。"""
 
         def setup(self, context) -> None:
-            """提供使用独立观察中心的角色。
-
-            Args:
-                context: 宿主提供的能力注册上下文。
-            """
+            """提供调用方创建、各自挂接独立观察中心的路由与执行角色。"""
 
             context.provide(CAP_EVENT_ROUTER, router)
             context.provide(CAP_GRAPH_WORKER, worker)
@@ -956,9 +808,17 @@ def test_custom_infrastructure_uses_the_same_local_plugin_path() -> None:
             runtime.plugin_host.require("interlace.runtime/graph-executor") is executor
         )
 
-    # 注入资源仍由调用方持有，与旧的角色构造器所有权约定一致。
-    assert not events._closed
-    assert not tasks._closed
+    # 注入资源仍由调用方持有：Runtime 关闭后仍可订阅、发布、绑定与提交。
+    received: list[str] = []
+    events.subscribe("still.open", lambda event: received.append(event.type))
+    events.publish(Event("still.open"))
+    assert received == ["still.open"]
+    unbind = tasks.bind(
+        "still.open", lambda delivery: DeliveryResult.ack(), concurrency=1
+    )
+    tasks.submit("still.open", Work("graph"))
+    tasks.wait_idle(1)
+    unbind()
     events.close()
     tasks.close()
     executor.close()
@@ -971,8 +831,10 @@ def test_runtime_fills_defaults_around_custom_event_bus_capability() -> None:
     bus = memory.EventBus()
 
     class EventBusPlugin(RecordingPlugin):
+        """用调用方创建的内存事件总线替换默认事件总线的插件。"""
+
         def __init__(self) -> None:
-            """初始化实例及其依赖，建立当前对象独立维护的状态。"""
+            """以 example/events 标识声明提供 CAP_EVENT_BUS 并共享外层记录列表。"""
 
             super().__init__(
                 "example/events",
@@ -981,21 +843,13 @@ def test_runtime_fills_defaults_around_custom_event_bus_capability() -> None:
             )
 
         def setup(self, context) -> None:
-            """在插件装配阶段登记声明的能力或贡献。
-
-            Args:
-                context: 当前调用的执行或插件上下文。
-            """
+            """记录 setup 并提供调用方创建的事件总线。"""
 
             self.events.append(f"setup:{self.descriptor.id}")
             context.provide(CAP_EVENT_BUS, bus)
 
         def stop(self, context) -> None:
-            """停止插件并释放其拥有的资源。
-
-            Args:
-                context: 当前调用的执行或插件上下文。
-            """
+            """记录 stop 并关闭提供的事件总线。"""
 
             super().stop(context)
             bus.close()
@@ -1019,15 +873,15 @@ def test_runtime_fills_defaults_around_each_infrastructure_capability(
     """验证独立替换各底层能力时仍能补齐默认装配。
 
     Args:
-        capability: 需要提供、取得或移除的能力名称。
-        component: 当前用例使用的 component 夹具或参数化输入。
+        capability: 被替换的底层能力名称。
+        component: 替换该能力的组件实例，插件停止时将其关闭。
     """
 
     class InfrastructurePlugin:
-        """当前契约测试使用的 InfrastructurePlugin 替代实现。
+        """只提供被替换能力的插件，其余能力交由默认插件补齐。
 
         Attributes:
-            descriptor: 插件身份、依赖和能力声明。
+            descriptor: 以能力名末段命名、声明提供该能力的插件描述。
         """
 
         descriptor = PluginDescriptor(
@@ -1037,29 +891,17 @@ def test_runtime_fills_defaults_around_each_infrastructure_capability(
         )
 
         def setup(self, context) -> None:
-            """在插件装配阶段登记声明的能力或贡献。
-
-            Args:
-                context: 当前调用的执行或插件上下文。
-            """
+            """提供参数化的替换组件。"""
 
             context.provide(capability, component)
 
         def start(self, context) -> None:
-            """启动已经装配的组件或提交一次新的执行。
-
-            Args:
-                context: 当前调用的执行或插件上下文。
-            """
+            """无启动动作。"""
 
             del context
 
         def stop(self, context) -> None:
-            """停止插件并释放其拥有的资源。
-
-            Args:
-                context: 当前调用的执行或插件上下文。
-            """
+            """关闭替换组件。"""
 
             del context
             component.close()
@@ -1067,3 +909,205 @@ def test_runtime_fills_defaults_around_each_infrastructure_capability(
     with Runtime(plugins=(InfrastructurePlugin(),)) as runtime:
         assert runtime.plugin_host is not None
         assert runtime.plugin_host.require(capability) is component
+
+
+class FailingStop(RecordingPlugin):
+    """stop 时抛出带插件标识消息的 RuntimeError。"""
+
+    def stop(self, context) -> None:
+        """记录 stop 后总是抛出 RuntimeError。"""
+
+        super().stop(context)
+        raise RuntimeError(f"stop {self.descriptor.id} failed")
+
+
+def _logged_errors(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """返回宿主日志中携带异常的消息文本。"""
+
+    return [
+        str(record.exc_info[1])
+        for record in caplog.records
+        if record.name == "interlace.plugins.host" and record.exc_info
+    ]
+
+
+def test_start_rollback_logs_cleanup_failures_and_raises_original(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """启动失败回滚时逆序停止全部插件，清理失败写入日志，重新抛出原始启动失败。"""
+
+    events: list[str] = []
+
+    class FailingStart(RecordingPlugin):
+        """start 时失败的插件。"""
+
+        def start(self, context) -> None:
+            """记录 start 后总是抛出 RuntimeError。"""
+
+            super().start(context)
+            raise RuntimeError("start failed")
+
+    host = PluginHost(
+        (
+            FailingStop("example/a", events),
+            FailingStop("example/b", events),
+            FailingStart("example/c", events),
+        )
+    )
+    with (
+        caplog.at_level(logging.ERROR, logger="interlace.plugins.host"),
+        pytest.raises(RuntimeError, match="start failed"),
+    ):
+        host.start()
+
+    assert events[-3:] == ["stop:example/c", "stop:example/b", "stop:example/a"]
+    assert sorted(_logged_errors(caplog)) == [
+        "stop example/a failed",
+        "stop example/b failed",
+    ]
+
+
+def test_close_raises_first_cleanup_failure_and_logs_the_rest(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """关闭时单个插件失败不跳过后续插件，抛出首个失败并记录其余失败。"""
+
+    events: list[str] = []
+    host = PluginHost(
+        (FailingStop("example/a", events), FailingStop("example/b", events))
+    ).start()
+    with (
+        caplog.at_level(logging.ERROR, logger="interlace.plugins.host"),
+        pytest.raises(RuntimeError, match="stop example/b failed"),
+    ):
+        host.close()
+
+    assert events[-2:] == ["stop:example/b", "stop:example/a"]
+    assert _logged_errors(caplog) == ["stop example/a failed"]
+    host.close()
+
+
+def test_registration_handle_detach_follows_host_phase() -> None:
+    """注册句柄在 setup 与关闭阶段可撤销，宿主运行期间撤销失败且注册保持不变。"""
+
+    handles: list = []
+    stopped: list[str] = []
+
+    class Registering(RecordingPlugin):
+        """setup 中撤销后重新提供，stop 中撤销最终注册。"""
+
+        def setup(self, context) -> None:
+            """先提供再重复撤销首个注册，然后提供最终值并保存其句柄。"""
+
+            first = context.provide("example/value", "first")
+            first.detach()
+            first.detach()
+            handles.append(context.provide("example/value", "final"))
+
+        def stop(self, context) -> None:
+            """在关闭期间撤销最终注册，并记录本插件已停止。"""
+
+            del context
+            handles[0].detach()
+            stopped.append(self.descriptor.id)
+
+    plugin = Registering("example/registering", [], capability="example/value")
+    host = PluginHost((plugin,)).start()
+    assert host.require("example/value") == "final"
+    with pytest.raises(RuntimeError, match="while the host runs"):
+        handles[0].detach()
+    assert host.require("example/value") == "final"
+
+    host.close()
+
+    assert stopped == ["example/registering"]
+    with pytest.raises(LookupError, match="unavailable"):
+        host.require("example/value")
+
+
+@pytest.mark.parametrize(
+    ("contribution", "message"),
+    [
+        (
+            {"selectors": {"example/any": AnySelector()}},
+            "worker must implement PolicyHost",
+        ),
+        (
+            {"hooks": {"example/hook": lambda call: call}},
+            "worker must implement HookHost",
+        ),
+        (
+            {"observers": {"example/trace": lambda event: None}},
+            "router must implement ObservationHost",
+        ),
+    ],
+)
+def test_contribution_installation_checks_the_narrow_role_protocol(
+    contribution: dict, message: str
+) -> None:
+    """每类标准贡献只要求角色实现对应的窄协议，缺失时在启动前失败。
+
+    Args:
+        contribution: 传给 ContributionPlugin 的单类贡献。
+        message: 期望的协议缺失错误。
+    """
+
+    events: list[str] = []
+
+    class Roles(RecordingPlugin):
+        """提供不实现任何角色协议的占位角色。"""
+
+        def setup(self, context) -> None:
+            """以未实现任何角色协议的 object 提供路由与执行角色。"""
+
+            context.provide(CAP_EVENT_ROUTER, object())
+            context.provide(CAP_GRAPH_WORKER, object())
+
+    roles = Roles("example/roles", events)
+    roles.descriptor = PluginDescriptor(
+        "example/roles", "1", provides=(CAP_EVENT_ROUTER, CAP_GRAPH_WORKER)
+    )
+    with pytest.raises(TypeError, match=message):
+        PluginHost((roles, ContributionPlugin("example/c", **contribution))).start()
+    assert events[-1] == "stop:example/roles"
+
+
+def test_observer_contributions_need_only_the_observation_protocol() -> None:
+    """只实现 observe_runtime 的角色即可接收 Observer 贡献，关闭时贡献被注销。"""
+
+    hub = ObservationHub()
+    observed: list[RuntimeEvent] = []
+
+    class ObservingRole:
+        """只实现 ObservationHost 的角色替身。"""
+
+        def observe_runtime(self, observer):
+            """把观察者挂到共享观察中心，并返回其卸载句柄。"""
+
+            return hub.attach(observer)
+
+    class Roles(RecordingPlugin):
+        """提供两个只支持观察的角色。"""
+
+        def setup(self, context) -> None:
+            """以两个 ObservingRole 分别提供路由与执行角色。"""
+
+            context.provide(CAP_EVENT_ROUTER, ObservingRole())
+            context.provide(CAP_GRAPH_WORKER, ObservingRole())
+
+    roles = Roles("example/roles", [])
+    roles.descriptor = PluginDescriptor(
+        "example/roles", "1", provides=(CAP_EVENT_ROUTER, CAP_GRAPH_WORKER)
+    )
+    host = PluginHost(
+        (
+            roles,
+            ContributionPlugin("example/c", observers={"example/o": observed.append}),
+        )
+    ).start()
+    event = RuntimeEvent(RuntimeEventKind.EVENT_PUBLISHED, event_type="example")
+    hub.publish(event)
+    assert observed == [event, event]
+    host.close()
+    hub.publish(event)
+    assert observed == [event, event]

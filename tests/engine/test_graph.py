@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Mapping
 from dataclasses import replace
+from threading import Event as ThreadEvent, Thread
 from typing import Any, cast
 
 import pytest
@@ -26,6 +27,7 @@ from interlace.engine.errors import (
     GraphValidationError,
     InvalidOutputError,
 )
+from interlace.engine.policies import PolicyRegistry
 
 
 class Source(Node):
@@ -109,12 +111,7 @@ def test_graph_rejects_all_node_without_every_required_incoming_port() -> None:
         output_ports = Ports()
 
         def execute(self, inputs, context: Context) -> None:
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-            """
+            """汇聚节点，仅用于结构校验，不产生输出。"""
 
             del inputs, context
 
@@ -124,7 +121,7 @@ def test_graph_rejects_all_node_without_every_required_incoming_port() -> None:
         edges=[Edge("source", "join", "value", "left")],
     )
 
-    with pytest.raises(GraphValidationError, match="join.*right"):
+    with pytest.raises(GraphValidationError, match=r"join.*right"):
         graph.freeze()
 
 
@@ -143,7 +140,7 @@ def test_graph_keyword_add_is_atomic() -> None:
 
     graph = Graph(entrypoint="source")
 
-    with pytest.raises(TypeError, match="sink.*Node"):
+    with pytest.raises(TypeError, match=r"sink.*Node"):
         graph.add(source=Source(), sink=cast(Any, object()))
 
     assert graph.nodes == {}
@@ -312,9 +309,8 @@ def test_graph_compose_defers_structure_validation_to_registration(
         edges=edges,
     )
     assert not graph.frozen
-    with Runtime() as runtime:
-        with pytest.raises(GraphValidationError, match=message):
-            runtime.register("invalid", graph)
+    with Runtime() as runtime, pytest.raises(GraphValidationError, match=message):
+        runtime.register("invalid", graph)
     assert not graph.frozen
 
 
@@ -333,15 +329,7 @@ def test_graph_accepts_cycle() -> None:
         output_ports = Ports(value=str)
 
         def execute(self, inputs, context: Context) -> Output:
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-
-            Returns:
-                测试节点或替代执行器产生的返回值。
-            """
+            """把 value 输入原样转发。"""
 
             del context
             return Output(inputs["value"], port="value")
@@ -520,7 +508,7 @@ def test_graph_rejects_invalid_node_timeout(timeout: object) -> None:
     source.timeout = timeout  # type: ignore[assignment]
     graph = Graph(entrypoint="source").add(source=source)
 
-    with pytest.raises(GraphValidationError, match="source.*timeout"):
+    with pytest.raises(GraphValidationError, match=r"source.*timeout"):
         graph.freeze()
 
 
@@ -574,30 +562,29 @@ def test_execution_plan_constructor_derives_immutable_selection() -> None:
 
 
 @pytest.mark.parametrize("selected", [set(), {"missing"}, {"source", "missing"}])
-def test_execution_plan_replacement_revalidates_selection(selected) -> None:
-    """替换节点集合时重新拒绝空计划和未知节点。
+def test_execution_plan_constructor_revalidates_selection(selected) -> None:
+    """构造新计划时重新拒绝空计划和未知节点。
 
     Args:
         selected: 无法形成合法执行计划的节点集合。
     """
 
-    graph = Graph(entrypoint="source").add(source=Source())
-    plan = graph.plan(include={"source"})
+    graph = Graph(entrypoint="source").add(source=Source()).freeze()
 
     with pytest.raises(GraphValidationError):
-        replace(plan, nodes=selected)
+        ExecutionPlan(graph, selected)
 
 
-def test_execution_plan_replacement_rebuilds_edges_before_execution() -> None:
-    """替换为合法子集时重新派生边，不沿用原计划的下游缓存。"""
+def test_execution_plan_for_subset_rebuilds_edges_before_execution() -> None:
+    """为合法子集构造新计划时重新派生边，不沿用原计划的下游索引。"""
 
     graph = (
         Graph(entrypoint="source")
         .add(source=Source(), sink=Sink())
         .connect("source", "sink", source_port="value", target_port="value")
     )
-    plan = graph.plan(include={"source", "sink"})
-    reduced = replace(plan, nodes=frozenset({"source"}), edges=None)
+    graph.plan(include={"source", "sink"})
+    reduced = ExecutionPlan(graph, {"source"})
 
     assert reduced.edges == ()
     assert reduced.outgoing_for("source", "value") == ()
@@ -607,21 +594,46 @@ def test_execution_plan_replacement_rebuilds_edges_before_execution() -> None:
 
 
 @pytest.mark.parametrize(
-    ("name", "value"),
-    [("outputs", ()), ("cut_outputs", ()), ("_outgoing", {})],
+    "name",
+    ["graph", "nodes", "entrypoint", "edges", "outputs", "cut_outputs", "_outgoing"],
 )
-def test_execution_plan_rejects_replacement_of_derived_fields(name, value) -> None:
-    """派生字段不能独立替换并偏离节点选择。
+def test_execution_plan_fields_are_read_only(name) -> None:
+    """计划的请求结果与派生字段都不能被改写或通过 dataclasses.replace 替换。
 
     Args:
-        name: 不允许调用方独立指定的派生字段。
-        value: 尝试写入的与原计划不一致的字段值。
+        name: 尝试改写的字段名。
     """
 
     plan = Graph(entrypoint="source").add(source=Source()).plan(include={"source"})
 
-    with pytest.raises((TypeError, ValueError), match="init=False"):
-        replace(plan, **{name: value})
+    if not name.startswith("_"):
+        with pytest.raises(AttributeError):
+            setattr(plan, name, ())
+    with pytest.raises(TypeError):
+        replace(plan, **{name: ()})  # type: ignore[type-var]
+
+
+def test_execution_plan_uses_identity_equality() -> None:
+    """相同选择构造的两个计划是独立对象，按身份比较并可哈希。"""
+
+    graph = Graph(entrypoint="source").add(source=Source()).freeze()
+    first = ExecutionPlan(graph, {"source"})
+    second = ExecutionPlan(graph, {"source"})
+
+    assert first != second
+    assert first.describe() == second.describe()
+    assert len({first, second}) == 2
+
+
+def test_plan_rejects_policies_for_frozen_graph() -> None:
+    """已冻结 Graph 保留冻结时的策略绑定，plan 不能静默忽略新的策略注册表。"""
+
+    graph = Graph(entrypoint="source").add(source=Source())
+    graph.plan(include={"source"}, policies=PolicyRegistry())
+
+    with pytest.raises(ValueError, match="already frozen"):
+        graph.plan(include={"source"}, policies=PolicyRegistry())
+    assert graph.plan(include={"source"}).nodes == frozenset({"source"})
 
 
 def test_execution_plan_constructor_requires_frozen_graph() -> None:
@@ -662,15 +674,7 @@ def test_execution_plan_rejects_disconnected_selection() -> None:
         input_policy = InputPolicy.ALL
 
         def execute(self, inputs, context: Context) -> Output:
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-
-            Returns:
-                测试节点或替代执行器产生的返回值。
-            """
+            """把 value 输入原样转发。"""
 
             del context
             return Output(inputs["value"], "value")
@@ -686,11 +690,11 @@ def test_execution_plan_rejects_disconnected_selection() -> None:
 
     with pytest.raises(GraphValidationError, match="unreachable"):
         graph.plan(include={"source", "sink"})
-    plan = graph.plan(include={"source", "relay", "sink"})
+    graph.plan(include={"source", "relay", "sink"})
     with pytest.raises(GraphValidationError, match="unreachable"):
-        replace(plan, nodes=frozenset({"source", "sink"}), edges=None)
+        ExecutionPlan(graph, {"source", "sink"})
     with pytest.raises(GraphValidationError, match="entrypoint"):
-        replace(plan, nodes=frozenset({"relay", "sink"}))
+        ExecutionPlan(graph, {"relay", "sink"})
 
 
 def test_execution_plan_requires_all_join_inputs() -> None:
@@ -708,15 +712,7 @@ def test_execution_plan_requires_all_join_inputs() -> None:
         output_ports = Ports(left=int, right=int)
 
         def execute(self, inputs, context: Context):
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-
-            Returns:
-                测试节点或替代执行器产生的返回值。
-            """
+            """把同一值同时发往 left 与 right 端口。"""
 
             del context
             return (
@@ -736,15 +732,7 @@ def test_execution_plan_requires_all_join_inputs() -> None:
         output_ports = Ports(value=int)
 
         def execute(self, inputs, context: Context) -> Output:
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-
-            Returns:
-                测试节点或替代执行器产生的返回值。
-            """
+            """把 value 输入原样转发。"""
 
             del context
             return Output(inputs["value"], "value")
@@ -763,15 +751,7 @@ def test_execution_plan_requires_all_join_inputs() -> None:
         input_policy = InputPolicy.ALL
 
         def execute(self, inputs, context: Context) -> Output:
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-
-            Returns:
-                测试节点或替代执行器产生的返回值。
-            """
+            """输出 left 与 right 两个输入之和。"""
 
             del context
             return Output(inputs["left"] + inputs["right"], "total")
@@ -787,11 +767,11 @@ def test_execution_plan_requires_all_join_inputs() -> None:
         .connect("left", "join", source_port="value", target_port="left")
         .connect("right", "join", source_port="value", target_port="right")
     )
-    with pytest.raises(GraphValidationError, match="ALL node.*right"):
+    with pytest.raises(GraphValidationError, match=r"ALL node.*right"):
         graph.plan(include={"split", "left", "join"})
-    plan = graph.plan(include={"split", "left", "right", "join"})
-    with pytest.raises(GraphValidationError, match="ALL node.*right"):
-        replace(plan, nodes=frozenset({"split", "left", "join"}), edges=None)
+    graph.plan(include={"split", "left", "right", "join"})
+    with pytest.raises(GraphValidationError, match=r"ALL node.*right"):
+        ExecutionPlan(graph, {"split", "left", "join"})
 
 
 def test_input_policy_any_uses_declaration_order() -> None:
@@ -809,15 +789,7 @@ def test_input_policy_any_uses_declaration_order() -> None:
         input_policy = InputPolicy.ANY
 
         def execute(self, inputs, context):
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-
-            Returns:
-                测试节点或替代执行器产生的返回值。
-            """
+            """输出本次被选中的输入端口名。"""
 
             return Output(next(iter(inputs)))
 
@@ -825,3 +797,54 @@ def test_input_policy_any_uses_declaration_order() -> None:
         runtime.register("select", Graph(entrypoint="node").add(node=Select()))
         outputs = runtime.run("select", {"cancel": 3, "right": 2, "left": 1})
     assert outputs == (Output("left"), Output("right"), Output("cancel"))
+
+
+def test_ports_accept_self_as_port_name() -> None:
+    """Ports 构造器的 self 是仅限位置参数，self 可以作为普通端口名称。"""
+
+    ports = Ports(self=int, other=str)
+
+    assert dict(ports) == {"self": int, "other": str}
+
+
+def test_concurrent_add_cannot_enter_graph_during_freeze() -> None:
+    """冻结校验期间的并发 add 等待冻结完成后失败，未校验节点不会进入冻结图。"""
+
+    entered = ThreadEvent()
+    release = ThreadEvent()
+
+    class SlowSource(Source):
+        """读取输出端口时暂停冻结校验的零输入节点。"""
+
+        @property  # type: ignore[override]
+        def output_ports(self) -> Ports:
+            """通知测试冻结已开始，并等待测试放行。"""
+
+            entered.set()
+            assert release.wait(5)
+            return Ports(value=str)
+
+    graph = Graph(entrypoint="source").add(source=SlowSource())
+    errors: list[BaseException] = []
+
+    def add_late() -> None:
+        """在冻结进行中尝试加入新节点并记录异常。"""
+
+        try:
+            graph.add("late", Source())
+        except BaseException as exc:
+            errors.append(exc)
+
+    freezer = Thread(target=graph.freeze)
+    freezer.start()
+    assert entered.wait(5)
+    adder = Thread(target=add_late)
+    adder.start()
+    adder.join(0.1)
+    release.set()
+    freezer.join(5)
+    adder.join(5)
+
+    assert graph.frozen
+    assert list(graph.nodes) == ["source"]
+    assert len(errors) == 1 and isinstance(errors[0], GraphFrozenError)

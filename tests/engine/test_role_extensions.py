@@ -23,301 +23,154 @@ from interlace.spi import RouterRole, SlotProvider, WorkerRole
 
 
 class RouterWrapper:
-    """当前契约测试使用的 RouterWrapper 替代实现。
+    """不继承 EventRouter、仅靠结构化协议满足 RouterRole 的路由包装器。
 
     Attributes:
-        router: 负责事件发布和工作路由的角色。
-        closed: 测试组件是否已经关闭。
+        router: 被包装的 EventRouter，所有调用都原样转发给它。
+        closed: close() 是否已被调用，供测试断言 Runtime 关闭了包装器。
     """
 
     def __init__(self, router):
-        """初始化实例及其依赖，建立当前对象独立维护的状态。
-
-        Args:
-            router: 事件路由角色，由 Runtime 管理生命周期。
-        """
+        """包装给定路由角色，并将关闭标记初始化为 False。"""
 
         self.router = router
         self.closed = False
 
     @property
     def idle(self):
-        """判断当前组件是否没有尚未完成的工作。
-
-        Returns:
-            没有未完成工作时为 True，否则为 False。
-        """
+        """返回被包装路由角色的 idle 状态。"""
 
         return self.router.idle
 
     def observe(self, *args, **kwargs):
-        """注册只读事件观察者，不建立目标 Graph 路由。
-
-        Args:
-            *args: 调用协议传入的位置参数。
-            **kwargs: 传给目标接口的关键字参数。
-
-        Returns:
-            当前测试回调收集或构造的结果。
-        """
+        """将 observe 调用原样转发给被包装的路由角色并返回其结果。"""
 
         return self.router.observe(*args, **kwargs)
 
     def route(self, *args, **kwargs):
-        """将事件类型连接到目标 Graph 和命名消费通道。
-
-        Args:
-            *args: 调用协议传入的位置参数。
-            **kwargs: 传给目标接口的关键字参数。
-
-        Returns:
-            当前测试回调收集或构造的结果。
-        """
+        """将 route 调用原样转发给被包装的路由角色并返回其结果。"""
 
         return self.router.route(*args, **kwargs)
 
     def emit(self, *args, **kwargs):
-        """通过事件发布能力提交领域事件并返回已接受的事件。
-
-        Args:
-            *args: 调用协议传入的位置参数。
-            **kwargs: 传给目标接口的关键字参数。
-
-        Returns:
-            事件传输已经接受的 Event 实例。
-        """
+        """将 emit 调用原样转发给被包装的路由角色并返回其接受的事件。"""
 
         return self.router.emit(*args, **kwargs)
 
     def publish(self, event):
-        """发布事件并推进对应的投递或观察流程。
-
-        Args:
-            event: 需要发布、观察或处理的事件。
-        """
+        """将事件原样交给被包装路由角色的 publish。"""
 
         self.router.publish(event)
 
     def observe_runtime(self, observer):
-        """注册只读运行时生命周期观察者。
-
-        Args:
-            observer: 接收只读生命周期事件的观察者。
-
-        Returns:
-            当前测试回调收集或构造的结果。
-        """
+        """将运行时观察者转交给被包装的路由角色注册并返回其结果。"""
 
         return self.router.observe_runtime(observer)
 
     def wait_idle(self, timeout=None):
-        """等待已接受的工作完成，并传播已记录的失败。
-
-        Args:
-            timeout: 等待或执行时限，单位秒；None 表示不设置时限。
-        """
+        """以相同 timeout 等待被包装路由角色进入空闲。"""
 
         self.router.wait_idle(timeout)
 
     def close(self):
-        """结束当前组件的生命周期并释放其拥有的资源。"""
+        """标记包装器已关闭，再关闭被包装的路由角色。"""
 
         self.closed = True
         self.router.close()
 
 
 class WorkerWrapper:
-    """当前契约测试使用的 WorkerWrapper 替代实现。
+    """不继承 GraphWorker、仅靠结构化协议满足 WorkerRole 的执行器包装器。
 
     Attributes:
-        worker: 负责消费工作和执行 Graph 的角色。
-        closed: 测试组件是否已经关闭。
+        worker: 被包装的 GraphWorker，所有调用都原样转发给它。
+        closed: close() 是否已被调用，供测试断言 Runtime 关闭了包装器。
     """
 
     def __init__(self, worker):
-        """初始化实例及其依赖，建立当前对象独立维护的状态。
-
-        Args:
-            worker: 任务消费与 Graph 执行角色，由 Runtime 管理生命周期。
-        """
+        """包装给定执行器角色，并将关闭标记初始化为 False。"""
 
         self.worker = worker
         self.closed = False
 
     @property
     def idle(self):
-        """判断当前组件是否没有尚未完成的工作。
-
-        Returns:
-            没有未完成工作时为 True，否则为 False。
-        """
+        """返回被包装执行器角色的 idle 状态。"""
 
         return self.worker.idle
 
     def register(self, *args, **kwargs):
-        """注册具名定义，供后续装配或执行查找。
-
-        Args:
-            *args: 调用协议传入的位置参数。
-            **kwargs: 传给目标接口的关键字参数。
-
-        Returns:
-            当前测试回调收集或构造的结果。
-        """
+        """将 Graph 注册调用原样转发给被包装的执行器角色。"""
 
         return self.worker.register(*args, **kwargs)
 
     def consume(self, *args, **kwargs):
-        """为命名通道注册本地消费者与独立的执行并发限制。
-
-        Args:
-            *args: 调用协议传入的位置参数。
-            **kwargs: 传给目标接口的关键字参数。
-
-        Returns:
-            当前测试回调收集或构造的结果。
-        """
+        """将队列消费者注册原样转发给被包装的执行器角色。"""
 
         return self.worker.consume(*args, **kwargs)
 
     def start(self, *args, **kwargs):
-        """启动已经装配的组件或提交一次新的执行。
-
-        Args:
-            *args: 调用协议传入的位置参数。
-            **kwargs: 传给目标接口的关键字参数。
-
-        Returns:
-            当前测试回调收集或构造的结果。
-        """
+        """将 start 调用转发给被包装的执行器角色并返回其执行句柄。"""
 
         return self.worker.start(*args, **kwargs)
 
     def iter(self, *args, **kwargs):
-        """启动 Graph 并返回同步终端输出流。
-
-        Args:
-            *args: 调用协议传入的位置参数。
-            **kwargs: 传给目标接口的关键字参数。
-
-        Returns:
-            当前测试回调收集或构造的结果。
-        """
+        """将 iter 调用转发给被包装的执行器角色并返回其同步输出流。"""
 
         return self.worker.iter(*args, **kwargs)
 
     def aiter(self, *args, **kwargs):
-        """启动 Graph 并返回异步终端输出流。
-
-        Args:
-            *args: 调用协议传入的位置参数。
-            **kwargs: 传给目标接口的关键字参数。
-
-        Returns:
-            当前测试回调收集或构造的结果。
-        """
+        """将 aiter 调用转发给被包装的执行器角色并返回其异步输出流。"""
 
         return self.worker.aiter(*args, **kwargs)
 
     def get_execution(self, execution_id):
-        """按执行 ID 取得已保存的执行句柄。
-
-        Args:
-            execution_id: 已登记执行记录的唯一标识。
-
-        Returns:
-            当前测试回调收集或构造的结果。
-        """
+        """从被包装的执行器角色按 ID 查询执行句柄。"""
 
         return self.worker.get_execution(execution_id)
 
     def executions(self):
-        """返回当前保存的执行记录快照。
-
-        Returns:
-            当前保存的 Execution 句柄快照。
-        """
+        """返回被包装执行器角色保存的执行记录快照。"""
 
         return self.worker.executions()
 
     def attach(self, *args, **kwargs):
-        """注册扩展回调并返回可卸载的句柄。
-
-        Args:
-            *args: 调用协议传入的位置参数。
-            **kwargs: 传给目标接口的关键字参数。
-
-        Returns:
-            当前测试回调收集或构造的结果。
-        """
+        """将扩展回调注册转发给被包装的执行器角色并返回其卸载句柄。"""
 
         return self.worker.attach(*args, **kwargs)
 
     def contribute_hook(self, *args, **kwargs):
-        """通过执行器公开扩展能力贡献节点 Hook。
-
-        Args:
-            *args: 调用协议传入的位置参数。
-            **kwargs: 传给目标接口的关键字参数。
-
-        Returns:
-            当前测试回调收集或构造的结果。
-        """
+        """将节点 Hook 贡献转发给被包装的执行器角色并返回其卸载函数。"""
 
         return self.worker.contribute_hook(*args, **kwargs)
 
     def register_policy(self, *args, **kwargs):
-        """注册带命名空间的输入选择策略。
-
-        Args:
-            *args: 调用协议传入的位置参数。
-            **kwargs: 传给目标接口的关键字参数。
-
-        Returns:
-            当前测试回调收集或构造的结果。
-        """
+        """将输入选择策略注册转发给被包装的执行器角色。"""
 
         return self.worker.register_policy(*args, **kwargs)
 
     def observe_runtime(self, observer):
-        """注册只读运行时生命周期观察者。
-
-        Args:
-            observer: 接收只读生命周期事件的观察者。
-
-        Returns:
-            当前测试回调收集或构造的结果。
-        """
+        """将运行时观察者转交给被包装的执行器角色注册并返回其结果。"""
 
         return self.worker.observe_runtime(observer)
 
     def wait_idle(self, timeout=None):
-        """等待已接受的工作完成，并传播已记录的失败。
-
-        Args:
-            timeout: 等待或执行时限，单位秒；None 表示不设置时限。
-        """
+        """以相同 timeout 等待被包装执行器角色进入空闲。"""
 
         self.worker.wait_idle(timeout)
 
     def close(self):
-        """结束当前组件的生命周期并释放其拥有的资源。"""
+        """标记包装器已关闭，再关闭被包装的执行器角色。"""
 
         self.closed = True
         self.worker.close()
 
 
 class Echo(Node):
+    """将 default 端口输入原样作为输出返回的测试节点。"""
+
     def execute(self, inputs, context):
-        """执行当前测试场景的节点行为，供外层契约断言检查。
-
-        Args:
-            inputs: 入口数据或按端口名称组织的输入映射。
-            context: 当前调用的执行或插件上下文。
-
-        Returns:
-            测试节点或替代执行器产生的返回值。
-        """
+        """把 default 端口收到的值包装为 Output 返回。"""
 
         return Output(inputs["default"])
 
@@ -327,11 +180,11 @@ class Echo(Node):
 def test_roles_can_be_independently_decorated_and_composed_without_inheritance(
     wrapped, plugin
 ):
-    """验证角色无需继承默认类即可独立包装和组合。
+    """验证包装 router、worker 或两者后，经直接注入或插件装配均可运行并被 Runtime 关闭。
 
     Args:
-        wrapped: 当前用例使用的 wrapped 夹具或参数化输入。
-        plugin: 当前插件实例或其声明身份。
+        wrapped: 替换为包装器的角色，取值 router、worker 或 both。
+        plugin: 为 True 时通过插件提供角色，否则直接传给 Runtime 构造函数。
     """
 
     tasks = memory.TaskBackend()
@@ -345,10 +198,10 @@ def test_roles_can_be_independently_decorated_and_composed_without_inheritance(
     assert isinstance(selected_worker, WorkerRole)
 
     class Roles:
-        """当前契约测试使用的 Roles 替代实现。
+        """通过插件 capability 提供本用例所选路由与执行器角色的插件。
 
         Attributes:
-            descriptor: 插件身份、依赖和能力声明。
+            descriptor: 声明提供 CAP_EVENT_ROUTER 与 CAP_GRAPH_WORKER 的插件描述。
         """
 
         descriptor = PluginDescriptor(
@@ -356,30 +209,18 @@ def test_roles_can_be_independently_decorated_and_composed_without_inheritance(
         )
 
         def setup(self, context):
-            """在插件装配阶段登记声明的能力或贡献。
-
-            Args:
-                context: 当前调用的执行或插件上下文。
-            """
+            """将所选的路由与执行器角色登记为对应 capability。"""
 
             context.provide(CAP_EVENT_ROUTER, selected_router)
             context.provide(CAP_GRAPH_WORKER, selected_worker)
 
         def start(self, context):
-            """启动已经装配的组件或提交一次新的执行。
-
-            Args:
-                context: 当前调用的执行或插件上下文。
-            """
+            """启动阶段无需额外操作。"""
 
             pass
 
         def stop(self, context):
-            """停止插件并释放其拥有的资源。
-
-            Args:
-                context: 当前调用的执行或插件上下文。
-            """
+            """先关闭所选执行器角色，再关闭所选路由角色。"""
 
             selected_worker.close()
             selected_router.close()
@@ -468,21 +309,13 @@ def test_role_plugins_install_contributions_before_start() -> None:
             context.provide(CAP_GRAPH_WORKER, worker)
 
         def start(self, context):
-            """在启动阶段验证 selector 已经能够冻结 Graph。
-
-            Args:
-                context: 宿主提供的能力注册上下文。
-            """
+            """在启动阶段注册使用插件 selector 的 echo Graph，验证 selector 已可用于冻结。"""
 
             del context
             worker.register("echo", Graph(entrypoint="node").add(node=SelectedEcho()))
 
         def stop(self, context):
-            """关闭当前插件拥有的角色。
-
-            Args:
-                context: 宿主提供的能力注册上下文。
-            """
+            """关闭本插件提供的执行器与路由包装器。"""
 
             del context
             worker.close()
@@ -535,23 +368,18 @@ def test_deferred_hook_can_be_detached_before_graph_registration() -> None:
 
 
 class ResourceLease:
-    """当前契约测试使用的 ResourceLease 替代实现。
+    """引用计数的测试 lease，最后一个引用释放时把 Slot 归还给 ResourcePool。
 
     Attributes:
-        provider: lease 归还资源时使用的测试资源提供者。
-        slot: 测试执行链共享的本地资源槽。
-        references: 测试 lease 尚未归还的引用数量。
-        lock: 保护测试组件共享状态的锁。
-        execution_lock: 测试 lease 保证串行执行所用的锁。
+        provider: 最后一个引用释放时接收归还 Slot 的 ResourcePool。
+        slot: 由该 lease 持有、在跨图执行链间共享的 Slot。
+        references: 尚未释放的引用数量，初始为 1。
+        lock: 保护 references 增减的可重入锁。
+        execution_lock: 让 execution() 对同一 Slot 串行使用的可重入锁。
     """
 
     def __init__(self, provider, slot):
-        """初始化实例及其依赖，建立当前对象独立维护的状态。
-
-        Args:
-            provider: 当前用例使用的 provider 夹具或参数化输入。
-            slot: 当前逻辑执行链使用的本地执行槽。
-        """
+        """以一个初始引用持有来自 provider 的 slot。"""
 
         self.provider = provider
         self.slot = slot
@@ -563,7 +391,7 @@ class ResourceLease:
         """为同一逻辑链新增一个必须由接管方释放的引用。
 
         Raises:
-            RuntimeError: 当前生命周期状态或操作顺序不允许此操作。
+            RuntimeError: 所有引用已经释放后再次调用。
         """
 
         with self.lock:
@@ -572,10 +400,10 @@ class ResourceLease:
             self.references += 1
 
     def release(self):
-        """释放当前持有的 lease 引用，最后一个引用结束时归还 Slot。
+        """释放一个引用，最后一个引用释放时把 Slot 放回 provider。
 
         Raises:
-            RuntimeError: 当前生命周期状态或操作顺序不允许此操作。
+            RuntimeError: 所有引用已经释放后再次调用。
         """
 
         with self.lock:
@@ -603,22 +431,18 @@ class ResourceLease:
 
 
 class ResourcePool:
-    """当前契约测试使用的 ResourcePool 替代实现。
+    """不继承 SlotPool、仅靠结构化协议满足 SlotProvider 的固定容量资源池。
 
     Attributes:
-        size: 测试资源池的固定容量。
-        slots: 消费者申请根执行链资源所用的 SlotProvider。
-        condition: 测试组件用于等待通知的条件变量。
-        listeners: 测试资源提供者登记的可用通知回调。
-        closed: 测试组件是否已经关闭。
+        size: 资源池创建时的 Slot 数量。
+        slots: 当前空闲、可被申请的 Slot 队列。
+        condition: 保护 slots 与 closed 并在 Slot 归还或关闭时唤醒等待者的条件变量。
+        listeners: Slot 归还后依次调用的可用通知回调。
+        closed: close() 是否已被调用；关闭后 try_acquire 会抛出异常。
     """
 
     def __init__(self, size):
-        """初始化实例及其依赖，建立当前对象独立维护的状态。
-
-        Args:
-            size: 资源池容量或本次断言使用的预期字节数。
-        """
+        """创建 size 个空闲 Slot 的资源池。"""
 
         self.size = size
         self.slots = deque(Slot() for _ in range(size))
@@ -641,10 +465,10 @@ class ResourcePool:
         """尝试立即取得 Slot lease，无可用资源时返回 None。
 
         Returns:
-            调用方负责释放的 Slot lease；没有空闲资源时返回 None。
+            包装一个空闲 Slot 的 ResourceLease；没有空闲 Slot 时返回 None。
 
         Raises:
-            RuntimeError: 当前生命周期状态或操作顺序不允许此操作。
+            RuntimeError: 资源池已经关闭。
         """
 
         with self.condition:
@@ -653,16 +477,17 @@ class ResourcePool:
             return ResourceLease(self, self.slots.popleft()) if self.slots else None
 
     def acquire(self, timeout=None):
-        """等待可用的本地 Slot，并返回调用方负责释放的 lease。
+        """等待可用的 Slot，并返回调用方负责释放的 lease。
 
         Args:
-            timeout: 等待或执行时限，单位秒；None 表示不设置时限。
+            timeout: 最长等待秒数；None 表示无限等待。
 
         Returns:
-            调用方负责释放的 Slot lease。
+            包装一个空闲 Slot 的 ResourceLease。
 
         Raises:
-            TimeoutError: 等待未在指定时限内完成。
+            TimeoutError: 在 timeout 内没有 Slot 可用。
+            RuntimeError: 资源池已经关闭。
         """
 
         deadline = None if timeout is None else time.monotonic() + timeout
@@ -689,7 +514,7 @@ class ResourcePool:
         self.listeners.append(listener)
 
         def detach():
-            """解除当前句柄对应的注册关系。"""
+            """从 listeners 中移除该回调，重复调用时不做任何事。"""
 
             if listener in self.listeners:
                 self.listeners.remove(listener)
@@ -697,11 +522,7 @@ class ResourcePool:
         return detach
 
     def put(self, slot):
-        """将使用结束的测试资源放回资源池。
-
-        Args:
-            slot: 当前逻辑执行链使用的本地执行槽。
-        """
+        """把 Slot 放回空闲队列，唤醒等待者并调用所有可用通知回调。"""
 
         with self.condition:
             self.slots.append(slot)
@@ -710,7 +531,7 @@ class ResourcePool:
             listener()
 
     def close(self):
-        """结束当前组件的生命周期并释放其拥有的资源。"""
+        """标记资源池已关闭并唤醒所有等待者。"""
 
         with self.condition:
             self.closed = True
@@ -725,13 +546,10 @@ def test_non_default_slot_provider_and_lease_preserve_cross_graph_resources():
     seen = []
 
     class Source(Node):
-        def execute(self, inputs, context):
-            """执行当前测试场景的节点行为，供外层契约断言检查。
+        """在 Slot 中写入输入值后向 next 事件转发的源节点。"""
 
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-            """
+        def execute(self, inputs, context):
+            """把 default 输入写入 context.slot、记录该 Slot 并发出 next 事件。"""
 
             assert context.slot is not None
             context.slot["value"] = inputs["default"]
@@ -739,16 +557,10 @@ def test_non_default_slot_provider_and_lease_preserve_cross_graph_resources():
             context.emit("next")
 
     class Target(Node):
+        """读取共享 Slot 中源节点写入值的目标节点。"""
+
         def execute(self, inputs, context):
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-
-            Returns:
-                测试节点或替代执行器产生的返回值。
-            """
+            """记录 context.slot 并把源节点写入的 value 作为输出返回。"""
 
             assert context.slot is not None
             seen.append(context.slot)

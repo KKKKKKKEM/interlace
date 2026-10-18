@@ -11,19 +11,19 @@ class ProduceMany(Node):
     """逐项产生终端输出以展示流式交付的示例节点。
 
     Attributes:
-        input_ports: 节点声明的输入端口及其类型。
-        output_ports: 节点声明的输出端口及其类型。
+        input_ports: 输入端口，count 为要产生的输出数量。
+        output_ports: 输出端口，item 未连线，每项都作为终端输出交付。
     """
 
     input_ports = Ports(count=int)
     output_ports = Ports(item=int)
 
     def execute(self, inputs, context):
-        """根据当前输入执行节点行为，并返回声明端口上的输出。
+        """一次返回 count 项 item 输出，供调用方逐项流式消费。
 
         Args:
-            inputs: 入口数据或按端口名称组织的输入映射。
-            context: 当前调用的执行或插件上下文。
+            inputs: 按输入端口名索引的值，count 为输出数量。
+            context: Node 执行上下文；本示例不使用。
 
         Returns:
             item 端口上从 0 到 count - 1 的整数 Output 元组。
@@ -34,10 +34,10 @@ class ProduceMany(Node):
 
 
 def make_graph() -> Graph:
-    """构造示例使用的 Graph 定义。
+    """构造只含 ProduceMany 一个节点的示例 Graph。
 
     Returns:
-        本次操作得到的 Graph 实例。
+        以 produce 为入口、尚未注册的 Graph。
     """
 
     return Graph(entrypoint="produce").add(produce=ProduceMany())

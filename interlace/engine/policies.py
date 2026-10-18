@@ -7,20 +7,29 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from threading import RLock
 from types import MappingProxyType
-from typing import Any, Protocol
+from typing import Any, ClassVar, Protocol
 
-from .core import InputPolicy, require_non_empty_string
+from .._validation import require_non_empty_string
+from .core import InputPolicy
+from .errors import PolicySelectionError
+
+ALL_POLICY = "interlace.core/all"  # InputPolicy.ALL 对应的内建 selector 名称。
+ANY_POLICY = "interlace.core/any"  # InputPolicy.ANY 对应的内建 selector 名称。
+ON_START_POLICY = (
+    "interlace.core/on-start"  # InputPolicy.ON_START 对应的内建 selector 名称。
+)
+
+_BUILTIN_NAMES: Mapping[InputPolicy, str] = MappingProxyType(
+    {
+        InputPolicy.ALL: ALL_POLICY,
+        InputPolicy.ANY: ANY_POLICY,
+        InputPolicy.ON_START: ON_START_POLICY,
+    }
+)  # 固定输入策略到内建 selector 名称的只读映射。
 
 
 def _freeze_config(value: Any) -> Any:
-    """递归复制策略配置，并把内置可变容器转换为只读值。
-
-    Args:
-        value: 待保存到冻结策略引用中的配置值。
-
-    Returns:
-        与调用方状态隔离的只读配置值。
-    """
+    """递归深复制策略配置，并把映射、列表/元组、集合分别转为只读映射、元组、frozenset。"""
 
     if isinstance(value, Mapping):
         return MappingProxyType(
@@ -34,21 +43,26 @@ def _freeze_config(value: Any) -> Any:
 
 
 class InputSelector(Protocol):
+    """具名输入策略的选择实现协议。
+
+    实现只能读取端口名称、各端口可用 token 数量和策略配置，不得读取领域值。
+    """
+
     def select(
         self,
         ports: Sequence[str],
         available: Mapping[str, int],
         config: Mapping[str, Any],
     ) -> tuple[str, ...] | None:
-        """只根据端口和可用数量选择本次各消费一个 token 的端口。
+        """选择本次 firing 各消费一个 token 的端口。
 
         Args:
             ports: 保持声明顺序的输入端口名称。
-            available: 各端口当前可消费的 token 数量。
-            config: 当前具名策略的参数映射。
+            available: 各端口当前可消费的 token 数量，只读。
+            config: 当前具名策略的只读参数映射。
 
         Returns:
-            符合当前可用条件的选择结果，没有可执行输入时不触发。
+            非空、无重复且只含当前非空端口的元组；暂不触发时返回 None。
         """
 
 
@@ -56,19 +70,25 @@ class InputSelector(Protocol):
 class PolicyRef:
     """带命名空间名称和只读参数的输入策略引用。
 
+    按值比较 name 与 config。config 冻结为只读映射，无法稳定哈希，因此 PolicyRef
+    显式不可哈希。
+
     Attributes:
-        name: 当前注册项或具名策略的名称。
-        config: 冻结的策略参数映射。
+        name: 已注册 selector 的命名空间名称。
+        config: 构造时深复制并递归冻结的策略参数映射。
     """
 
     name: str
     config: Mapping[str, Any] = field(default_factory=dict)
 
+    __hash__: ClassVar[None] = None  # type: ignore[assignment]
+
     def __post_init__(self) -> None:
-        """校验构造字段并固定需要保持不变的数据。
+        """校验名称并冻结配置副本。
 
         Raises:
-            TypeError: 参数类型或接口实现不符合当前契约。
+            TypeError: name 不是字符串或 config 不是映射。
+            ValueError: name 为空。
         """
 
         require_non_empty_string(self.name, "policy name")
@@ -79,11 +99,11 @@ class PolicyRef:
 
 @dataclass(frozen=True, slots=True)
 class BoundPolicy:
-    """Graph 冻结时绑定的策略引用与实现快照。
+    """Graph 冻结时绑定的策略引用与 selector 实现快照。
 
     Attributes:
         ref: 策略名称及参数的不可变引用。
-        selector: 冻结时绑定的输入选择实现。
+        selector: 冻结时从注册表取得的选择实现，后续注销不影响该快照。
     """
 
     ref: PolicyRef
@@ -91,30 +111,31 @@ class BoundPolicy:
 
     @property
     def on_start(self) -> bool:
-        """判断已绑定策略是否为启动时触发策略。
+        """判断绑定的是否为内建启动触发策略。
 
         Returns:
-            绑定的是启动触发策略时返回 True。
+            策略名称为 ON_START_POLICY 时返回 True。
         """
 
-        return self.ref.name == "interlace.core/on-start"
+        return self.ref.name == ON_START_POLICY
 
     def select(
         self,
         ports: Sequence[str],
         queues: Mapping[str, Sequence[object]],
     ) -> tuple[str, ...] | None:
-        """仅根据端口名称和可用 token 数量选择本次输入组合。
+        """把各端口队列长度交给 selector，并校验其选择结果。
 
         Args:
             ports: 保持声明顺序的输入端口名称。
-            queues: 各端口已有的输入 token 队列。
+            queues: 各端口已有的输入 token 队列；缺失端口视为空。
 
         Returns:
-            符合当前可用条件的选择结果，没有可执行输入时不触发。
+            本次各消费一个 token 的端口元组；暂不触发时返回 None。
 
         Raises:
-            RuntimeError: 当前生命周期状态或操作顺序不允许此操作。
+            PolicySelectionError: selector 返回非元组、空元组、重复端口、未声明端口或空端口。
+                该异常不填写 graph 与 node，由执行器补齐。
         """
 
         available = MappingProxyType(
@@ -124,17 +145,17 @@ class BoundPolicy:
         if selected is None:
             return None
         if not isinstance(selected, tuple) or not selected:
-            raise RuntimeError(
+            raise PolicySelectionError(
                 f"policy {self.ref.name!r} must return a non-empty tuple or None"
             )
         if len(set(selected)) != len(selected):
-            raise RuntimeError(
+            raise PolicySelectionError(
                 f"policy {self.ref.name!r} selected a port more than once"
             )
         unknown = set(selected) - set(ports)
         empty = tuple(port for port in selected if available.get(port, 0) < 1)
         if unknown or empty:
-            raise RuntimeError(
+            raise PolicySelectionError(
                 f"policy {self.ref.name!r} made an invalid selection; "
                 f"unknown={sorted(unknown)!r}, empty={empty!r}"
             )
@@ -142,22 +163,15 @@ class BoundPolicy:
 
 
 class _AllSelector:
+    """内建 ALL 策略：全部声明端口都有 token 时一次各消费一个。"""
+
     def select(
         self,
         ports: Sequence[str],
         available: Mapping[str, int],
         config: Mapping[str, Any],
     ) -> tuple[str, ...] | None:
-        """所有声明端口都有数据时选择全部端口，否则暂不触发。
-
-        Args:
-            ports: 保持声明顺序的输入端口名称。
-            available: 各端口当前可消费的 token 数量。
-            config: 当前具名策略的参数映射。
-
-        Returns:
-            符合当前可用条件的选择结果，没有可执行输入时不触发。
-        """
+        """全部端口非空时按声明顺序选择全部端口，否则返回 None。"""
 
         del config
         selected = tuple(ports)
@@ -167,41 +181,30 @@ class _AllSelector:
 
 
 class _AnySelector:
+    """内建 ANY 策略：每次只消费声明顺序中第一个非空端口。"""
+
     def select(
         self,
         ports: Sequence[str],
         available: Mapping[str, int],
         config: Mapping[str, Any],
     ) -> tuple[str, ...] | None:
-        """按声明顺序选择第一个非空端口。
-
-        Args:
-            ports: 保持声明顺序的输入端口名称。
-            available: 各端口当前可消费的 token 数量。
-            config: 当前具名策略的参数映射。
-
-        Returns:
-            符合当前可用条件的选择结果，没有可执行输入时不触发。
-        """
+        """返回第一个非空端口组成的单元素元组；全部为空时返回 None。"""
 
         del config
         return next(((port,) for port in ports if available[port]), None)
 
 
 class _OnStartSelector:
+    """内建 ON_START 策略：从不选择 token，由执行器在启动时单次触发节点。"""
+
     def select(
         self,
         ports: Sequence[str],
         available: Mapping[str, int],
         config: Mapping[str, Any],
     ) -> None:
-        """启动策略不选择端口 token，由执行器控制单次启动触发。
-
-        Args:
-            ports: 保持声明顺序的输入端口名称。
-            available: 各端口当前可消费的 token 数量。
-            config: 当前具名策略的参数映射。
-        """
+        """始终返回 None。"""
 
         del ports, available, config
 
@@ -210,17 +213,17 @@ class PolicyRegistry:
     """注册 namespaced selector；Graph freeze 会保存实现快照。
 
     Attributes:
-        _selectors: 带命名空间的输入策略实现映射。
-        _lock: 保护当前组件共享状态的进程内互斥锁。
+        _selectors: 名称到 selector 实现的映射，预置三种内建策略。
+        _lock: 保护 _selectors 的可重入锁。
     """
 
     def __init__(self) -> None:
-        """注册三种内建输入策略并初始化策略注册锁。"""
+        """注册三种内建输入策略并初始化注册锁。"""
 
         self._selectors: dict[str, InputSelector] = {
-            "interlace.core/all": _AllSelector(),
-            "interlace.core/any": _AnySelector(),
-            "interlace.core/on-start": _OnStartSelector(),
+            ALL_POLICY: _AllSelector(),
+            ANY_POLICY: _AnySelector(),
+            ON_START_POLICY: _OnStartSelector(),
         }
         self._lock = RLock()
 
@@ -228,15 +231,15 @@ class PolicyRegistry:
         """注册具名输入选择器，拒绝重复名称和缺失命名空间。
 
         Args:
-            name: 注册或查找使用的名称。
+            name: 含 ``/`` 命名空间分隔的 selector 名称。
             selector: 仅依据端口和 token 数量选择输入的实现。
 
         Returns:
             仅撤销本次注册的幂等函数，不改变 Graph 已绑定的选择器快照。
 
         Raises:
-            TypeError: 参数类型或接口实现不符合当前契约。
-            ValueError: 参数值或字段组合不合法。
+            TypeError: name 不是字符串，或 selector 没有可调用的 select。
+            ValueError: name 为空、不含命名空间或已注册。
         """
 
         name = require_non_empty_string(name, "policy name")
@@ -262,26 +265,21 @@ class PolicyRegistry:
         return detach
 
     def bind(self, policy: InputPolicy | PolicyRef) -> BoundPolicy:
-        """将输入策略引用绑定为包含实现快照的 BoundPolicy。
+        """将输入策略绑定到当前注册的 selector 实现快照。
 
         Args:
             policy: 内建输入策略或具名策略引用。
 
         Returns:
-            本次操作得到的 BoundPolicy 实例。
+            保存策略引用与 selector 实现的 BoundPolicy。
 
         Raises:
-            TypeError: 参数类型或接口实现不符合当前契约。
-            ValueError: 参数值或字段组合不合法。
+            TypeError: policy 既不是 InputPolicy 也不是 PolicyRef。
+            ValueError: 策略名称未注册。
         """
 
         if isinstance(policy, InputPolicy):
-            names = {
-                InputPolicy.ALL: "interlace.core/all",
-                InputPolicy.ANY: "interlace.core/any",
-                InputPolicy.ON_START: "interlace.core/on-start",
-            }
-            ref = PolicyRef(names[policy])
+            ref = PolicyRef(_BUILTIN_NAMES[policy])
         elif isinstance(policy, PolicyRef):
             ref = policy
         else:

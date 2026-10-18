@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import secrets
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Iterable
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -17,31 +17,66 @@ from fastapi.staticfiles import StaticFiles
 from jsonrpcserver import Error, Result, Success, async_dispatch
 from pydantic import ValidationError
 from starlette.concurrency import run_in_threadpool
+from starlette.datastructures import Headers, MutableHeaders
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from interlace.engine.errors import GraphError, InterlaceRuntimeError
+from interlace import Execution
+from interlace.engine.errors import GraphError, RuntimeClosedError
 
+from .diagnostics import redact_text
+from .errors import (
+    ConflictError,
+    InvalidRequestError,
+    NotFoundError,
+    OutputEncodingError,
+    ServiceCapacityError,
+    ServiceClosedError,
+)
 from .models import (
+    DefinitionProjectRequest,
     DraftRequest,
     GraphDefinition,
     NodeDefinition,
-    RunRequest,
     ProjectRequest,
-    DefinitionProjectRequest,
+    RunRequest,
 )
-from .service import GraphService, ServiceCapacityError, encode
-from .store import ConflictError
+from .service import LOOPBACK_HOSTS, GraphService, encode
+
+_LOGGER = logging.getLogger(__name__)
+
+# JSON-RPC 服务端错误码，与 HTTP 接口的状态码一一对应。
+RPC_EXECUTION_FAILED = -32000  # Graph 执行失败，HTTP /api/call 返回 409
+RPC_OUTPUT_ENCODING_FAILED = -32001  # 输出无法编码为 JSON，HTTP 500
+RPC_CAPACITY_EXCEEDED = -32002  # 活跃执行达到上限，HTTP 429
+RPC_UNAVAILABLE = -32003  # 服务或 Runtime 已关闭，HTTP 409
+
+# 已知错误类型到 HTTP 状态码，按顺序匹配；未列出的异常返回 500 且不透出消息。
+_ERROR_STATUS: tuple[tuple[type[Exception], int], ...] = (
+    (NotFoundError, 404),
+    (InvalidRequestError, 422),
+    (ConflictError, 409),
+    (ServiceCapacityError, 429),
+    (ServiceClosedError, 409),
+    (OutputEncodingError, 500),
+    (ValidationError, 422),
+    (GraphError, 422),
+    (RuntimeClosedError, 409),
+)
+
+# 需要令牌与同源检查的路径前缀，相对于挂载点。
+_PROTECTED = ("/api", "/rpc", "/openapi.json", "/docs", "/redoc")
 
 
 def sse(kind: str, value: Any, event_id: int | None = None) -> str:
     """编码一条符合 SSE 行协议的 JSON 消息。
 
     Args:
-        kind: 事件类型。
-        value: 可编码的 JSON 内容。
-        event_id: 可恢复的观测游标，输出流不设置此字段。
+        kind: SSE event 字段。
+        value: 可严格编码为 JSON 的内容。
+        event_id: 可用于 Last-Event-ID 恢复的观测游标；None 不写 id 行。
 
     Returns:
-        包含完整消息分隔符的文本。
+        以空行结尾的完整消息文本。
     """
 
     prefix = "" if event_id is None else f"id: {event_id}\n"
@@ -59,7 +94,7 @@ class RequestBodyLimitMiddleware:
         max_bytes: 单个请求体允许的最大字节数。
     """
 
-    def __init__(self, app: Any, max_bytes: int) -> None:
+    def __init__(self, app: ASGIApp, max_bytes: int) -> None:
         """保存下游应用和请求体上限。
 
         Args:
@@ -70,8 +105,8 @@ class RequestBodyLimitMiddleware:
         self.app = app
         self.max_bytes = max_bytes
 
-    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
-        """累计 HTTP body，并在超过上限时中止解析。
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """先按 Content-Length 拒绝过大请求，再在读取分块时累计检查。
 
         Args:
             scope: 当前 ASGI 连接作用域。
@@ -79,11 +114,10 @@ class RequestBodyLimitMiddleware:
             send: 发送响应消息的异步回调。
         """
 
-        if scope.get("type") != "http":
+        if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
-        headers = dict(scope.get("headers", ()))
-        content_length = headers.get(b"content-length")
+        content_length = Headers(scope=scope).get("content-length")
         if content_length is not None:
             try:
                 too_large = int(content_length) > self.max_bytes
@@ -97,19 +131,12 @@ class RequestBodyLimitMiddleware:
                 return
         received = 0
 
-        async def limited_receive() -> Any:
-            """读取一段请求体并检查累计大小。
-
-            Returns:
-                未超过容量限制的下一条 ASGI 消息。
-
-            Raises:
-                HTTPException: 累计请求体超过配置上限。
-            """
+        async def limited_receive() -> Message:
+            """读取下一条请求消息，累计 body 超过上限时抛出 HTTP 413。"""
 
             nonlocal received
             message = await receive()
-            if message.get("type") == "http.request":
+            if message["type"] == "http.request":
                 received += len(message.get("body", b""))
                 if received > self.max_bytes:
                     raise HTTPException(
@@ -120,402 +147,318 @@ class RequestBodyLimitMiddleware:
         await self.app(scope, limited_receive, send)
 
 
+class AccessMiddleware:
+    """纯 ASGI 访问控制：Host 白名单、Bearer 令牌、浏览器同源写入与安全响应头。
+
+    Host 检查作用于全部 HTTP 与 WebSocket 请求，用于抵御 DNS rebinding；令牌与 Origin
+    检查只作用于 API、RPC 和 OpenAPI 路径，Studio 静态资源无需令牌即可加载。
+
+    Attributes:
+        app: 下游 ASGI 应用。
+        allowed_hosts: 允许的小写主机名，包含 `*` 时不限制。
+        expected: 期望的完整 Authorization 头字节，None 表示不要求令牌。
+    """
+
+    def __init__(
+        self, app: ASGIApp, *, token: str | None, allowed_hosts: frozenset[str]
+    ) -> None:
+        """保存下游应用、令牌与 Host 白名单。
+
+        Args:
+            app: 待保护的 ASGI 应用。
+            token: Bearer 令牌，None 不检查 Authorization。
+            allowed_hosts: 已规范化的主机名集合。
+        """
+
+        self.app = app
+        self.allowed_hosts = allowed_hosts
+        self.expected = None if token is None else f"Bearer {token}".encode()
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """依次检查 Host、令牌和 Origin，通过后为响应补充安全头。
+
+        Args:
+            scope: 当前 ASGI 连接作用域。
+            receive: 读取请求消息的异步回调。
+            send: 发送响应消息的异步回调。
+        """
+
+        if scope["type"] not in ("http", "websocket"):
+            await self.app(scope, receive, send)
+            return
+        headers = Headers(scope=scope)
+        host = headers.get("host", "")
+        if "*" not in self.allowed_hosts and _hostname(host) not in self.allowed_hosts:
+            await _reject(scope, receive, send, 400, "Host 不在服务允许的主机列表中")
+            return
+        path = scope["path"].removeprefix(scope.get("root_path", ""))
+        protected = path.startswith(_PROTECTED)
+        if protected and self.expected is not None:
+            # ASGI 头是原始字节，按字节比较，非 ASCII 凭据得到 401 而不是异常。
+            supplied = headers.get("authorization", "").encode("latin-1")
+            if not secrets.compare_digest(supplied, self.expected):
+                await _reject(scope, receive, send, 401, "需要有效的访问令牌")
+                return
+        origin = headers.get("origin")
+        if protected and origin and urlsplit(origin).netloc != host:
+            await _reject(scope, receive, send, 403, "不允许跨站请求")
+            return
+
+        async def secured_send(message: Message) -> None:
+            """在响应头中加入 nosniff，受保护路径额外禁止缓存。"""
+
+            if message["type"] == "http.response.start":
+                response_headers = MutableHeaders(scope=message)
+                response_headers["X-Content-Type-Options"] = "nosniff"
+                if protected:
+                    response_headers["Cache-Control"] = "no-store"
+            await send(message)
+
+        await self.app(scope, receive, secured_send)
+
+
+def _hostname(host: str) -> str | None:
+    """从 Host 头取出小写主机名，去掉端口与 IPv6 方括号；无法解析时为 None。"""
+
+    try:
+        return urlsplit(f"//{host}").hostname
+    except ValueError:
+        return None
+
+
+async def _reject(
+    scope: Scope, receive: Receive, send: Send, status: int, detail: str
+) -> None:
+    """以 JSON 错误响应拒绝 HTTP 请求，WebSocket 握手以策略违规关闭。"""
+
+    if scope["type"] == "websocket":
+        await send({"type": "websocket.close", "code": 1008})
+        return
+    await JSONResponse({"detail": detail}, status_code=status)(scope, receive, send)
+
+
+def _host_allowlist(allowed_hosts: Iterable[str] | None) -> frozenset[str]:
+    """规范化 Host 白名单；None 只允许本机回环名称。
+
+    Raises:
+        TypeError: allowed_hosts 是单个字符串。
+    """
+
+    if allowed_hosts is None:
+        return LOOPBACK_HOSTS
+    if isinstance(allowed_hosts, str):
+        raise TypeError("allowed_hosts must be an iterable of host names")
+    return frozenset(
+        host.strip().lower().removeprefix("[").removesuffix("]")
+        for host in allowed_hosts
+    )
+
+
 def create_app(
     service: GraphService,
     *,
     token: str | None = None,
     max_request_bytes: int = 1_048_576,
+    allowed_hosts: Iterable[str] | None = None,
 ) -> FastAPI:
-    """创建可独立启动或挂载的官方服务应用。
+    """创建可独立启动或挂载的官方服务应用；应用不拥有服务的生命周期。
 
     Args:
-        service: 协议共同使用的图服务。
-        token: 可选 API 访问令牌，不放入 URL。
-        max_request_bytes: 单个 HTTP 请求体允许的最大字节数。
+        service: 协议共同使用的图服务；ASGI 关闭时不关闭它，由创建服务的调用方负责 `close()`。
+        token: 可选 API 访问令牌，通过 Authorization: Bearer 传递，不放入 URL。
+        max_request_bytes: 单个 HTTP 请求体允许的最大字节数，默认 1 MiB。
+        allowed_hosts: 允许的 Host 头主机名，None 只允许 127.0.0.1、localhost 与 ::1；
+            包含 `*` 时不限制。
 
     Returns:
-        带 OpenAPI、RPC 和 Studio 的 FastAPI 应用。
+        带 OpenAPI、JSON-RPC 和 Studio 的 FastAPI 应用。
+
+    Raises:
+        ValueError: max_request_bytes 不是正整数。
+        TypeError: allowed_hosts 是单个字符串。
     """
 
     if type(max_request_bytes) is not int or max_request_bytes < 1:
         raise ValueError("max_request_bytes must be an integer greater than zero")
+    hosts = _host_allowlist(allowed_hosts)
 
-    @asynccontextmanager
-    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        """在 ASGI 停止时清理服务观察与存储。
-
-        Args:
-            app: 当前服务应用。
-
-        Yields:
-            应用正常提供服务的生命周期区间。
-        """
-
-        del app
-        try:
-            yield
-        finally:
-            service.close()
-
-    app = FastAPI(title="Interlace Graph Service", version="1.0", lifespan=lifespan)
+    app = FastAPI(title="Interlace Graph Service", version="1.0")
     app.add_middleware(RequestBodyLimitMiddleware, max_bytes=max_request_bytes)
+    app.add_middleware(AccessMiddleware, token=token, allowed_hosts=hosts)
+    _add_error_handlers(app)
+    _add_project_routes(app, service)
+    _add_editor_routes(app, service)
+    _add_execution_routes(app, service)
+    _add_stream_routes(app, service)
+    _add_rpc_route(app, service)
+    static = Path(__file__).with_name("static")
+    if static.is_dir():
+        app.mount("/", StaticFiles(directory=static, html=True), name="studio")
+    return app
 
-    @app.middleware("http")
-    async def access(request: Request, call_next: Any) -> Response:
-        """检查 API 令牌及浏览器同源写入。
 
-        Args:
-            request: 当前请求。
-            call_next: 下游应用调用入口。
+def _add_error_handlers(app: FastAPI) -> None:
+    """把已知服务错误映射为稳定状态码，其他异常记录日志后返回通用 500。"""
 
-        Returns:
-            业务响应或明确的访问拒绝。
-        """
-
-        relative_path = request.url.path.removeprefix(
-            request.scope.get("root_path", "")
-        )
-        protected = relative_path.startswith(
-            ("/api", "/rpc", "/openapi.json", "/docs", "/redoc")
-        )
-        if protected and token is not None:
-            supplied = request.headers.get("authorization", "")
-            if not secrets.compare_digest(supplied, f"Bearer {token}"):
-                return JSONResponse({"detail": "需要有效的访问令牌"}, status_code=401)
-        origin = request.headers.get("origin")
-        if (
-            protected
-            and origin
-            and urlsplit(origin).netloc != request.headers.get("host")
-        ):
-            return JSONResponse({"detail": "不允许跨站请求"}, status_code=403)
-        response = await call_next(request)
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        if protected:
-            response.headers["Cache-Control"] = "no-store"
-        return response
-
-    @app.exception_handler(Exception)
-    async def failure(request: Request, exc: Exception) -> JSONResponse:
-        """把服务异常映射为稳定 HTTP 错误。
-
-        Args:
-            request: 发生异常的请求。
-            exc: 服务抛出的异常。
-
-        Returns:
-            带错误详情的 JSON 响应。
-        """
+    async def known_failure(request: Request, exc: Exception) -> Response:
+        """返回已知错误的状态码、消息与类型名。"""
 
         del request
-        status = 500
-        if isinstance(exc, KeyError):
-            status = 404
-        elif isinstance(exc, ConflictError):
-            status = 409
-        elif isinstance(exc, ServiceCapacityError):
-            status = 429
-        elif isinstance(exc, (ValueError, TypeError, ValidationError, GraphError)):
-            status = 422
-        elif isinstance(exc, InterlaceRuntimeError):
-            status = 409
+        status = next(code for kind, code in _ERROR_STATUS if isinstance(exc, kind))
         return JSONResponse(
             {"detail": str(exc), "error_type": type(exc).__name__}, status_code=status
         )
 
-    # 注册具体错误处理器，使普通参数错误不会穿过 ASGI 的服务器异常边界。
-    for error_type in (
-        KeyError,
-        ValueError,
-        TypeError,
-        GraphError,
-        InterlaceRuntimeError,
-        ServiceCapacityError,
-    ):
-        app.add_exception_handler(error_type, failure)
+    async def internal_failure(request: Request, exc: Exception) -> Response:
+        """记录未预期异常，响应中不包含异常消息。"""
 
-    @app.get("/api/graphs")
-    def graphs() -> Any:
-        """读取已注册图。
+        _LOGGER.error(
+            "unhandled graph service error: %s %s",
+            request.method,
+            request.url.path,
+            exc_info=exc,
+        )
+        return JSONResponse({"detail": "服务内部错误"}, status_code=500)
 
-        Returns:
-            代码图与发布图结构集合。
-        """
+    for kind, _ in _ERROR_STATUS:
+        app.add_exception_handler(kind, known_failure)
+    app.add_exception_handler(Exception, internal_failure)
 
-        return service.graphs()
+
+def _add_project_routes(app: FastAPI, service: GraphService) -> None:
+    """注册项目、定义管理与项目运行记录接口。"""
 
     @app.get("/api/projects")
     def projects() -> Any:
-        """读取项目列表与定义统计。
-
-        Returns:
-            持久项目清单。
-        """
+        """读取项目列表与定义统计。"""
 
         return service.projects()
 
     @app.post("/api/projects", status_code=201)
     def create_project(body: ProjectRequest) -> Any:
-        """创建新的管理项目。
+        """创建新的管理项目。"""
 
-        Args:
-            body: 项目名称和描述。
-
-        Returns:
-            新建项目的稳定标识和元数据。
-        """
-
-        return service.store.save_project(body.name, body.description)
+        return service.create_project(body.name, body.description)
 
     @app.post("/api/projects/{project_id}")
     def update_project(project_id: str, body: ProjectRequest) -> Any:
-        """更新项目显示信息。
+        """更新项目名称与描述。"""
 
-        Args:
-            project_id: 目标项目标识。
-            body: 新名称与描述。
-
-        Returns:
-            更新后的项目信息。
-        """
-
-        return service.store.save_project(body.name, body.description, project_id)
+        return service.update_project(project_id, body.name, body.description)
 
     @app.delete("/api/projects/{project_id}")
     def delete_project(project_id: str) -> Any:
-        """删除不含定义的项目。
+        """删除不含定义的非默认项目。"""
 
-        Args:
-            project_id: 目标项目标识。
-
-        Returns:
-            删除结果。
-        """
-
-        service.definitions()
-        service.store.delete_project(project_id)
+        service.delete_project(project_id)
         return {"deleted": True}
 
     @app.get("/api/projects/{project_id}/definitions")
     def project_definitions(project_id: str) -> Any:
-        """读取指定项目内的定义列表。
-
-        Args:
-            project_id: 所属项目。
-
-        Returns:
-            项目元数据与定义摘要列表。
-        """
+        """读取项目元数据与项目内的定义摘要。"""
 
         return {
-            "project": service.store.project(project_id),
+            "project": service.project(project_id),
             "definitions": service.definitions(project_id),
         }
 
-    @app.get("/api/definitions/{name:path}")
-    def definition_detail(name: str, project_id: str | None = None) -> Any:
-        """读取单条定义详情及其运行和版本。
-
-        Args:
-            name: 定义全局标识。
-            project_id: 可选项目范围，不匹配时返回不存在。
-
-        Returns:
-            管理详情。
-        """
-
-        detail = service.definition(name)
-        if project_id is not None and detail["project_id"] != project_id:
-            raise KeyError("该项目下没有此定义")
-        return detail
-
     @app.post("/api/projects/{project_id}/definitions", status_code=201)
     def create_definition(project_id: str, body: GraphDefinition) -> Any:
-        """在项目中创建新的定义草稿，不覆盖已有全局标识。
+        """在项目中创建新的定义草稿，已存在的全局标识返回 409。"""
 
-        Args:
-            project_id: 所属项目标识。
-            body: 新定义的初始文档。
-
-        Returns:
-            创建后的定义详情。
-        """
-
-        with service.store.lock:
-            service.definitions()
-            if body.name in service.store.memberships():
-                raise ConflictError("定义标识已存在，请使用其他标识")
-            service.store.save_draft(body.name, body.model_dump(), 0, project_id)
-        return service.definition(body.name)
+        return service.create_definition(project_id, body)
 
     @app.get("/api/projects/{project_id}/executions")
     def project_executions(project_id: str) -> Any:
-        """读取项目内全部定义的最近运行。
+        """读取项目内全部定义的最近运行，每项带 definition_name。"""
 
-        Args:
-            project_id: 所属项目标识。
+        return service.executions(project_id=project_id)
 
-        Returns:
-            带逻辑定义标识的运行记录。
-        """
+    @app.get("/api/definitions/{name:path}")
+    def definition_detail(name: str, project_id: str | None = None) -> Any:
+        """读取单条定义详情；指定 project_id 且不匹配时返回 404。"""
 
-        allowed = {item["name"] for item in service.definitions(project_id)}
-        names = {
-            f"{item['name']}@v{item['version']}": item["name"]
-            for item in service.store.versions()
-        }
-        return [
-            {**run, "definition_name": names.get(run["graph"], run["graph"])}
-            for run in service.executions(project_id=project_id)
-            if names.get(run["graph"], run["graph"]) in allowed
-        ]
+        return service.definition(name, project_id)
 
     @app.post("/api/definition-project")
     def move_definition(body: DefinitionProjectRequest) -> Any:
-        """整体移动定义的项目归属。
+        """整体移动定义的项目归属。"""
 
-        Args:
-            body: 定义标识和目标项目。
+        return service.move_definition(body.name, body.project_id)
 
-        Returns:
-            更新后的定义详情。
-        """
 
-        service.definition(body.name)
-        service.store.assign_definition(body.name, body.project_id)
-        return service.definition(body.name)
+def _add_editor_routes(app: FastAPI, service: GraphService) -> None:
+    """注册图目录、节点目录、草稿、校验与发布接口。"""
+
+    @app.get("/api/graphs")
+    def graphs() -> Any:
+        """读取 Runtime 中全部注册图的结构。"""
+
+        return service.graphs()
 
     @app.get("/api/nodes")
     def nodes() -> Any:
-        """读取可编辑节点目录。
+        """读取可编辑节点类型及配置表单 Schema。"""
 
-        Returns:
-            节点类型及配置表单 Schema。
-        """
-
-        return service.nodes.describe()
+        return service.node_types()
 
     @app.post("/api/nodes/preview")
     def preview(body: NodeDefinition) -> Any:
-        """构造单节点并读取真实端口，包括依配置变化的端口。
+        """构造单节点并返回真实端口，包括依配置变化的端口。"""
 
-        Args:
-            body: 节点类型与配置。
-
-        Returns:
-            节点输入和输出端口。
-        """
-
-        node = service.nodes.create(body.type, body.config)
-        return {
-            "inputs": {key: value.__name__ for key, value in node.input_ports.items()},
-            "outputs": {
-                key: value.__name__ for key, value in node.output_ports.items()
-            },
-        }
+        return service.preview_node(body)
 
     @app.get("/api/drafts")
     def drafts() -> Any:
-        """读取保存的编辑草稿。
+        """读取全部编辑草稿与修订号。"""
 
-        Returns:
-            草稿文档与修订号。
-        """
-
-        return service.store.drafts()
+        return service.drafts()
 
     @app.post("/api/drafts")
-    def save(body: DraftRequest) -> Any:
-        """允许保存尚未满足冻结约束的编辑草稿。
+    def save_draft(body: DraftRequest) -> Any:
+        """保存可不完整的草稿，返回新修订号。"""
 
-        Args:
-            body: 文档和预期修订号。
-
-        Returns:
-            新草稿修订号。
-        """
-
-        service.definitions()
-        return {
-            "revision": service.store.save_draft(
-                body.definition.name,
-                body.definition.model_dump(),
-                body.revision,
-                body.project_id,
-            )
-        }
+        return {"revision": service.save_draft(body)}
 
     @app.post("/api/validate")
     def validate(body: GraphDefinition) -> Any:
-        """通过核心冻结逻辑校验编辑中的图。
-
-        Args:
-            body: 完整图文档。
-
-        Returns:
-            校验后的真实图结构。
-        """
+        """通过核心冻结逻辑校验图文档并返回真实结构。"""
 
         return service.validate(body)
 
     @app.post("/api/definitions/parse")
     def parse_definition(body: GraphDefinition) -> Any:
-        """校验导入文件的文档格式，允许尚未完成的草稿。
-
-        Args:
-            body: 待导入的图文档。
-
-        Returns:
-            补齐画布默认值后的结构化文档。
-        """
+        """校验导入文件的文档格式并补齐默认值，允许尚未完成的草稿。"""
 
         return body.model_dump()
 
     @app.post("/api/publish")
     def publish(body: DraftRequest) -> Any:
-        """发布一个新的不可变执行版本。
-
-        Args:
-            body: 当前图文档与修订号。
-
-        Returns:
-            发布版本及运行名称。
-        """
+        """发布新的不可变版本，返回注册名、版本号与新修订号。"""
 
         return service.publish(body)
 
+
+def _add_execution_routes(app: FastAPI, service: GraphService) -> None:
+    """注册执行提交、同步调用、查询与取消接口。"""
+
     @app.get("/api/executions")
     def executions() -> Any:
-        """查询当前和历史执行。
-
-        Returns:
-            执行状态快照集合。
-        """
+        """查询当前与历史执行。"""
 
         return service.executions()
 
     @app.post("/api/executions", status_code=202)
     def start(body: RunRequest) -> Any:
-        """提交后台执行并返回标识。
-
-        Args:
-            body: 图注册名与执行输入。
-
-        Returns:
-            已提交 Execution 的状态。
-        """
+        """提交后台执行并返回初始状态。"""
 
         return service.snapshot(service.start(body))
 
     @app.post("/api/call")
     async def call(body: RunRequest) -> Any:
-        """等待执行结束并返回完整 terminal Outputs。
+        """等待执行结束并返回按追加顺序排列的全部 terminal Outputs。
 
-        Args:
-            body: 图注册名与执行参数。
-
-        Returns:
-            执行状态以及按追加顺序排列的输出。
+        执行失败返回 409 与状态快照；输出无法编码为 JSON 返回 500，执行终态不变。
         """
 
         execution = await run_in_threadpool(service.start, body)
@@ -523,77 +466,71 @@ def create_app(
             outputs = await execution
         except Exception as exc:
             return JSONResponse(
-                {**service.snapshot(execution), "detail": str(exc)}, status_code=409
+                {**service.snapshot(execution), "detail": redact_text(str(exc))},
+                status_code=409,
             )
-        return {**service.snapshot(execution), "outputs": encode(outputs)}
+        try:
+            encoded = encode(outputs)
+        except OutputEncodingError as exc:
+            return JSONResponse(
+                {
+                    **service.snapshot(execution),
+                    "detail": str(exc),
+                    "error_type": type(exc).__name__,
+                },
+                status_code=500,
+            )
+        return {**service.snapshot(execution), "outputs": encoded}
 
     @app.get("/api/executions/{execution_id}")
     def execution(execution_id: str) -> Any:
-        """取得一次执行的当前状态。
-
-        Args:
-            execution_id: 执行标识。
-
-        Returns:
-            当前或历史状态快照。
-        """
+        """读取一次执行的当前或历史状态。"""
 
         return service.execution(execution_id)
 
     @app.post("/api/executions/{execution_id}/cancel")
     def cancel(execution_id: str) -> Any:
-        """向当前进程的执行提交协作式取消。
+        """向当前进程中的执行提交协作式取消。"""
 
-        Args:
-            execution_id: 执行标识。
+        return service.cancel(execution_id)
 
-        Returns:
-            取消请求是否被接受。
-        """
 
-        handle = service.runtime.get_execution(execution_id)
-        return {"accepted": handle.cancel(), **service.snapshot(handle)}
+def _add_stream_routes(app: FastAPI, service: GraphService) -> None:
+    """注册执行观测与终端输出的 SSE 订阅接口。"""
 
     @app.get("/api/executions/{execution_id}/events")
     async def events(
         execution_id: str, request: Request, after: int = 0
     ) -> StreamingResponse:
-        """重放并持续订阅执行观测，支持 Last-Event-ID 重连。
+        """重放并持续订阅执行观测，支持 after 参数或 Last-Event-ID 重连。"""
 
-        Args:
-            execution_id: 执行标识。
-            request: 当前 HTTP 请求。
-            after: 已读观测编号，默认从头。
-
-        Returns:
-            带观测游标与终态通知的 SSE 流。
-        """
-
-        service.execution(execution_id)
-        cursor = max(after, int(request.headers.get("last-event-id", "0")))
+        await run_in_threadpool(service.execution, execution_id)
+        try:
+            cursor = max(after, int(request.headers.get("last-event-id", "0")))
+        except ValueError as exc:
+            raise InvalidRequestError("Last-Event-ID 必须是整数") from exc
 
         async def stream() -> AsyncIterator[str]:
-            """按数据库游标逐批交付观测并等待终态。
-
-            Yields:
-                观测消息、心跳或结束消息。
-            """
+            """逐批交付观测；先读终态再读批次，终态后读到空批次才发送 finished。"""
 
             nonlocal cursor
             while not await request.is_disconnected():
-                batch = await run_in_threadpool(
-                    service.store.events, execution_id, cursor
-                )
+                state = await run_in_threadpool(service.execution, execution_id)
+                batch = await run_in_threadpool(service.events, execution_id, cursor)
                 for item in batch:
                     cursor = item["id"]
                     yield sse("observation", item, cursor)
-                state = service.execution(execution_id)
-                if state["done"] and not batch:
-                    yield sse("finished", state)
+                if batch:
+                    continue
+                if state["done"]:
+                    # 终态之前发布的观测都已在上面的空批次之前写入并交付。
+                    yield sse(
+                        "finished",
+                        await run_in_threadpool(service.execution, execution_id),
+                    )
                     return
-                if not batch:
-                    yield ": heartbeat\n\n"
-                    await asyncio.sleep(0.2)
+                yield ": heartbeat\n\n"
+                await asyncio.sleep(0.2)
 
         return StreamingResponse(
             stream(),
@@ -603,93 +540,90 @@ def create_app(
 
     @app.get("/api/executions/{execution_id}/outputs")
     async def outputs(execution_id: str) -> StreamingResponse:
-        """从首项重放并持续交付原生输出流，断开只释放订阅。
+        """从首项重放并持续交付输出流；客户端断开只释放订阅，不取消执行。"""
 
-        Args:
-            execution_id: 当前 Runtime 保留的执行标识。
+        handle = service.live_execution(execution_id)
+        state = await run_in_threadpool(service.execution, execution_id)
 
-        Returns:
-            逐项输出和终态的 SSE 流。
-        """
+        async def replay() -> AsyncIterator[str]:
+            """从历史数据库分批重放已归档输出，并按记录发送终态。"""
 
-        live = {item.id: item for item in service.runtime.executions()}
-        state = service.execution(execution_id)
+            offset = 0
+            while batch := await run_in_threadpool(
+                service.outputs, execution_id, offset
+            ):
+                for item in batch:
+                    yield sse("output", item)
+                offset += len(batch)
+            error = state.get("output_error") or state.get("error")
+            yield sse("failure" if error else "finished", {**state, "detail": error})
 
-        async def stream() -> AsyncIterator[str]:
-            """逐项等待输出，失败保留之前已经交付的项目。
+        async def follow(handle: Execution) -> AsyncIterator[str]:
+            """逐项等待当前执行的输出，失败保留之前已经交付的项目。"""
 
-            Yields:
-                输出消息及成功或失败终态。
-            """
-
-            if execution_id not in live:
-                offset = 0
-                while True:
-                    batch = await run_in_threadpool(
-                        service.store.outputs, execution_id, offset
-                    )
-                    if not batch:
-                        break
-                    for item in batch:
-                        yield sse("output", item)
-                    offset += len(batch)
-                error = state.get("output_error") or state.get("error")
-                yield sse(
-                    "failure" if error else "finished", {**state, "detail": error}
-                )
-                return
-            handle = live[execution_id]
             iterator = handle.__aiter__()
             try:
                 async for output in iterator:
                     yield sse("output", encode(output))
                 yield sse("finished", service.snapshot(handle))
             except Exception as exc:
-                yield sse("failure", {**service.snapshot(handle), "detail": str(exc)})
+                yield sse(
+                    "failure",
+                    {**service.snapshot(handle), "detail": redact_text(str(exc))},
+                )
             finally:
                 await iterator.aclose()
 
         return StreamingResponse(
-            stream(),
+            replay() if handle is None else follow(handle),
             media_type="text/event-stream",
             headers={"X-Accel-Buffering": "no"},
         )
 
+
+def _add_rpc_route(app: FastAPI, service: GraphService) -> None:
+    """注册 JSON-RPC 2.0 入口，提供 graph.call 方法。"""
+
     async def rpc_call(**params: Any) -> Result:
-        """调用图并返回 JSON-RPC 结果。
+        """执行 graph.call：参数与 RunRequest 相同，等待全部终端输出。
 
-        Args:
-            **params: RunRequest 的命名参数。
-
-        Returns:
-            JSON-RPC 成功结果或明确错误。
+        参数错误与未知图返回 -32602；容量、关闭、执行失败与输出编码失败使用模块常量中的
+        专用错误码，其他异常记录日志后返回不含消息的 -32603。
         """
 
         try:
             body = RunRequest.model_validate(params)
             handle = await run_in_threadpool(service.start, body)
-        except (ValueError, TypeError, KeyError) as exc:
+        except (ValidationError, InvalidRequestError, NotFoundError) as exc:
             return Error(-32602, "Invalid params", str(exc))
+        except ServiceCapacityError as exc:
+            return Error(RPC_CAPACITY_EXCEEDED, "Service capacity exceeded", str(exc))
+        except (ServiceClosedError, RuntimeClosedError) as exc:
+            return Error(RPC_UNAVAILABLE, "Service unavailable", str(exc))
+        except Exception:
+            _LOGGER.exception("graph.call failed before execution started")
+            return Error(-32603, "Internal error")
         try:
             values = await handle
-            return Success({**service.snapshot(handle), "outputs": encode(values)})
         except Exception as exc:
             return Error(
-                -32000,
+                RPC_EXECUTION_FAILED,
                 "Graph execution failed",
+                {**service.snapshot(handle), "detail": redact_text(str(exc))},
+            )
+        try:
+            encoded = encode(values)
+        except OutputEncodingError as exc:
+            return Error(
+                RPC_OUTPUT_ENCODING_FAILED,
+                "Output encoding failed",
                 {**service.snapshot(handle), "detail": str(exc)},
             )
+        return Success({**service.snapshot(handle), "outputs": encoded})
 
     @app.post("/rpc")
     async def rpc(request: Request) -> Response:
-        """通过标准 JSON-RPC 分发器处理调用、批量与通知。
-
-        Args:
-            request: 原始 JSON-RPC 2.0 请求。
-
-        Returns:
-            协议响应；通知返回无内容 HTTP 响应。
-        """
+        """通过标准 JSON-RPC 分发器处理调用、批量与通知；通知返回 HTTP 204。"""
 
         response = await async_dispatch(
             await request.body(), methods={"graph.call": rpc_call}
@@ -699,8 +633,3 @@ def create_app(
             media_type="application/json",
             status_code=200 if response else 204,
         )
-
-    static = Path(__file__).with_name("static")
-    if static.is_dir():
-        app.mount("/", StaticFiles(directory=static, html=True), name="studio")
-    return app

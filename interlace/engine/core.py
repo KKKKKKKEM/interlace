@@ -3,57 +3,17 @@
 from __future__ import annotations
 
 import enum
-import math
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, get_origin
 
+from .._validation import require_non_empty_string
+
 if TYPE_CHECKING:
     from .events import Context
     from .policies import PolicyRef
-
-
-def require_non_empty_string(value: object, label: str) -> str:
-    """校验一个值是非空字符串。
-
-    Args:
-        value: 待校验的字符串，不能是空串或全空白。
-        label: 校验失败时用于指明字段的说明名称。
-
-    Returns:
-        通过非空字符串校验的原始值。
-
-    Raises:
-        TypeError: 参数类型或接口实现不符合当前契约。
-        ValueError: 参数值或字段组合不合法。
-    """
-
-    if not isinstance(value, str):
-        raise TypeError(f"{label} must be a string")
-    if not value.strip():
-        raise ValueError(f"{label} must not be empty")
-    return value
-
-
-def _validate_timeout(timeout: float | None) -> None:
-    """校验等待接口使用的超时参数。
-
-    Args:
-        timeout: 等待或执行时限，单位秒；None 表示不设置时限。
-
-    Raises:
-        TypeError: 参数类型或接口实现不符合当前契约。
-        ValueError: 参数值或字段组合不合法。
-    """
-
-    if timeout is None:
-        return
-    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
-        raise TypeError("timeout must be a number or None")
-    if not math.isfinite(timeout) or timeout < 0:
-        raise ValueError("timeout must be a finite non-negative number")
 
 
 class InputPolicy(str, enum.Enum):
@@ -80,11 +40,17 @@ class Ports(Mapping[str, type[Any]]):
 
     __slots__ = ("_types",)
 
-    def __init__(self, **ports: type[Any]) -> None:
-        """创建端口集合。
+    def __init__(self, /, **ports: type[Any]) -> None:
+        """按关键字参数的声明顺序创建端口集合。
+
+        ``self`` 是仅限位置参数，因此 ``self`` 也可以作为端口名称。
 
         Args:
-            **ports: 保持声明顺序的输入端口名称。
+            **ports: 端口名称到普通 Python 类的映射。
+
+        Raises:
+            TypeError: 端口类型不是普通 Python 类。
+            ValueError: 端口名称为空或全空白。
         """
 
         normalized: dict[str, type[Any]] = {}
@@ -101,14 +67,14 @@ class Ports(Mapping[str, type[Any]]):
         """校验端口声明使用普通 Python class。
 
         Args:
-            value: 待校验的端口数据类型，必须是普通 Python 类。
+            value: 待校验的端口数据类型。
             label: 校验失败时用于指明字段的说明名称。
 
         Returns:
-            可作为端口数据类型的普通 Python 类。
+            原样返回通过校验的类。
 
         Raises:
-            TypeError: 参数类型或接口实现不符合当前契约。
+            TypeError: value 是 Any、泛型别名、Protocol 或不是类。
         """
 
         if (
@@ -125,14 +91,17 @@ class Ports(Mapping[str, type[Any]]):
         source_type: type[Any],
         target_type: type[Any],
     ) -> bool:
-        """判断输出类型能否安全传给输入端口。
+        """判断源端口类型能否安全传给目标端口，即源类型是目标类型的子类。
 
         Args:
             source_type: 源端口声明的数据类型。
             target_type: 目标端口要求的数据类型。
 
         Returns:
-            满足当前操作的判断条件时返回 True，否则返回 False。
+            source_type 是 target_type 的子类时返回 True。
+
+        Raises:
+            TypeError: 任一参数不是普通 Python 类。
         """
 
         source_type = Ports.require_type(source_type, "source_type")
@@ -143,29 +112,24 @@ class Ports(Mapping[str, type[Any]]):
         """返回指定端口声明的数据类型。
 
         Args:
-            port: 需要读取或输出的端口名称。
+            port: 端口名称。
 
         Returns:
-            指定端口声明的 Python 数据类型。
+            该端口声明的 Python 类。
+
+        Raises:
+            KeyError: 端口未声明。
         """
 
         return self._types[port]
 
     def __iter__(self) -> Iterator[str]:
-        """按声明顺序遍历端口名称。
-
-        Returns:
-            遍历当前对象内容的独立迭代入口。
-        """
+        """按声明顺序遍历端口名称。"""
 
         return iter(self._types)
 
     def __len__(self) -> int:
-        """返回端口数量。
-
-        Returns:
-            当前容器条目数量。
-        """
+        """返回端口数量。"""
 
         return len(self._types)
 
@@ -175,8 +139,8 @@ class Output:
     """Node 在当前 Graph 内从命名端口产生的一项值。
 
     Attributes:
-        value: 当前记录携带的数据值。
-        port: Output 在当前 Graph 内发送到的输出端口。
+        value: 输出携带的数据值，执行器按端口声明校验类型。
+        port: 发出该值的输出端口名称，默认 ``default``。
     """
 
     value: Any
@@ -215,8 +179,8 @@ class Node(ABC):
         """执行一次节点行为，直接返回结果或返回可等待的结果。
 
         Args:
-            inputs: 入口数据或按端口名称组织的输入映射。
-            context: 当前调用的执行或插件上下文。
+            inputs: 本次 firing 按输入端口名称选中的只读值映射。
+            context: Graph 的 Context 工厂为本次 firing 返回的上下文。
 
         Returns:
             Output、惰性 Iterable[Output]、None，或得到这些结果的 Awaitable。

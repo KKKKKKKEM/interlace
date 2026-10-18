@@ -9,7 +9,7 @@
 
 `Runtime.start/run/arun/iter/aiter` 接受 `options`，节点从 `context.options` 读取。
 例如 `runtime.run("parse.graph", data, options={"parser.strict": True})`。
-同样可以使用 `Context(emit, options={"parser.strict": True})` 手动调用节点。
+手动调用节点时，可用内部的 `interlace.engine.events.bind_context(emit, None, options={"parser.strict": True})` 创建基础上下文。
 
 配置在提交前深复制，顶层映射只读；每次节点调用再次复制嵌套值，所以节点修改嵌套值不会影响其他节点或后续执行。
 键应使用领域命名空间；值必须可深复制，HTTP Client 等资源仍通过 Slot 或构造器注入。
@@ -86,8 +86,8 @@ class AirContext(Context):
 `seed` 输入端口。工厂也可以根据实际输入分支，选择不同的领域类型。核心不解释 seed、request 或其他领域字段。
 
 组合保留同一基础 Context 的 `emit`、`slot`、取消检查、节点命名空间状态、配置和静止回调；不复制内部绑定，
-也不重新计算配置快照。`parent` 与 emitter、Slot、配置等底层绑定参数互斥。领域对象的字段由工厂自行初始化，
-基类继承仅复用执行能力的转发接口。调用方仍可用 `Context(emit, ...)` 创建独立的基础上下文。
+也不重新计算配置快照。公开构造器只接受 `parent`；基础上下文由执行器通过 `bind_context` 绑定。领域对象的字段由
+工厂自行初始化，基类继承仅复用执行能力的转发接口。
 
 工厂是可重入的同步创建逻辑，不缓存或跨调用复用 Context。传入的端口映射顶层只读，内部数据沿用原输入所有权，
 不会深复制。工厂看到的是 **Hook enter 转换前** 的输入；后续 Hook 替换输入不会自动重写已经初始化的领域字段。
@@ -130,10 +130,12 @@ for output in execution:
 all_outputs = execution.result()
 ```
 
-Execution 保留完整 terminal Output，因此迭代可以重放，`result()` 仍返回完整 tuple。活跃迭代器存在时，生产者与每个
-消费者之间最多保留 `output_buffer` 个未读 Output；没有流消费者时不会为了背压阻塞 `result()`。若 Graph 在发布部分
-Output 后失败，已发布 Output 不撤回，迭代器在读完它们后抛出执行异常。停止迭代不会隐式取消 Graph，需要调用
-`execution.cancel()` 显式取消。
+Execution 保留完整 terminal Output，因此迭代可以重放：每个 `iter(execution)` / `aiter(execution)` 订阅都从第一项
+Output 开始读取，再等待后续输出；`result()` 仍返回完整 tuple。活跃订阅都参与背压：生产者与每个消费者之间最多保留
+`output_buffer` 个未读 Output，任一订阅读得慢都会让发布方等待；没有流消费者时不会为了背压阻塞 `result()`。
+背压等待发生在产生该输出的 Node firing 内，因此计入该 Node 的 `timeout` 与 Graph 总时限。若 Graph 在发布部分
+Output 后失败，已发布 Output 不撤回，迭代器在读完它们后抛出执行异常。停止迭代或回收迭代器只解除该订阅的背压，
+不会隐式取消 Graph，需要调用 `execution.cancel()` 显式取消。
 
 默认 Engine 不会提前耗尽 Node 返回的 Iterable。背压计数限制已提交的未读输出，执行器最多再持有正在交付的一项；
 取消和超时会中止后续推进并关闭输出迭代器。Node Hook 的出口转换逐项执行，同步 Node 的迭代由执行线程推进，
@@ -142,6 +144,47 @@ Output 后失败，已发布 Output 不撤回，迭代器在读完它们后抛�
 保留完整输出是逻辑契约，存放位置可以替换。默认 OutputStore 使用内存，也可以由 ExecutionFactory 为每次执行
 创建磁盘或其他追加式存储。`wait()`、执行结束和流消费结束不会自动读取全量输出；`result()`、`await execution`
 或成功后的 `outputs` 属性会按需读取完整 tuple，因此这些调用仍需要容纳全量结果的内存。
+
+下面的存储把每项 Output 序列化追加到临时文件，内存中只保留每项 8 字节的偏移；索引稳定、可重放，因此仍满足
+OutputStore 契约。Execution 在自身锁内调用存储，实现无需另加锁；Output 的值必须可被 pickle。
+
+```python
+import pickle
+import tempfile
+from array import array
+
+from interlace import Execution, Output, Runtime
+from interlace.runtime import LocalRuntimePlugin
+
+
+class SpillingOutputStore:
+    """把 Output 追加到临时文件，内存只保留各项的文件偏移。"""
+
+    def __init__(self) -> None:
+        self._file = tempfile.TemporaryFile()
+        self._offsets = array("q")  # 第 i 项 Output 在文件中的起始偏移。
+
+    def __len__(self) -> int:
+        return len(self._offsets)
+
+    def __getitem__(self, index: int) -> Output:
+        self._file.seek(self._offsets[index])
+        return pickle.load(self._file)
+
+    def append(self, output: Output) -> None:
+        offset = self._file.seek(0, 2)
+        pickle.dump(output, self._file)
+        self._offsets.append(offset)  # 写入成功后才登记，失败即视为未接受。
+
+
+def spilling_execution(graph: str, **kwargs) -> Execution:
+    return Execution(graph, output_store=SpillingOutputStore(), **kwargs)
+
+
+runtime = Runtime(plugins=(LocalRuntimePlugin(execution_factory=spilling_execution),))
+```
+
+流式消费这类执行时，内存只随未读背压窗口与偏移数组增长；调用 `result()` 仍会把全部 Output 读回内存。
 
 默认异步等待通过 ExecutionNotifier 接收版本化通知，不使用轮询或阻塞线程等待结果。同步和异步等待共享相同
 状态、取消和输出可见性；替换通知实现必须保证跨线程唤醒以及“通知先发生、等待后注册”时不会丢失通知。
@@ -156,11 +199,19 @@ outputs = runtime.run(
     payload,
     max_steps=1000,
     timeout=60,
+    max_queued=10_000,
 )
 ```
 
 - `max_steps=0` 表示不限步数；正整数限制 Node firing 次数。Node 每消费一组输入并开始调用一次，计为一步。
 - `timeout=None` 表示 Graph 总执行时长不限；正数表示秒数。
+- `max_queued=0` 表示不限制 Graph 内积压；正整数限制全部 Node 输入端口中等待消费的 token 总数。
+
+执行器在单线程内串行推进：一次 firing 的全部输出先依次进入下游队列，下游随后才开始执行，因此 Graph 内没有
+可以阻塞生产者的背压。`max_queued` 是这段内存的硬上限：再入队一个 token 会超过上限时，execution 立即以
+`QueueLimitExceededError` 结束，状态为 `QUEUE_LIMITED`，错误信息列出积压最多的端口。它覆盖 `max_steps`
+看不到的情形，例如一次 firing 产出大量值、或回边每轮产出多于消费。入口输入同样计数；已被 firing 取走的 token
+不再计入。
 
 单次 Node firing 的时限是 Node 自身的配置：
 
@@ -174,8 +225,9 @@ class Fetch(Node):
 `Node.timeout=None` 是默认值，表示该 Node 不限时；有限正数表示秒数。一次 firing 的 Hook 与 Node 调用共用这段
 预算。Graph 冻结时会校验并固定该配置，不存在 Runtime 级的统一 Node timeout。
 
-以上默认值保持无限制。超过限制分别抛出 `StepLimitExceededError`、`ExecutionTimeoutError` 或
-`NodeTimeoutError`。限制不会撤回已经发布的 Event。
+以上默认值保持无限制。超过限制分别抛出 `StepLimitExceededError`、`QueueLimitExceededError`、
+`ExecutionTimeoutError` 或 `NodeTimeoutError`。它们都是执行控制异常，Hook 不能恢复。限制不会撤回已经发布的
+Event 与已交付的 terminal Output。
 
 需要身份、状态、查询或取消时使用 `start()`：
 
@@ -192,9 +244,15 @@ Awaitable 会收到取消请求，包括 `async def execute()` 创建的协程�
 `context.checkpoint()`。无法安全强杀的普通同步函数会在返回后检查 deadline，因此超过 timeout 后产生的外部副作用
 不会被自动撤销。
 
-异步取消或超时会向实际协程发送取消请求，并等待它完成 `finally` 等清理后才结束 execution、释放执行锁并归还
-Slot。清理期间 execution 仍为 `RUNNING`，`wait_idle()` 也会继续等待。协程若抑制取消或清理迟迟不结束，等待可能
-超过配置的 timeout；该限制不能安全强杀协程，也不会让下一张 Graph 提前复用仍在使用的资源。
+异步取消或超时会立即唤醒等待方（不轮询），向实际协程发送取消请求，并等待它完成 `finally` 等清理后才结束
+execution、释放执行锁并归还 Slot。清理期间 execution 仍为 `RUNNING`，`wait_idle()` 也会继续等待。协程若抑制
+`CancelledError` 或清理迟迟不结束，取消会一直阻塞，等待可能超过配置的 timeout；该限制不能安全强杀协程，也不会让
+下一张 Graph 提前复用仍在使用的资源。关闭执行器时，后台 loop 线程最多等待 5 秒；仍有协程抑制取消时记录警告后
+返回，守护线程继续运行到协程结束。
+
+默认执行器在私有的后台 event loop 线程上运行异步 Node 与 Hook，而不是调用方自己的 event loop；同一 Graph
+execution 的 Node firing 严格串行推进。因此 HTTP client、`asyncio.Lock`、Future 等绑定 loop 的资源必须在节点
+协程内部创建，不能在调用方 loop 上预先创建后经构造器或 Slot 传入。
 
 等待期间仍占用本次完整 Graph execution 的队列并发与 Slot，使用 `async def` 或从普通 `def` 返回 Awaitable
 都不会把一次 Graph 拆成多份独立工作。
@@ -209,12 +267,22 @@ stateDiagram-v2
     RUNNING --> CANCELLED: 协作式取消
     RUNNING --> TIMED_OUT: 超过总时限
     RUNNING --> STEP_LIMITED: 超过最大步数
+    RUNNING --> QUEUE_LIMITED: 待消费输入超过上限
     SUCCEEDED --> [*]
     FAILED --> [*]
     CANCELLED --> [*]
     TIMED_OUT --> [*]
     STEP_LIMITED --> [*]
+    QUEUE_LIMITED --> [*]
 ```
+
+### 静止回调
+
+`context.on_quiescence(callback)` 注册的回调只在数据流自然静止时运行：不再有可触发的 Node 且没有残留输入之后、
+execution 成功结束之前，按注册顺序同步调用全部回调，包括回调运行期间新注册的回调；每个回调前检查取消与超时。
+Node 失败、取消、超时、步数限制、残留输入或 Hook 以 `StopGraph` 停止时不会调用。回调抛出的执行控制异常原样
+传播；其他 `ExecutionError`（例如 `IncompleteInputsError`）补齐 `graph` 后传播；普通异常包装为带 `graph` 的
+`ExecutionError` 并以原异常为 `__cause__`。首个失败终止后续回调并使 execution 失败。
 
 ## Slot 与逻辑并发
 
@@ -263,13 +331,22 @@ SlotPool 的生命周期由创建者管理；自动池由 GraphWorker 关闭。
 | 取消 execution | `ExecutionCancelledError` |
 | Graph 或 Node 超时 | `ExecutionTimeoutError` / `NodeTimeoutError` |
 | 超过最大步数 | `StepLimitExceededError` |
+| Graph 内待消费输入超过上限 | `QueueLimitExceededError` |
 | 输入或输出类型不匹配 | `PortValueTypeError` |
 | Node 返回非法值或端口 | `InvalidOutputError` |
 | 半组输入遗留 | `IncompleteInputsError` |
-| 同步观察者或事件传输失败 | 发布点抛出 `EventDispatchError` |
+| 输入策略 selector 抛错或违反选择契约 | `PolicySelectionError`，带有 `graph` 和目标 `node` 信息 |
+| 静止回调失败 | `ExecutionError`（或回调抛出的 `ExecutionError` 子类），带有 `graph` 信息 |
+| 事件传输或 route 投递失败 | 发布点抛出 `EventDispatchError` |
+| `observe()` 观察者失败 | 记录日志，不影响 `emit()` 或业务结果 |
 | 队列中异步 Graph 失败 | 下一次 `wait_idle()` 抛出该失败 |
 
-默认事件总线即使一个观察者失败，也会继续调用同一事件的其余观察者，然后报告第一个失败。异步任务没有自动
+`NodeHook.error` 只接收 Node 或内层 Hook 的业务异常。执行控制异常与 Engine 契约错误（`HookExecutionError`、
+`InvalidOutputError`、`PortValueTypeError`、`PolicySelectionError`）不会交给 Hook 恢复，而是直接传播。
+`StopGraph` 携带的输出按停止节点声明的 output port 与类型校验，违反时同样以上述契约错误失败。
+
+生命周期观察者在发布事件的线程上同步运行，失败只写日志。`execution.finished` 先于 Execution 写入终态发布：
+观察者应从事件的 `status` 与 `error_type` 读取结果，此时 `execution.status` 可能仍为 `RUNNING`。异步任务没有自动
 重试；一次 `wait_idle()` 已报告的队列失败会被消费，不会在下一次等待时重复报告。
 
 ## 生命周期

@@ -64,8 +64,12 @@ def api() -> Iterator[tuple[TestClient, GraphService]]:
 
     with Runtime() as runtime:
         runtime.register("code.task", Graph(entrypoint="echo").add(echo=Echo()))
-        service = GraphService(runtime, nodes=NodeCatalog().register_node("echo", Echo))
-        with TestClient(service.create_app()) as client:
+        with (
+            GraphService(
+                runtime, nodes=NodeCatalog().register_node("echo", Echo)
+            ) as service,
+            TestClient(service.create_app(), base_url="http://localhost") as client,
+        ):
             yield client, service
 
 
@@ -276,7 +280,7 @@ def test_existing_database_migrates_without_rewriting_definitions_or_history(
             runtime, nodes=NodeCatalog().register_node("echo", Echo), database=database
         )
         assert (
-            service.store.connection.execute("PRAGMA user_version").fetchone()[0] == 2
+            service.store.connection.execute("PRAGMA user_version").fetchone()[0] == 3
         )
         assert service.definitions("default")[0]["name"] == "legacy"
         assert (
@@ -297,3 +301,54 @@ def test_existing_database_migrates_without_rewriting_definitions_or_history(
         assert runtime.run("legacy@v1", "still works")[0].value == "still works"
         runtime.wait_idle()
         service.close()
+
+
+def test_drafts_cannot_claim_code_graph_names(api: Any) -> None:
+    """草稿接口与新建定义使用同一全局唯一性校验，包括服务启动后注册的代码图。
+
+    Args:
+        api: 管理测试客户端与服务。
+    """
+
+    client, service = api
+    rejected = client.post("/api/drafts", json={"definition": document("code.task")})
+    assert rejected.status_code == 409
+    service.runtime.register("late.task", Graph(entrypoint="echo").add(echo=Echo()))
+    assert (
+        client.post(
+            "/api/drafts", json={"definition": document("late.task")}
+        ).status_code
+        == 409
+    )
+    assert (
+        client.post(
+            "/api/publish", json={"definition": document("late.task")}
+        ).status_code
+        == 409
+    )
+    assert client.get("/api/drafts").json() == []
+    created = client.post("/api/drafts", json={"definition": document("fresh.task")})
+    assert created.json() == {"revision": 1}
+
+
+def test_read_paths_do_not_persist_code_graph_membership(api: Any) -> None:
+    """列表与详情只读：新代码图按默认项目展示，但不因读取写入归属。
+
+    Args:
+        api: 管理测试客户端与服务。
+    """
+
+    client, service = api
+    service.runtime.register("read.task", Graph(entrypoint="echo").add(echo=Echo()))
+    before = service.store.memberships()
+    rows = client.get("/api/projects/default/definitions").json()["definitions"]
+    assert "read.task" in {item["name"] for item in rows}
+    assert client.get("/api/definitions/read.task").json()["status"] == "code"
+    assert client.get("/api/projects").json()[0]["definition_count"] == 2
+    assert service.store.memberships() == before
+    target = client.post("/api/projects", json={"name": "代码项目"}).json()["id"]
+    moved = client.post(
+        "/api/definition-project", json={"name": "read.task", "project_id": target}
+    )
+    assert moved.json()["project_id"] == target
+    assert service.store.memberships()["read.task"]["project_id"] == target

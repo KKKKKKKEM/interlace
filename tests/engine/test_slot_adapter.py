@@ -33,14 +33,7 @@ def test_accepted_delivery_dispatch_failure_releases_only_transferred_reference(
             pass
 
         def submit(self, *args):
-            """向命名执行通道提交工作。
-
-            Args:
-                *args: 调用协议传入的位置参数。
-
-            Raises:
-                RuntimeError: 当前生命周期状态或操作顺序不允许此操作。
-            """
+            """向命名执行通道提交工作。"""
 
             raise RuntimeError("thread submission failed")
 
@@ -215,16 +208,7 @@ class PumpTasks:
         self.queued.append((queue, Delivery(work)))
 
     def submit_local(self, queue, work, lease):
-        """提交延续本地 Slot 链的工作，成功后接管传入的引用。
-
-        Args:
-            queue: 命名消费通道。
-            work: 需要投递或执行的工作请求。
-            lease: 当前进程内执行槽的引用与串行执行能力。
-
-        Raises:
-            ValueError: 参数值或字段组合不合法。
-        """
+        """提交延续本地 Slot 链的工作，成功后接管传入的引用。"""
 
         if self.reject_local:
             raise ValueError("local publication rejected")
@@ -237,9 +221,7 @@ class PumpTasks:
             当前测试回调收集或构造的结果。
         """
 
-        ordered = sorted(
-            tuple(self.queued), key=lambda item: item[1].slot_lease is None
-        )
+        ordered = sorted(self.queued, key=lambda item: item[1].slot_lease is None)
         for queue, delivery in ordered:
             handler, slots = self.consumers[queue]
             lease = delivery.slot_lease
@@ -300,12 +282,7 @@ def test_independent_adapter_preserves_chain_and_recovers_pool(failure):
 
     class Source(Node):
         def execute(self, inputs, context):
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-            """
+            """把入口值写入 Slot 并记录；值为 1 时连续发布两个 next 事件。"""
 
             assert context.slot is not None
             context.slot["root"] = inputs["default"]
@@ -316,15 +293,7 @@ def test_independent_adapter_preserves_chain_and_recovers_pool(failure):
 
     class Target(Node):
         def execute(self, inputs, context):
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-
-            Raises:
-                ValueError: 参数值或字段组合不合法。
-            """
+            """记录收到的 Slot；按测试参数在图内失败。"""
 
             assert context.slot is not None
             seen.append(("target", context.slot, context.slot["root"]))
@@ -354,7 +323,7 @@ def test_independent_adapter_preserves_chain_and_recovers_pool(failure):
         assert tasks.pump()
         while tasks.failures:
             with pytest.raises(
-                Exception, match="target failed|local publication rejected"
+                Exception, match=r"target failed|local publication rejected"
             ):
                 runtime.wait_idle(1)
         runtime.wait_idle(1)

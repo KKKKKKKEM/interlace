@@ -1,4 +1,10 @@
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, {
+  useCallback,
+  useEffect,
+  useEffectEvent,
+  useRef,
+  useState,
+} from "react";
 import { createPortal } from "react-dom";
 import {
   ReactFlow,
@@ -34,9 +40,9 @@ import {
   X,
   Workflow,
 } from "lucide-react";
-import { createParser } from "eventsource-parser";
 import NodeRunDetails, { firingState } from "./NodeRunDetails.jsx";
 import { Tool, ResizeHandle } from "./ui.jsx";
+import { useApi } from "./api.js";
 
 const names = {
   not_run: "未执行",
@@ -48,12 +54,11 @@ const names = {
   timed_out: "已超时",
   node_timed_out: "节点超时",
   step_limited: "达到步数上限",
+  queue_limited: "达到队列上限",
   interrupted: "已中断",
 };
 const empty = () => ({ name: "", entrypoint: "", nodes: [], edges: [] });
 const copy = (value) => structuredClone(value);
-const errorText = (error) =>
-  typeof error === "string" ? error : JSON.stringify(error);
 
 /** 以真实端口渲染可连接的节点。 */
 function GraphNode({ id, data, selected }) {
@@ -238,19 +243,13 @@ export default function GraphWorkbench({
   allowedGraphs,
   autoRun = false,
   showRuns = false,
-  accessToken,
-  onAccessToken,
   onDirtyChange,
   onPublished,
   onEditDraft,
   onRunStarted,
   actionsTarget,
 }) {
-  const [token, setToken] = useState(
-    sessionStorage.getItem("interlace.token") || "",
-  );
-  const [tokenInput, setTokenInput] = useState(token);
-  const [auth, setAuth] = useState(false);
+  const { api, stream } = useApi();
   const [graphs, setGraphs] = useState([]);
   const [drafts, setDrafts] = useState([]);
   const [catalog, setCatalog] = useState([]);
@@ -301,32 +300,9 @@ export default function GraphWorkbench({
   }, []);
 
   useEffect(() => {
-    setToken(accessToken || "");
-    setTokenInput(accessToken || "");
-    setAuth(false);
-  }, [accessToken]);
-  useEffect(() => {
     onDirtyChange?.(dirty);
   }, [dirty, onDirtyChange]);
   useEffect(() => () => onDirtyChange?.(false), [onDirtyChange]);
-
-  const api = useCallback(
-    async (path, body) => {
-      const response = await fetch(`./api/${path}`, {
-        method: body === undefined ? "GET" : "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        },
-        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-      });
-      if (response.status === 401) setAuth(true);
-      const value = await response.json();
-      if (!response.ok) throw new Error(errorText(value.detail || value));
-      return value;
-    },
-    [token],
-  );
 
   const refresh = useCallback(async () => {
     const [g, d, c, r] = await Promise.all([
@@ -355,6 +331,8 @@ export default function GraphWorkbench({
   };
 
   useEffect(() => {
+    // 令牌更新会换新 api，清除上一次的授权错误后重新加载。
+    setMessage(null);
     refresh().catch((error) =>
       setMessage({ error: true, text: error.message }),
     );
@@ -380,15 +358,12 @@ export default function GraphWorkbench({
     return () => window.removeEventListener("beforeunload", protect);
   }, [dirty]);
   useEffect(() => {
-    if (!dialog && !auth) return;
+    if (!dialog) return;
     const previous = document.activeElement;
     const modal = document.querySelector('[role="dialog"]');
     modal?.querySelector("input, textarea, button")?.focus();
     const keyboard = (event) => {
-      if (event.key === "Escape") {
-        setDialog(null);
-        setAuth(false);
-      }
+      if (event.key === "Escape") setDialog(null);
       if (event.key !== "Tab") return;
       const fields = [
         ...modal.querySelectorAll(
@@ -408,7 +383,7 @@ export default function GraphWorkbench({
       document.removeEventListener("keydown", keyboard);
       previous?.focus();
     };
-  }, [dialog, auth]);
+  }, [dialog]);
 
   const resetHistory = () => {
     history.current = { past: [], future: [] };
@@ -485,13 +460,15 @@ export default function GraphWorkbench({
     );
   };
 
+  const hasSelection = Boolean(selected);
+  const hasSelectedEdge = Boolean(selectedEdge);
   useEffect(() => {
     const timer = window.setTimeout(
       () => fitView({ padding: 0.2, maxZoom: 1 }),
       60,
     );
     return () => window.clearTimeout(timer);
-  }, [Boolean(selected), Boolean(selectedEdge), fitView]);
+  }, [hasSelection, hasSelectedEdge, fitView]);
 
   const mayLeave = () =>
     !dirty || window.confirm("当前修改尚未保存，是否离开？");
@@ -520,7 +497,8 @@ export default function GraphWorkbench({
     );
     draw(draft.definition, { nodes: previews }, true, "", draft.revision);
   };
-  useEffect(() => {
+  // 按 URL 打开运行、草稿或版本；读取最新回调，booted 保证只打开一次。
+  const bootDefinition = useEffectEvent(() => {
     if (booted.current) return;
     const draft = drafts.find(
       (item) => item.definition.name === definitionName,
@@ -554,6 +532,9 @@ export default function GraphWorkbench({
         openGraph(graph);
       }
     }
+  });
+  useEffect(() => {
+    bootDefinition();
   }, [graphs, drafts, definitionName, graphName, runId]);
 
   const documentValue = () => ({
@@ -696,11 +677,14 @@ export default function GraphWorkbench({
     onRunStarted?.(run);
   };
 
-  useEffect(() => {
-    if (autoRun && registered && !autoOpened.current) {
+  const autoOpenRunDialog = useEffectEvent(() => {
+    if (!autoOpened.current) {
       autoOpened.current = true;
       runDialog();
     }
+  });
+  useEffect(() => {
+    if (autoRun && registered) autoOpenRunDialog();
   }, [autoRun, registered]);
 
   useEffect(() => {
@@ -712,33 +696,13 @@ export default function GraphWorkbench({
     const controller = new AbortController();
     setObservations([]);
     setOutputs([]);
-    const read = async (path, onEvent) => {
-      const response = await fetch(`./api/executions/${activeRun.id}/${path}`, {
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
+    const read = (path, failure, onEvent) =>
+      stream(`executions/${activeRun.id}/${path}`, {
         signal: controller.signal,
+        failure,
+        onEvent,
       });
-      if (!response.ok)
-        throw new Error(
-          path === "outputs"
-            ? "该执行的输出已不在当前进程中"
-            : "运行记录读取失败",
-        );
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      const parser = createParser({
-        onEvent: (event) => onEvent(event.event, JSON.parse(event.data)),
-      });
-      try {
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          parser.feed(decoder.decode(value, { stream: true }));
-        }
-      } finally {
-        reader.releaseLock();
-      }
-    };
-    read("events", (kind, value) => {
+    read("events", "运行记录读取失败", (kind, value) => {
       if (kind === "observation") setObservations((old) => [...old, value]);
       if (kind === "finished") {
         setActiveRun((old) => (old?.id === value.id ? value : old));
@@ -750,7 +714,7 @@ export default function GraphWorkbench({
       if (error.name !== "AbortError")
         setMessage({ error: true, text: error.message });
     });
-    read("outputs", (kind, value) => {
+    read("outputs", "该执行的输出已不在当前进程中", (kind, value) => {
       if (kind === "output") setOutputs((old) => [...old, value]);
       if (kind === "failure") setMessage({ error: true, text: value.detail });
     }).catch((error) => {
@@ -758,7 +722,7 @@ export default function GraphWorkbench({
         setOutputs([{ unavailable: error.message }]);
     });
     return () => controller.abort();
-  }, [activeRun?.id, token]);
+  }, [activeRun?.id, stream]);
 
   const nodeStates = {};
   if (activeRun?.graph === registered)
@@ -904,7 +868,7 @@ export default function GraphWorkbench({
     >
       <main className="workspace" ref={workspaceRef}>
         {!showRuns && actionsTarget && createPortal(actions, actionsTarget)}
-        {message && !dialog && !auth && (
+        {message && !dialog && (
           <div
             className={`notice ${message.error ? "error" : ""}`}
             role={message.error ? "alert" : "status"}
@@ -1434,35 +1398,25 @@ export default function GraphWorkbench({
           </div>
         </section>
       </main>
-      {(dialog || auth) && (
+      {dialog && (
         <div
           className="modal-backdrop"
           onMouseDown={(event) => {
-            if (event.target === event.currentTarget) {
-              setDialog(null);
-              setAuth(false);
-            }
+            if (event.target === event.currentTarget) setDialog(null);
           }}
         >
           <section
             className="modal material-glass"
             role="dialog"
             aria-modal="true"
-            aria-label={
-              auth ? "访问令牌" : dialog === "run" ? "运行图" : "添加节点"
-            }
+            aria-label={dialog === "run" ? "运行图" : "添加节点"}
           >
             <div className="section-heading">
-              <h2>
-                {auth ? "访问令牌" : dialog === "run" ? "运行图" : "添加节点"}
-              </h2>
+              <h2>{dialog === "run" ? "运行图" : "添加节点"}</h2>
               <Tool
                 icon={X}
                 label="关闭对话框"
-                onClick={() => {
-                  setDialog(null);
-                  setAuth(false);
-                }}
+                onClick={() => setDialog(null)}
               />
             </div>
             <div className="modal-content">
@@ -1471,29 +1425,7 @@ export default function GraphWorkbench({
                   {message.text}
                 </div>
               )}
-              {auth ? (
-                <form
-                  onSubmit={(event) => {
-                    event.preventDefault();
-                    sessionStorage.setItem("interlace.token", tokenInput);
-                    setToken(tokenInput);
-                    onAccessToken?.(tokenInput);
-                    setAuth(false);
-                    setMessage(null);
-                  }}
-                >
-                  <label className="field">
-                    <span>令牌</span>
-                    <input
-                      type="password"
-                      autoFocus
-                      value={tokenInput}
-                      onChange={(e) => setTokenInput(e.target.value)}
-                    />
-                  </label>
-                  <button className="primary wide">连接</button>
-                </form>
-              ) : dialog === "nodes" ? (
+              {dialog === "nodes" ? (
                 <div className="node-catalog">
                   {catalog.map((type) => (
                     <button key={type.type} onClick={() => addNode(type)}>

@@ -23,8 +23,8 @@ from .host import (
 __all__ = [
     "CAP_EVENT_BUS",
     "CAP_EVENT_ROUTER",
-    "CAP_GRAPH_EXECUTOR",
     "CAP_EXECUTION_FACTORY",
+    "CAP_GRAPH_EXECUTOR",
     "CAP_GRAPH_WORKER",
     "CAP_INPUT_SELECTOR",
     "CAP_NODE_HOOK",

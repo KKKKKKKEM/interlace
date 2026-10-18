@@ -2,19 +2,17 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from contextvars import ContextVar
 from functools import partial
 from threading import RLock
+from types import TracebackType
 from typing import Any
 
 from ..adapters import memory
-from ..engine.core import require_non_empty_string
-from ..engine.errors import (
-    InterlaceRuntimeError,
-    EventDispatchError,
-    RuntimeClosedError,
-)
+from .._validation import require_non_empty_string
+from ..engine.errors import EventDispatchError, InterlaceRuntimeError
 from ..engine.events import Event
 from ..engine.execution import ExecutionLimits
 from ..engine.observation import (
@@ -24,29 +22,34 @@ from ..engine.observation import (
     RuntimeEventKind,
     RuntimeObserver,
 )
-from ..spi import EventBus, SlotLease, TaskPublisher, Work
-from ._utils import _close_components, _unique
+from ..spi import EventBus, LocalTaskPublisher, SlotLease, TaskPublisher, Work
+from ._utils import _close_components, _Lifecycle, _unique
 
 EventHandler = Callable[[Event], None]
+# 当前同步分发所属的源 Slot lease；只由 route handler 的 Work 提交读取，观察者调用期间清空。
 _LOCAL_LEASE: ContextVar[SlotLease | None] = ContextVar(
     "interlace_local_event_lease",
     default=None,
 )
+_logger = logging.getLogger(__name__)
 
 
 class EventRouter:
     """发布和订阅 Event，并把匹配的 Event 转成队列 Work。
 
+    route handler 的提交失败以 EventDispatchError 传回 emit 调用方；observe 注册的观察者异常写入日志后隔离，
+    不改变 emit 结果。关闭时先进入 CLOSING 拒绝新的注册与发布，再注销订阅、等待在途分发并关闭拥有的组件。
+
     Attributes:
-        _events: 事件传输实现。
-        _publisher: 向命名通道提交工作的发布能力。
-        _owned_components: 当前组件负责关闭的底层资源集合。
-        _close_injected: 是否负责关闭调用方注入的底层组件。
-        _observations: 当前组件的只读生命周期事件分发中心。
-        _routes: 已注册的事件到 Graph 路由关系。
-        _subscriptions: 当前角色拥有的事件订阅注销函数。
-        _lock: 保护当前组件共享状态的进程内互斥锁。
-        _closed: 当前组件是否已停止接受新工作。
+        _events: 承载订阅与分发的 EventBus。
+        _publisher: 接收路由 Work 的任务发布端。
+        _owned_components: 由当前 Router 自建并负责关闭的组件。
+        _close_injected: 是否在关闭时一并关闭注入的 EventBus 与任务发布端。
+        _observations: 发布 EVENT_PUBLISHED 与 WORK_SUBMITTED 的观察中心。
+        _routes: 已注册的 (事件类型, Graph 名称, 队列) 路由，用于拒绝重复路由。
+        _subscriptions: 当前 Router 在 EventBus 上的订阅注销函数，按注册顺序保存。
+        _lock: 保护路由表和订阅列表的可重入锁。
+        _lifecycle: OPEN -> CLOSING -> CLOSED 关闭状态机。
     """
 
     def __init__(
@@ -57,16 +60,16 @@ class EventRouter:
         close_injected: bool = False,
         observations: ObservationHub | None = None,
     ) -> None:
-        """装配事件传输、任务发布和观察能力，明确注入资源的所有权。
+        """装配事件传输、任务发布和观察中心，明确注入资源的所有权。
 
         Args:
-            publisher: 负责向命名通道投递工作的发布能力。
-            events: 注入的事件传输实现。
-            close_injected: 是否由当前组件关闭注入的底层资源。
-            observations: 负责分发生命周期事件的观察中心。
+            publisher: 接收路由 Work 的任务发布端；实现 LocalTaskPublisher 时可延续本地 Slot 链。
+            events: 注入的 EventBus；None 时自建并负责关闭默认内存实现。
+            close_injected: 是否在关闭时一并关闭注入的 events 与 publisher。
+            observations: 共享的观察中心；None 时创建独立实例。
 
         Raises:
-            TypeError: 参数类型或接口实现不符合当前契约。
+            TypeError: close_injected 不是布尔值。
         """
 
         if type(close_injected) is not bool:
@@ -83,14 +86,14 @@ class EventRouter:
         self._routes: set[tuple[str, str, str]] = set()
         self._subscriptions: list[Callable[[], None]] = []
         self._lock = RLock()
-        self._closed = False
+        self._lifecycle = _Lifecycle("EventRouter")
 
     @property
     def idle(self) -> bool:
-        """返回当前 Router 是否没有正在投递的 Event。
+        """判断 EventBus 是否没有在途分发。
 
         Returns:
-            没有未完成工作时为 True，否则为 False。
+            EventBus 报告空闲时为 True。
         """
 
         return self._events.idle
@@ -98,34 +101,40 @@ class EventRouter:
     def observe(self, event_type: str, handler: EventHandler) -> EventRouter:
         """注册一个相互独立的 Event 观察者。
 
+        观察者在发布线程内调用，调用期间不关联源 Slot lease；其普通异常写入日志后忽略，不传回 emit。
+
         Args:
-            event_type: 用于订阅或路由匹配的事件类型。
-            handler: 接收事件或投递的处理函数。
+            event_type: 精确事件类型，或匹配全部类型的 ``"*"``。
+            handler: 接收 Event 的观察函数。
 
         Returns:
-            当前实例，可继续进行链式组合。
+            当前 Router，可继续链式组合。
 
         Raises:
-            TypeError: 参数类型或接口实现不符合当前契约。
+            RuntimeClosedError: Router 正在关闭或已经关闭。
+            TypeError: handler 不可调用。
+            ValueError: event_type 为空字符串。
         """
 
-        self._ensure_open()
+        self._lifecycle.ensure_open()
         event_type = require_non_empty_string(event_type, "subscription event type")
         if not callable(handler):
             raise TypeError("event handler must be callable")
         with self._lock:
-            self._ensure_open()
-            self._subscriptions.append(self._events.subscribe(event_type, handler))
+            self._lifecycle.ensure_open()
+            self._subscriptions.append(
+                self._events.subscribe(event_type, partial(_observe, handler))
+            )
         return self
 
     def observe_runtime(self, observer: RuntimeObserver) -> ObserverHandle:
         """订阅当前 Router 发布的只读生命周期事件。
 
         Args:
-            observer: 接收只读生命周期事件的观察者。
+            observer: 接收 RuntimeEvent 的观察者。
 
         Returns:
-            用于卸载本次注册的句柄。
+            可独立卸载本次注册的句柄。
         """
 
         return self._observations.attach(observer)
@@ -139,23 +148,26 @@ class EventRouter:
         subscription: str | None = None,
         limits: ExecutionLimits | None = None,
     ) -> EventRouter:
-        """订阅 Event，并向队列投递目标 Graph 的 Work。
+        """订阅 Event，并为每次匹配向队列提交目标 Graph 的 Work。
 
         Args:
-            event_type: 用于订阅或路由匹配的事件类型。
-            graph: 目标 Graph 定义或其注册名称，以类型声明为准。
-            queue: 命名消费通道。
-            subscription: 竞争消费组名称，None 创建独立订阅。
-            limits: 本次执行独立使用的步数和时长限制。
+            event_type: 精确事件类型，或匹配全部类型的 ``"*"``。
+            graph: 目标 Graph 的注册名称。
+            queue: 接收 Work 的命名通道。
+            subscription: 竞争消费组名称；None 时按事件类型、Graph 与队列生成。
+            limits: 每个 Work 独立使用的步数、时长与队列限制；None 表示不限制。
 
         Returns:
-            当前实例，可继续进行链式组合。
+            当前 Router，可继续链式组合。
 
         Raises:
-            TypeError: 参数类型或接口实现不符合当前契约。
+            InterlaceRuntimeError: 相同的事件类型、Graph 与队列路由已经存在。
+            RuntimeClosedError: Router 正在关闭或已经关闭。
+            TypeError: limits 不是 ExecutionLimits。
+            ValueError: 任一名称为空字符串。
         """
 
-        self._ensure_open()
+        self._lifecycle.ensure_open()
         event_type = require_non_empty_string(event_type, "subscription event type")
         graph = require_non_empty_string(graph, "route graph")
         queue = require_non_empty_string(queue, "route queue")
@@ -168,7 +180,7 @@ class EventRouter:
         else:
             subscription = require_non_empty_string(subscription, "route subscription")
         with self._lock:
-            self._ensure_open()
+            self._lifecycle.ensure_open()
             route = (event_type, graph, queue)
             if route in self._routes:
                 raise InterlaceRuntimeError(f"duplicate event route {route!r}")
@@ -185,14 +197,16 @@ class EventRouter:
         """发布完整 Event，或从 type 和 payload 创建后发布。
 
         Args:
-            event_or_type: 已有事件实例，或用于构造事件的类型字符串。
-            payload: 事件携带的领域数据。
+            event_or_type: 已有 Event，或用于构造 Event 的类型字符串。
+            payload: 构造 Event 时携带的领域数据；传入完整 Event 时必须为 None。
 
         Returns:
-            事件传输已经接受的 Event 实例。
+            EventBus 已经接受的 Event。
 
         Raises:
-            TypeError: 参数类型或接口实现不符合当前契约。
+            EventDispatchError: EventBus 或 route handler 的 Work 提交失败。
+            RuntimeClosedError: Router 正在关闭或已经关闭。
+            TypeError: 完整 Event 与 payload 同时传入。
         """
 
         if isinstance(event_or_type, Event):
@@ -205,99 +219,104 @@ class EventRouter:
         return event
 
     def publish(self, event: Event) -> None:
-        """向 EventBus 发布一项 Event，供 GraphWorker emitter 使用。
+        """发布 Event，路由产生的 Work 开始新的 Slot 链；供 GraphWorker 的 emit 回调使用。
 
         Args:
-            event: 需要发布、观察或处理的事件。
+            event: 需要发布的 Event。
 
         Raises:
-            EventDispatchError: 事件投递失败，保留原始原因。
+            EventDispatchError: EventBus 或 route handler 的 Work 提交失败。
+            RuntimeClosedError: Router 正在关闭或已经关闭。
         """
 
-        self._ensure_open()
-        try:
-            self._events.publish(event)
-        except BaseException as exc:
-            if isinstance(exc, EventDispatchError):
-                raise
-            if isinstance(exc, Exception):
-                raise EventDispatchError(event, exc) from exc
-            raise
-        self._observations.publish(
-            RuntimeEvent(RuntimeEventKind.EVENT_PUBLISHED, event_type=event.type)
-        )
+        self._dispatch(event, None)
 
     def publish_local(self, event: Event, lease: SlotLease) -> None:
-        """发布 Event，并仅为同步本地路由关联当前 Slot lease。
+        """发布 Event，让本次同步分发中的路由 Work 延续 lease 所属的 Slot 链。
+
+        只有 route handler 的 Work 提交读取 lease；观察者及其嵌套发布不继承该 lease。
 
         Args:
-            event: 需要发布、观察或处理的事件。
-            lease: 当前进程内执行槽的引用与串行执行能力。
+            event: 需要发布的 Event。
+            lease: 源 execution 持有的 Slot lease；每个本地路由分支各自 retain 一个引用。
+
+        Raises:
+            EventDispatchError: EventBus 或 route handler 的 Work 提交失败。
+            RuntimeClosedError: Router 正在关闭或已经关闭。
         """
 
-        token = _LOCAL_LEASE.set(lease)
-        try:
-            self.publish(event)
-        finally:
-            _LOCAL_LEASE.reset(token)
+        self._dispatch(event, lease)
 
     def wait_idle(self, timeout: float | None = None) -> None:
-        """等待当前 Router 已接受的 Event 投递完成。
+        """等待 EventBus 的在途分发完成。
 
         Args:
-            timeout: 等待或执行时限，单位秒；None 表示不设置时限。
+            timeout: 最长等待秒数；None 表示一直等待。
+
+        Raises:
+            TimeoutError: 时限内仍有在途分发。
         """
 
         self._events.wait_idle(timeout)
 
     def close(self) -> None:
-        """等待投递结束，并关闭当前 Router 拥有的组件。"""
+        """注销订阅、等待在途分发，并关闭当前 Router 拥有的组件。
 
-        with self._lock:
-            if self._closed:
-                return
-            self._closed = True
-            subscriptions = tuple(reversed(self._subscriptions))
-            self._subscriptions.clear()
+        并发调用等待首个调用完成后返回；关闭线程内的重入调用立即返回。
+
+        Raises:
+            Exception: 注销、等待或关闭组件时出现的首个失败。
+        """
+
+        if not self._lifecycle.begin_close():
+            return
         failure: BaseException | None = None
-        for unsubscribe in subscriptions:
+        try:
+            with self._lock:
+                subscriptions = tuple(reversed(self._subscriptions))
+                self._subscriptions.clear()
+            for unsubscribe in subscriptions:
+                try:
+                    unsubscribe()
+                except Exception as exc:
+                    if failure is None:
+                        failure = exc
             try:
-                unsubscribe()
-            except Exception as exc:  # noqa: BLE001
+                self.wait_idle()
+            except Exception as exc:
                 if failure is None:
                     failure = exc
-        try:
-            self.wait_idle()
-        except Exception as exc:  # noqa: BLE001
-            if failure is None:
-                failure = exc
-        components = (
-            _unique(self._events, self._publisher)
-            if self._close_injected
-            else tuple(self._owned_components)
-        )
-        failure = _close_components(reversed(components), failure)
+            components = (
+                _unique(self._events, self._publisher)
+                if self._close_injected
+                else tuple(self._owned_components)
+            )
+            failure = _close_components(reversed(components), failure)
+        finally:
+            self._lifecycle.finish_close()
         if failure is not None:
             raise failure
 
     def __enter__(self) -> EventRouter:
-        """进入资源作用域并返回当前句柄。
+        """进入资源作用域并返回当前 Router。
 
         Returns:
-            当前资源管理对象。
+            当前 Router。
+
+        Raises:
+            RuntimeClosedError: Router 正在关闭或已经关闭。
         """
 
-        self._ensure_open()
+        self._lifecycle.ensure_open()
         return self
 
-    def __exit__(self, exc_type, exc_value, traceback) -> None:
-        """退出资源作用域，执行对应的关闭或卸载操作。
-
-        Args:
-            exc_type: 离开上下文时的异常类型，没有异常时为 None。
-            exc_value: 离开上下文时的异常实例，没有异常时为 None。
-            traceback: 离开上下文时的异常栈，没有异常时为 None。
-        """
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        """退出资源作用域并关闭 Router；已有异常时不以关闭失败覆盖它。"""
 
         del exc_type, traceback
         try:
@@ -306,6 +325,29 @@ class EventRouter:
             if exc_value is None:
                 raise
 
+    def _dispatch(self, event: Event, lease: SlotLease | None) -> None:
+        """先记录 EVENT_PUBLISHED，再在关联 lease 的上下文中交给 EventBus 分发。
+
+        Raises:
+            EventDispatchError: EventBus 或 route handler 抛出普通异常。
+            RuntimeClosedError: Router 正在关闭或已经关闭。
+        """
+
+        self._lifecycle.ensure_open()
+        # 先于分发记录，保证同一 Event 引起的 WORK_SUBMITTED 按因果顺序出现在其后。
+        self._observations.publish(
+            RuntimeEvent(RuntimeEventKind.EVENT_PUBLISHED, event_type=event.type)
+        )
+        token = _LOCAL_LEASE.set(lease)
+        try:
+            self._events.publish(event)
+        except EventDispatchError:
+            raise
+        except Exception as exc:
+            raise EventDispatchError(event, exc) from exc
+        finally:
+            _LOCAL_LEASE.reset(token)
+
     def _submit(
         self,
         graph: str,
@@ -313,55 +355,45 @@ class EventRouter:
         limits: ExecutionLimits,
         event: Event,
     ) -> None:
-        """将已路由的事件转换为目标通道的工作投递。
+        """route handler：把 Event 转成目标 Graph 的 Work 并提交到队列。
 
-        Args:
-            graph: 目标 Graph 定义或其注册名称，以类型声明为准。
-            queue: 命名消费通道。
-            limits: 本次执行独立使用的步数和时长限制。
-            event: 需要发布、观察或处理的事件。
+        存在本地 lease 且发布端实现 LocalTaskPublisher 时为本分支 retain 一个引用并转交；
+        submit_local 抛错时由本函数释放该引用一次，释放失败写入日志，保留原始提交失败。
+        其他情况提交不携带 lease 的根 Work。
         """
 
+        work = Work(graph, event.payload, trigger=event, limits=limits)
         lease = _LOCAL_LEASE.get()
-        if lease is not None:
+        if lease is not None and isinstance(self._publisher, LocalTaskPublisher):
             lease.retain()
-        try:
-            work = Work(
-                graph,
-                event.payload,
-                trigger=event,
-                limits=limits,
-            )
-            submit_local = getattr(self._publisher, "submit_local", None)
-            if lease is not None and callable(submit_local):
-                submit_local(queue, work, lease)
-                lease = None
-            else:
-                self._publisher.submit(queue, work)
-                if lease is not None:
+            try:
+                self._publisher.submit_local(queue, work, lease)
+            except BaseException:
+                try:
                     lease.release()
-                    lease = None
-            self._observations.publish(
-                RuntimeEvent(
-                    RuntimeEventKind.WORK_SUBMITTED,
-                    graph=graph,
-                    work_id=work.id,
-                    event_type=event.type,
-                    attributes={"queue": queue},
-                )
+                except Exception:
+                    _logger.exception("failed to release a rejected local Work lease")
+                raise
+        else:
+            self._publisher.submit(queue, work)
+        self._observations.publish(
+            RuntimeEvent(
+                RuntimeEventKind.WORK_SUBMITTED,
+                graph=graph,
+                work_id=work.id,
+                event_type=event.type,
+                attributes={"queue": queue},
             )
-        except BaseException:
-            if lease is not None:
-                lease.release()
-            raise
+        )
 
-    def _ensure_open(self) -> None:
-        """拒绝对已经关闭的组件继续提交工作。
 
-        Raises:
-            RuntimeClosedError: 当前运行时角色已经关闭。
-        """
+def _observe(handler: EventHandler, event: Event) -> None:
+    """在清空本地 lease 的上下文中调用观察者，记录并隔离其普通异常。"""
 
-        with self._lock:
-            if self._closed:
-                raise RuntimeClosedError("EventRouter is closed")
+    token = _LOCAL_LEASE.set(None)
+    try:
+        handler(event)
+    except Exception:
+        _logger.exception("event observer failed for %r", event.type)
+    finally:
+        _LOCAL_LEASE.reset(token)

@@ -3,6 +3,7 @@
 import asyncio
 import pickle
 import sqlite3
+import time
 from collections.abc import Awaitable
 from types import MappingProxyType
 from typing import Any, cast
@@ -12,6 +13,7 @@ import pytest
 
 from interlace import Context, Execution, ExecutionLimits, Graph, Node, Output, Runtime
 from interlace.engine.errors import ExecutionCancelledError, ExecutionTimeoutError
+from interlace.engine.events import bind_context
 from interlace.engine.execution_resources import LocalExecutionNotifier
 from interlace.plugins import CAP_EXECUTION_FACTORY, PluginDescriptor
 from interlace.runtime import LocalRuntimePlugin
@@ -19,15 +21,7 @@ from interlace.runtime import LocalRuntimePlugin
 
 class Produce(Node):
     def execute(self, inputs, context):
-        """执行当前测试场景的节点行为，供外层契约断言检查。
-
-        Args:
-            inputs: 入口数据或按端口名称组织的输入映射。
-            context: 当前调用的执行或插件上下文。
-
-        Returns:
-            测试节点或替代执行器产生的返回值。
-        """
+        """按 default 输入产生对应数量的默认端口 Output。"""
 
         return tuple(Output(index) for index in range(inputs["default"]))
 
@@ -75,21 +69,7 @@ class SyncExecutor:
         options=None,
         execution,
     ) -> Awaitable[None] | None:
-        """执行当前测试 Graph，并通过 Execution 的公开接口交付输出。
-
-        Args:
-            name: 注册或查找使用的名称。
-            graph: 目标 Graph 定义或其注册名称，以类型声明为准。
-            inputs: 入口数据或按端口名称组织的输入映射。
-            emit: 发布跨图事件的回调。
-            plan: 限定本次执行范围的计划，None 使用完整 Graph。
-            slot: 当前逻辑执行链使用的本地执行槽。
-            options: 当前执行的领域配置。
-            execution: 记录当前执行状态、控制限制及输出的句柄。
-
-        Raises:
-            ValueError: 参数值或字段组合不合法。
-        """
+        """执行当前测试 Graph，并通过 Execution 的公开接口交付输出。"""
 
         assert graph.frozen and len(graph.nodes) == 1
         assert graph.spec_for(graph.entrypoint).input_ports["default"] is object
@@ -100,7 +80,7 @@ class SyncExecutor:
             outputs = graph.nodes[graph.entrypoint].execute(
                 {"default": inputs},
                 graph.context_factory(
-                    Context(
+                    bind_context(
                         emit, slot, checkpoint=execution.checkpoint, options=options
                     ),
                     MappingProxyType({"default": inputs}),
@@ -134,28 +114,14 @@ class AsyncExecutor(SyncExecutor):
         options=None,
         execution,
     ):
-        """执行当前测试 Graph，并通过 Execution 的公开接口交付输出。
-
-        Args:
-            name: 注册或查找使用的名称。
-            graph: 目标 Graph 定义或其注册名称，以类型声明为准。
-            inputs: 入口数据或按端口名称组织的输入映射。
-            emit: 发布跨图事件的回调。
-            plan: 限定本次执行范围的计划，None 使用完整 Graph。
-            slot: 当前逻辑执行链使用的本地执行槽。
-            options: 当前执行的领域配置。
-            execution: 记录当前执行状态、控制限制及输出的句柄。
-
-        Raises:
-            ValueError: 参数值或字段组合不合法。
-        """
+        """执行当前测试 Graph，并通过 Execution 的公开接口交付输出。"""
 
         assert graph.frozen
         with execution.step(graph.entrypoint):
             outputs = graph.nodes[graph.entrypoint].execute(
                 {"default": inputs},
                 graph.context_factory(
-                    Context(
+                    bind_context(
                         emit, slot, checkpoint=execution.checkpoint, options=options
                     ),
                     MappingProxyType({"default": inputs}),
@@ -303,18 +269,7 @@ def test_async_executor_cleanup_precedes_terminal_status(control):
             options=None,
             execution,
         ):
-            """执行当前测试 Graph，并通过 Execution 的公开接口交付输出。
-
-            Args:
-                name: 注册或查找使用的名称。
-                graph: 目标 Graph 定义或其注册名称，以类型声明为准。
-                inputs: 入口数据或按端口名称组织的输入映射。
-                emit: 发布跨图事件的回调。
-                plan: 限定本次执行范围的计划，None 使用完整 Graph。
-                slot: 当前逻辑执行链使用的本地执行槽。
-                options: 当前执行的领域配置。
-                execution: 记录当前执行状态、控制限制及输出的句柄。
-            """
+            """执行当前测试 Graph，并通过 Execution 的公开接口交付输出。"""
 
             with execution.step(graph.entrypoint):
                 entered.set()
@@ -342,6 +297,78 @@ def test_async_executor_cleanup_precedes_terminal_status(control):
             ExecutionCancelledError if control == "cancel" else ExecutionTimeoutError
         ):
             execution.result(2)
+
+
+@pytest.mark.parametrize("control", ["drain", "cancel"])
+def test_async_executor_apublish_output_yields_loop_under_backpressure(control):
+    """异步执行器的 apublish_output 在背压时让出事件循环，并受取消约束。
+
+    Args:
+        control: drain 由流消费者读取以解除背压；cancel 在背压等待中取消 execution。
+    """
+
+    attached, blocked = ThreadEvent(), ThreadEvent()
+    ticks = 0
+    published: list[int] = []
+
+    class Backpressured(AsyncExecutor):
+        """流订阅登记后发布两项输出；output_buffer=1 时第二项进入背压等待。"""
+
+        async def execute(
+            self,
+            name,
+            graph,
+            inputs,
+            emit,
+            plan=None,
+            *,
+            slot=None,
+            options=None,
+            execution,
+        ):
+            """在背压等待期间运行计时协程，用计数证明事件循环未被阻塞。"""
+
+            async def tick() -> None:
+                """持续推进计数，直到被取消。"""
+
+                nonlocal ticks
+                while True:
+                    await asyncio.sleep(0.005)
+                    ticks += 1
+
+            ticker = asyncio.ensure_future(tick())
+            try:
+                while not attached.is_set():
+                    await asyncio.sleep(0.005)
+                for value in range(2):
+                    if value == 1:
+                        blocked.set()
+                    await execution.apublish_output(Output(value))
+                    published.append(value)
+            finally:
+                ticker.cancel()
+
+    with Runtime(plugins=(LocalRuntimePlugin(executor=Backpressured()),)) as runtime:
+        runtime.register("work", graph())
+        execution = runtime.start("work", 0, output_buffer=1)
+        stream = iter(execution)
+        attached.set()
+        assert blocked.wait(1)
+        baseline = ticks
+        deadline = time.monotonic() + 1
+        while ticks < baseline + 5 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ticks >= baseline + 5
+        assert published == [0]
+        if control == "cancel":
+            execution.cancel()
+            with pytest.raises(ExecutionCancelledError):
+                execution.result(2)
+            assert published == [0]
+        else:
+            assert tuple(stream) == (Output(0), Output(1))
+            assert execution.result(2) == (Output(0), Output(1))
+            assert published == [0, 1]
 
 
 class DiskStore:
@@ -535,29 +562,17 @@ def test_plugin_execution_factory_replaces_storage_for_direct_and_queued_work(tm
         )
 
         def setup(self, context):
-            """在插件装配阶段登记声明的能力或贡献。
-
-            Args:
-                context: 当前调用的执行或插件上下文。
-            """
+            """在插件装配阶段登记声明的能力或贡献。"""
 
             context.provide(CAP_EXECUTION_FACTORY, factory)
 
         def start(self, context):
-            """启动已经装配的组件或提交一次新的执行。
-
-            Args:
-                context: 当前调用的执行或插件上下文。
-            """
+            """启动已经装配的组件或提交一次新的执行。"""
 
             pass
 
         def stop(self, context):
-            """停止插件并释放其拥有的资源。
-
-            Args:
-                context: 当前调用的执行或插件上下文。
-            """
+            """停止插件并释放其拥有的资源。"""
 
             pass
 
@@ -662,15 +677,7 @@ def test_execution_factory_cannot_silently_change_limits():
     """验证替代执行工厂不能静默改变执行限制。"""
 
     def broken(graph, **kwargs):
-        """抛出测试指定的异常以验证失败传播与清理。
-
-        Args:
-            graph: 目标 Graph 定义或其注册名称，以类型声明为准。
-            **kwargs: 传给目标接口的关键字参数。
-
-        Returns:
-            当前测试回调收集或构造的结果。
-        """
+        """抛出测试指定的异常以验证失败传播与清理。"""
 
         return Execution(graph, limits=ExecutionLimits(max_steps=999))
 
@@ -696,21 +703,7 @@ def test_executor_cannot_return_a_second_result_channel():
             options=None,
             execution,
         ):
-            """执行当前测试 Graph，并通过 Execution 的公开接口交付输出。
-
-            Args:
-                name: 注册或查找使用的名称。
-                graph: 目标 Graph 定义或其注册名称，以类型声明为准。
-                inputs: 入口数据或按端口名称组织的输入映射。
-                emit: 发布跨图事件的回调。
-                plan: 限定本次执行范围的计划，None 使用完整 Graph。
-                slot: 当前逻辑执行链使用的本地执行槽。
-                options: 当前执行的领域配置。
-                execution: 记录当前执行状态、控制限制及输出的句柄。
-
-            Returns:
-                测试节点或替代执行器产生的返回值。
-            """
+            """执行当前测试 Graph，并通过 Execution 的公开接口交付输出。"""
 
             execution.publish_output(Output("accepted"))
             return cast(
@@ -730,15 +723,7 @@ def test_host_rejects_foreign_plan_before_calling_alternate_executor():
 
     class NeverCalled(SyncExecutor):
         def execute(self, *args, **kwargs):
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                *args: 调用协议传入的位置参数。
-                **kwargs: 传给目标接口的关键字参数。
-
-            Raises:
-                AssertionError: 内部不变量或测试契约断言不成立。
-            """
+            """宿主应在调用前拒绝外部计划；一旦被调用即判定测试失败。"""
 
             raise AssertionError("foreign plan reached executor")
 
@@ -797,15 +782,7 @@ def test_output_store_failure_preserves_previously_accepted_outputs():
             self.items.append(output)
 
     def factory(graph, **kwargs):
-        """按测试要求创建带替代存储或控制配置的执行句柄。
-
-        Args:
-            graph: 目标 Graph 定义或其注册名称，以类型声明为准。
-            **kwargs: 传给目标接口的关键字参数。
-
-        Returns:
-            注入测试指定资源与限制的 Execution。
-        """
+        """按测试要求创建带替代存储或控制配置的执行句柄。"""
 
         return Execution(graph, **kwargs, output_store=FailingStore())
 

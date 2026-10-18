@@ -50,6 +50,7 @@ Event、Context、Execution、ExecutionLimits、ExecutionStatus、Slot、SlotPoo
    不自动补边或改变节点行为；按实际入口绑定输入并校验可达性及其他 ALL 节点的完整输入。
    无计划内下游的端口是终端输出；可声明完整预期 outputs，在执行前拒绝出口不符，不过滤结果或隐式截断流程。
    outputs、cut_outputs、boundary_edges 和 describe() 提供不可变边界或独立诊断快照；静态可达不保证运行时产出。
+   ExecutionPlan 按身份比较，变更选择须构造新计划；已冻结 Graph 不接受新的策略注册表。
 8. Graph.compose() 以节点映射、显式入口和 Edge 集合快捷组装普通 Graph，不推断入口或端口；返回值保持构建状态，
    复用 add/connect 与原有冻结校验，不引入第二套图定义或执行语义。
 
@@ -71,19 +72,24 @@ Event、Context、Execution、ExecutionLimits、ExecutionStatus、Slot、SlotPoo
    Runtime 管理；注入角色或插件的底层组件默认仍由调用方管理。
 4. Runtime 不得直接实现消息持久化、队列算法、Node 执行、插件发现或领域策略。
 5. Trigger、Task、Queue、Scheduler、execution record 可以作为内部职责存在，但不要求用户逐项组装。
+6. Runtime 与运行角色关闭时先进入 CLOSING，拒绝新的根提交，排空已接受工作后进入 CLOSED；并发 close 等待同一次
+   关闭完成。`on()` 在 route 失败时撤销本次新建的消费绑定，不遗留半组合状态。
 
 ## 第六条：可替换性通过窄协议获得
 
 1. EventBus 只负责 Event 发布、订阅和投递生命周期；subscribe 返回独立、幂等的注销函数。
 2. TaskPublisher 负责工作投递，TaskConsumer 负责命名执行通道、本地并发和消费；TaskBackend 是两者的组合。
    bind 返回独立、幂等的注销函数；注册失败必须回收本次资源，注销和空闲等待必须包含在途交付的 lease 清理。
+   WorkerRole.consume 返回仅撤销本次新建消费绑定的幂等释放函数。默认内存通道只向已有消费者的通道接受 Work，
+   未消费或已退订的通道立即拒绝提交。
 3. GraphExecutor 只负责执行冻结 Graph，通过 Execution 的公开输出接口交付结果；同步返回 None，异步返回
    Awaitable[None]。执行宿主管理 start/succeed/fail，不依靠整批返回值补发输出。
 4. EventBus、任务传输和 GraphExecutor 必须可以独立替换和组合，不得合并为万能 Backend。
 5. SPI 位于高级扩展层，不进入顶层 `interlace` API。
 6. Runtime 和插件装配层只依赖公开角色或能力协议，不得使用默认内存实现的私有状态。
 7. RouterRole、WorkerRole 和 SlotProvider 按结构化协议替换，不要求继承默认实现。ExecutionFactory 可注入
-   OutputStore 与 ExecutionNotifier，默认实现与第三方实现均经同一装配路径。
+   OutputStore 与 ExecutionNotifier，默认实现与第三方实现均经同一装配路径。WorkerRole 由 ExecutionHost、
+   HookHost、PolicyHost 与 ObservationHost 组合，装配层只依赖所需的最窄协议。
 
 ## 第七条：可靠性不得夸大
 
@@ -94,8 +100,9 @@ Event、Context、Execution、ExecutionLimits、ExecutionStatus、Slot、SlotPoo
 
 ## 第八条：Context 保持狭窄
 
-1. Context 提供 `emit()`、当前逻辑执行链的 `slot`、协作式 `checkpoint()`，以及按 Node/插件命名空间隔离的
-   execution-local `state()` 与静止阶段 `on_quiescence()`。
+1. Context 提供 `emit()`、当前逻辑执行链的 `slot`、本次配置 `options`、取消查询 `cancelled`、协作式
+   `checkpoint()`，以及按 Node/插件命名空间隔离的 execution-local `state()` 与静止阶段 `on_quiescence()`
+   （仅在数据流自然静止且执行成功前调用）。
 2. 数据库、HTTP client、LLM provider、领域 Store 和 tracing 通过 Node 构造器或观察者注入。
 3. Node 不得获得 Runtime 内部工作请求、TaskBackend 或 executor。
 4. Context.options 提供当前 Graph execution 的配置，顶层只读，每次 Node firing 深复制嵌套值。
@@ -105,7 +112,8 @@ Event、Context、Execution、ExecutionLimits、ExecutionStatus、Slot、SlotPoo
 5. Graph(context_factory=...) 按图固定同步 Context 工厂，默认 Context.make；工厂每次 Node firing 接收已绑定的
    基础 Context 与 Hook enter 前的只读输入，返回本次独立 Context。领域工厂自行定义构造与 make 逻辑，
    通过 Context(parent=base) 组合基础上下文；emit、取消、Slot、state 的节点命名空间隔离、options 快照和
-   静止回调均委托给基础上下文，不复制内部执行状态。parent 与底层绑定参数互斥；核心不解释领域字段。
+   静止回调均委托给基础上下文，不复制内部执行状态。Context 公开构造只接受 parent；基础上下文由执行器通过内部
+   绑定接口创建，不作为公共构造参数；核心不解释领域字段。
    Node 与该次调用的 Hook 使用同一返回实例，工厂不得缓存或跨调用复用 Context，不得改写基础执行能力契约。
 6. 领域字段由工厂或领域节点从 typed inputs 绑定，跨节点数据通过 Output 传递；Context 实例和附加字段不自动沿 Edge、
    Event 或跨进程传播，也不因同名 state 命名空间而跨 Node 共享。目标图使用自身 context_factory。
@@ -135,7 +143,9 @@ Event、Context、Execution、ExecutionLimits、ExecutionStatus、Slot、SlotPoo
 
 ## 第十一条：Execution 控制必须默认开放
 
-1. 一次 Node firing 计为一步；`max_steps=0` 表示不限制步数。
+1. 一次 Node firing 计为一步；`max_steps=0` 表示不限制步数。`max_queued=0` 表示不限制 Graph 内全部输入端口
+   待消费 token 的总数；正数为硬上限，超过时以 QueueLimitExceededError 结束为 QUEUE_LIMITED，不阻塞生产者、
+   不丢弃 token。替代 GraphExecutor 必须遵守同一计数与终止语义。
 2. Graph execution 的 `timeout=None` 和 Node 的 `timeout=None` 表示各自不限制时长，正数统一使用秒。
 3. 取消和同步 Node timeout 是协作式语义；核心不得宣称能够安全强杀任意 Python 函数。
 4. 控制异常不得被 Node Hook 当作普通业务异常恢复。
@@ -148,13 +158,15 @@ Event、Context、Execution、ExecutionLimits、ExecutionStatus、Slot、SlotPoo
 
 ## 第十二条：扩展点保持受控
 
-1. Runtime 生命周期通过只读事件观察；观察者失败不得改变业务执行结果。
+1. Runtime 生命周期与 `observe()` 事件观察者均为只读观察；观察者失败记录后隔离，不得改变业务执行结果或
+   `emit()` 结果；route 的 Work 提交失败仍以 EventDispatchError 传播。
 2. selector contribution 必须使用命名空间 ID，只能选择当前非空端口，每个 firing 对每个端口最多消费一个 token。
 3. Graph 冻结时绑定 selector 实现快照；缺失 contribution 必须在冻结阶段失败。
 4. TaskConsumer 以 DeliveryResult 明确表达 ACK、RETRY 或 REJECT；broker lease、重投递和死信实现留给 backend。
 5. keyed join、窗口和领域状态属于扩展 Node，不进入 Engine 的固定调度语义。
 6. Engine 逐项推进 Node 输出；NodeHook.exit 逐项接收 Output，可返回 Output、Iterable[Output] 或 None。
-   Hook 不接管 Node 源迭代器；迭代阶段的控制边界、取消、超时、清理与直接调用一致。
+   Hook 不接管 Node 源迭代器；迭代阶段的控制边界、取消、超时、清理与直接调用一致。NodeHook.error 只恢复业务
+   异常，执行控制异常与 Engine 契约错误直接传播；StopGraph 携带的输出遵守停止节点的输出端口契约。
 7. NodeHook.inspect 通过相同 Hook 贡献通道同步采集实际 Node 调用边界：输入位于所有 enter 转换之后，原始输出
    位于 exit 转换之前；不得修改参数或恢复异常，返回值不参与执行，采集失败隔离。触发身份通过观测作用域关联。
 
@@ -184,9 +196,12 @@ Event、Context、Execution、ExecutionLimits、ExecutionStatus、Slot、SlotPoo
 1. 代码实现应符合 Python 惯用方式，接口设计简洁、清晰、优美；优先使用标准语言特性和窄协议，避免不必要的
    包装、重复抽象和隐式行为。
 2. 模块、类、函数、方法及行内说明使用中文；代码标识符、标准格式标题和工具指令保留其原有语法。
-3. 每个函数和方法必须提供 Google 风格文档字符串：以中文概述职责，按实际契约填写 Args、Returns、Yields、
-   Raises，说明参数、返回值或产出及需要调用方处理的异常；无对应内容时省略该节，不机械填充空段落。
-4. 成员字段（含类属性和私有实例字段）必须有中文说明，可使用字段旁注释或类文档字符串的 Attributes 节，明确
+3. 公开模块、类、函数和方法必须提供 Google 风格文档字符串：以中文概述职责，按实际契约填写 Args、Returns、
+   Yields、Raises；无对应内容时省略该节。私有函数、方法与嵌套函数至少提供一句中文概述，仅在参数、返回值或
+   异常语义无法从名称和类型看出时补充对应节。
+4. 文档字符串必须准确描述所在签名的实际类型、单位、取值与行为；不得跨函数复用与签名不符的模板化描述，
+   宁可省略也不写泛化套话。
+5. 成员字段（含类属性和私有实例字段）必须有中文说明，可使用字段旁注释或类文档字符串的 Attributes 节，明确
    含义及必要的单位、默认值、所有权或可变性边界。实现、测试和示例均遵守本条。
 
 ## 第十六条：官方服务按需启用
@@ -199,7 +214,8 @@ Event、Context、Execution、ExecutionLimits、ExecutionStatus、Slot、SlotPoo
 5. 发布版本不可变，执行记录保存当时的图结构；草稿更新比较修订号。任意 Python 构造代码不隐式转换为编辑文档。
 6. 生命周期观测不携带节点业务输入对象；服务可通过受控 NodeHook.inspect 独立快照输入、配置和原始输出，并通过
    观测作用域关联 Python logging。诊断记录按 execution、node 与 firing 隔离，允许关闭采集，不改变原对象或业务结果。
-7. 服务历史、诊断与终端输出存储不代表任务恢复、broker 持久化或跨进程 Slot 延续。
+   诊断快照按字段名片段与文本凭据形态脱敏；服务以 execution.finished 事件记录终态。
+7. 服务历史、诊断与终端输出存储不代表任务恢复、broker 持久化或跨进程 Slot 延续；执行历史按 retention 上限清理。
 8. 项目属于服务管理层，按“项目、逻辑定义、版本与运行实例”组织界面；不改变 Runtime 注册名与执行语义。
    已有定义通过数据迁移归入默认项目，移动定义时其草稿、版本与历史保持整体归属，定义标识仍全局唯一。
 
@@ -208,10 +224,10 @@ Event、Context、Execution、ExecutionLimits、ExecutionStatus、Slot、SlotPoo
 行为变更应先运行相关测试，并在可行时运行完整检查：
 
 ```bash
-uv run --with pytest pytest -q
-uv run --with mypy mypy interlace
-uv run --with ruff ruff check interlace tests examples
-uv run --with ruff ruff format --check interlace
+uv run pytest -q
+uv run --extra service mypy interlace
+uv run ruff check interlace tests examples
+uv run ruff format --check interlace tests examples
 ```
 
 文档变更还应检查本地链接、Markdown 围栏和发生变化的 Mermaid 图。

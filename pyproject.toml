@@ -17,9 +17,10 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
-requires-python = ">=3.10,<3.14"
+requires-python = ">=3.10,<3.15"
 dependencies = []
 
 [project.optional-dependencies]
@@ -40,14 +41,19 @@ build-backend = "hatchling.build"
 packages = ["interlace"]
 
 [tool.mypy]
-check_untyped_defs = true
+strict = true
 
 [tool.ruff]
 target-version = "py310"
 line-length = 88
 
 [tool.ruff.lint]
-select = ["E4", "E7", "E9", "F"]
+select = ["E4", "E7", "E9", "F", "B", "C4", "C90", "PLW2901", "RUF", "SIM", "UP"]
+# 中文文档与注释使用全角标点。
+ignore = ["RUF001", "RUF002", "RUF003"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 15
 
 [tool.hatch.build.targets.sdist]
 include = [

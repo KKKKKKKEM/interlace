@@ -5,7 +5,8 @@ from threading import Event as ThreadEvent
 
 import pytest
 
-from interlace import Context, Graph, Node, Output, Ports, Runtime
+from interlace import Graph, Node, Output, Ports, Runtime
+from interlace.engine.events import bind_context
 from interlace.spi import Work
 from interlace.adapters import memory
 from interlace.runtime import GraphWorker
@@ -77,8 +78,8 @@ def test_context_and_work_snapshot_options():
     """验证配置深复制、顶层只读和嵌套值隔离。"""
 
     original = {"parser.rules": ["strict"]}
-    first = Context(lambda event: None, options=original)
-    second = Context(lambda event: None, options=original)
+    first = bind_context(lambda event: None, None, options=original)
+    second = bind_context(lambda event: None, None, options=original)
     work = Work("read", options=original)
     original["parser.rules"].append("changed")
     first.options["parser.rules"].append("local")

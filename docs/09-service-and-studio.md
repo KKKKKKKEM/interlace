@@ -58,6 +58,9 @@ uv run --extra service python examples/service.py --port 8000
 | 移动定义 | `POST /api/definition-project`，请求包含 name 和 project_id |
 
 `/api/drafts` 和 `/api/publish` 的请求包含 `project_id`，省略时使用默认项目；不匹配现有归属时返回冲突，不隐式移动。
+新建定义、首次保存草稿和首次发布使用同一全局唯一性校验：标识已被代码图、其他草稿或版本、历史运行引用的定义
+占用时返回 HTTP 409，包括服务启动后才注册的代码图。列表与详情等读取接口不写数据库；尚未持久化归属的代码图按
+默认项目展示，在写入路径、首次运行或移动定义时才建立归属。
 RPC 的图注册名与调用参数保持独立，不需要添加项目字段。
 
 ## 接入已有 Runtime
@@ -65,17 +68,18 @@ RPC 的图注册名与调用参数保持独立，不需要添加项目字段。
 ```python
 from interlace.service import GraphService
 
-# runtime 已由应用创建并注册 Graph。
-service = GraphService(runtime, database=".interlace/studio.sqlite3")
-service.serve(host="127.0.0.1", port=8000)
+# runtime 已由应用创建并注册 Graph；离开 with 时关闭服务，不关闭 Runtime。
+with GraphService(runtime, database=".interlace/studio.sqlite3") as service:
+    service.serve(host="127.0.0.1", port=8000)
 ```
 
 服务通过 `Runtime.graphs()` 自动取得已有及之后注册的代码图，无需重复注册到服务。默认 GraphWorker 提供
 公开的 `interlace.spi.GraphCatalog`；自定义 Worker 实现同一窄协议即可接入图查看。
 
-所有权保持明确：Runtime 由应用管理，GraphService 只拥有自己的观察注册与数据库。
-`service.close()` 幂等，不关闭 Runtime、不撤销已接受的执行。ASGI 应用独立关闭时会关闭服务；将其挂载到已有
-应用时，应由父应用生命周期显式调用 `service.close()`。
+所有权保持明确：Runtime 由应用管理，GraphService 只拥有自己的观察注册、归档线程与数据库。
+`service.close()` 幂等，不关闭 Runtime、不撤销已接受的执行；关闭时等待已排队的输出归档完成。服务由创建它的
+一方关闭：`create_app()` 返回的 ASGI 应用和 `serve()` 都不在退出时关闭服务，因此独立启动与挂载到已有应用的
+行为一致；挂载时在父应用生命周期结束处调用 `service.close()`。
 
 ```python
 from fastapi import FastAPI
@@ -85,11 +89,24 @@ app.mount("/interlace", service.create_app(token="application-provided-token"))
 ```
 
 `token` 是可选 Bearer 令牌，保护 HTTP、JSON-RPC、SSE 和 OpenAPI 数据接口。工作台可在令牌对话框中输入，
-保存在当前浏览器标签页的 sessionStorage，随后放入 Authorization 请求头，不写入 URL。
-默认仅监听 `127.0.0.1`。TLS、用户体系和多用户权限由应用或反向代理承担。
+保存在当前浏览器标签页的 sessionStorage，随后放入 Authorization 请求头，不写入 URL。令牌按字节比较，
+非 ASCII 的 Authorization 头同样返回 401。
+
+每个 HTTP 与 WebSocket 请求的 Host 头必须在 `allowed_hosts` 中，否则返回 HTTP 400，用于阻止 DNS rebinding：
+攻击页面即使让 Host 与 Origin 一致（例如都指向 `evil.example`），也不在白名单中。`create_app()` 默认只接受
+`127.0.0.1`、`localhost` 与 `::1`；`serve()` 默认再加入实际监听地址。通过域名、局域网地址或反向代理访问时，
+显式传入 `allowed_hosts=["studio.example.com"]`；包含 `"*"` 表示不检查 Host，只应在前置代理已校验 Host 时使用。
+默认仅监听 `127.0.0.1`；`serve()` 监听非回环地址且没有设置令牌时记录警告。TLS、用户体系和多用户权限由应用或
+反向代理承担。
+
 单个 HTTP 请求体默认最多 1 MiB，可通过 `create_app(max_request_bytes=...)` 或
-`serve(max_request_bytes=...)` 调整；`GraphService(max_active_executions=...)` 默认把当前 Runtime 的同时活跃执行限制为
-128，达到上限返回 HTTP 429。反向代理仍应设置自己的连接数、请求大小和速率限制。
+`serve(max_request_bytes=...)` 调整；该上限同样约束 `inputs` 与 `options` 的大小。
+`GraphService(max_active_executions=...)` 默认把当前 Runtime 的同时活跃执行限制为 128，达到上限返回 HTTP 429。
+反向代理仍应设置自己的连接数、请求大小和速率限制。
+
+服务启动时先读取并编译全部已保存版本、标记中断记录、安装诊断与观察，最后才向 Runtime 注册恢复的版本。
+注册之前的任何失败都会卸载已安装的观察与诊断并关闭数据库，同一 Runtime 可以直接重新创建服务。Runtime 没有
+注销接口，若注册阶段本身失败（例如 Runtime 并发关闭），已注册的版本会保留在该 Runtime 中。
 
 ## 节点目录与编辑边界
 
@@ -148,11 +165,30 @@ curl http://127.0.0.1:8000/api/call \
 ```
 
 响应包含 execution ID、状态和有序 `outputs`，每项保留 `port` 与 `value`。
-`options`、`max_steps`、`timeout` 使用现有执行契约；零步数不限步数，缺省 timeout 不限时，时间单位为秒。
+`max_steps`、`timeout`、`max_queued` 使用现有执行契约；零步数不限步数，零队列上限不限积压，缺省 timeout 不限时，
+时间单位为秒。
+
+远程 `options` 默认关闭：非空 `options` 返回 HTTP 422，JSON-RPC 返回 `-32602`。应用通过
+`GraphService(runtime, allowed_options=["text"])` 声明允许的顶层领域命名空间，未声明的键仍被拒绝；值的大小受请求体上限
+约束，内容由领域节点自行校验。`examples/service.py` 只允许 `text` 命名空间，例如
+`"options": {"text": {"suffix": "!"}}`。
 
 输入通过 Pydantic TypeAdapter 的严格 JSON 解码验证，支持内置 JSON 类型以及 Pydantic 能描述的模型和数据类。
 输出使用明确的 JSON 序列化规则，不把不支持的对象转换为 repr 字符串。任意 Python Client、Slot 等对象不属于
 远程传输值；领域模型应提供可序列化端口类型。编码失败是传输错误，不把已成功的 Graph 改为业务失败。
+
+HTTP 只按服务声明的错误类型映射状态码，其他异常记录日志后返回不含异常消息的 500：
+
+| 状态码 | 含义 |
+| --- | --- |
+| 400 | Host 不在 `allowed_hosts` 中 |
+| 401 / 403 | 缺少有效令牌 / 浏览器跨站访问 |
+| 404 | 项目、定义、图或执行不存在 |
+| 409 | 修订号过期、定义标识冲突、Graph 执行失败（`/api/call`），或服务、Runtime 已关闭 |
+| 413 | 请求体超过上限 |
+| 422 | 请求字段、输入类型、`options` 键、节点配置或图冻结校验不合法 |
+| 429 | 活跃执行达到 `max_active_executions` |
+| 500 | 输出无法编码为 JSON（`error_type` 为 `OutputEncodingError`，响应仍包含成功的执行状态），或未预期的服务错误 |
 
 ## 长任务与 SSE
 
@@ -172,7 +208,8 @@ curl http://127.0.0.1:8000/api/executions \
 | 订阅节点观测 | `GET /api/executions/{id}/events` |
 | 订阅终端输出 | `GET /api/executions/{id}/outputs` |
 
-观测 SSE 提供 `observation` 与 `finished` 消息，支持 `Last-Event-ID` 或 `after` 游标恢复。
+观测 SSE 提供 `observation` 与 `finished` 消息，支持 `Last-Event-ID` 或 `after` 游标恢复。服务先读取执行状态再读取
+观测批次，只有在已观察到终态之后再读到空批次时才发送 `finished`，因此终态前写入的观测不会被跳过。
 输出 SSE 提供 `output`、`finished` 或 `failure` 消息，从首项重放。当前执行沿用原生异步输出迭代与背压，
 历史输出从数据库逐批读取，均不要求先构建全量结果。
 
@@ -188,8 +225,18 @@ curl http://127.0.0.1:8000/rpc \
 ```
 
 `graph.call` 接收与 HTTP 相同的命名参数并等待执行结果。标准分发由 jsonrpcserver 完成，支持请求 ID、批量请求、
-通知以及标准的解析、方法与参数错误；通知不返回 JSON-RPC 内容，对应 HTTP 204。业务执行失败返回 `-32000`，
-保留执行标识和状态。长任务管理与流式输出使用上述 HTTP/SSE 接口。
+通知以及标准的解析、方法与参数错误；通知不返回 JSON-RPC 内容，对应 HTTP 204。服务端错误码与 HTTP 状态对应：
+
+| 错误码 | 含义 | 对应 HTTP |
+| --- | --- | --- |
+| `-32602` | 参数非法、`options` 键未允许或图不存在 | 422 / 404 |
+| `-32000` | Graph 执行失败，`data` 包含执行标识、状态和 `detail` | 409 |
+| `-32001` | 输出无法编码为 JSON，执行状态保持成功 | 500 |
+| `-32002` | 活跃执行达到上限 | 429 |
+| `-32003` | 服务或 Runtime 已关闭 | 409 |
+| `-32603` | 未预期的服务错误，不包含异常消息 | 500 |
+
+长任务管理与流式输出使用上述 HTTP/SSE 接口。
 
 本版实现 HTTP/JSON、JSON-RPC 2.0 和 SSE；没有把 gRPC、Thrift 或其他协议写成已实现能力。
 
@@ -216,18 +263,26 @@ curl http://127.0.0.1:8000/rpc \
 Node.execute 中调用 logger.info。同步、async 节点和生成器迭代期间均支持；自建线程、队列日志监听器或进程边界
 需要应用显式传递观测上下文。print 不属于此接口，节点结束后的后台任务日志不会写入已结束的 firing。
 
-参数快照按字段名隐藏 password、token、authorization、api_key、cookie 等常见凭据；自由文本日志和异常消息由应用
-自行控制。单条快照、日志消息或堆栈保留最多 65,536 个字符，过大快照和无法编码的值有明确标记。旧运行不会补造
-未采集的参数或日志。替代执行器需支持 Hook 安装、inspect 与观测作用域才能提供同等诊断粒度；仅提供生命周期的
-实现可关闭 diagnostics 后接入。
+参数、配置与输出快照按字段名片段隐藏凭据：字段名不区分大小写地包含 secret、token、password、passwd、key、
+authorization、cookie 或 credential 时整体替换为 `[REDACTED]`。快照中的字符串、日志消息、异常消息、堆栈、生命周期
+事件属性和执行错误还会隐藏 URL userinfo（`scheme://user:pass@` 中的凭据）、`Bearer`/`Basic` 凭据，以及
+`password=...`、`api_key: ...` 这类凭据名后的值；自由文本不单独匹配 key，避免把 `KeyError` 等名称当成凭据。
+脱敏只依据形态识别，应用仍不应在日志中写入凭据。单条快照、日志消息或堆栈保留最多 65,536 个字符，过大快照和
+无法编码的值有明确标记。旧运行不会补造未采集的参数或日志。替代执行器需支持 Hook 安装、inspect 与观测作用域
+才能提供同等诊断粒度；仅提供生命周期的实现可关闭 diagnostics 后接入。
 
 服务启动后的直接调用和队列执行都可记录；服务接入前已经结束的执行只有 Runtime 仍保留的状态，没有补造历史
 节点事件。每次执行保存当时的图结构，防止代码图在下一次部署改变后误画旧运行。
 
-SQLite 保存草稿、发布版本、运行元数据、启用诊断后采集的参数、节点输出和日志，以及可编码的终端输出。终端输出在执行终止后
-通过公开迭代接口逐项归档；进程在归档前退出时，不能保证保留尚未归档的输出。历史保留在指定数据库中，当前
-运行列表在全局、项目或定义范围内分别读取最近五百条，先筛选范围再限制数量；观测和输出接口分批读取。
-生产应用应按自己的数据保留策略管理数据库文件。
+Worker 在写入 Execution 终态之前发布 `execution.finished`，服务因此直接按该事件的 status 与 error_type 记录终态，
+不读取此刻可能仍为 running 的句柄状态。终端输出由服务的归档线程在执行真正终止后通过公开迭代接口逐项保存，
+随后写入带错误消息的最终快照；`service.close()` 会等待已排队的归档，进程在归档前退出时不能保证保留尚未归档的输出。
+
+SQLite 保存草稿、发布版本、运行元数据、启用诊断后采集的参数、节点输出和日志，以及可编码的终端输出。没有执行
+标识的 Runtime 事件没有读取入口，不写入数据库。`GraphService(retention=1000)` 默认最多保留 1,000 条执行记录：新执行
+写入后，超出数量的最早已结束执行连同其观测、诊断和终端输出一起删除；`retention=None` 关闭清理。当前运行列表在
+全局、项目或定义范围内分别读取最近五百条，先筛选范围再限制数量；观测和输出接口分批读取。数据库结构版本记录在
+SQLite `user_version` 中，旧版本在启动时逐级迁移，高于当前代码支持版本的数据库会被拒绝打开。
 
 服务重启后把历史在途记录标记为中断，不恢复任务，不提供 broker ack、重试、exactly-once 或跨进程 Slot 连续性。
 跨图事件的业务关联键仍属于领域 payload；当前工作台不推断远程调用链。
@@ -239,7 +294,7 @@ uv sync --extra service
 uv run --extra service pytest -q
 uv run --extra service mypy interlace
 uv run --extra service ruff check interlace tests examples
-uv run --extra service ruff format --check interlace
+uv run --extra service ruff format --check interlace tests examples
 ```
 
 工作台源码位于 `web/`，使用 React Flow 的图交互与 Lucide 图标。修改界面后在该目录运行：

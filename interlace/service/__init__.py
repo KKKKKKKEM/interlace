@@ -4,4 +4,4 @@ from .catalog import NodeCatalog
 from .models import GraphDefinition, RunRequest
 from .service import GraphService
 
-__all__ = ["GraphService", "NodeCatalog", "GraphDefinition", "RunRequest"]
+__all__ = ["GraphDefinition", "GraphService", "NodeCatalog", "RunRequest"]

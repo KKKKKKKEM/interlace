@@ -16,6 +16,7 @@ from interlace import Graph, Node, Output, Ports, Runtime
 from interlace.engine.hooks import HookPhase, NodeCall, NodeHook, StopGraph
 from interlace.engine.observation import current_node_event
 from interlace.service import GraphService
+from interlace.service.diagnostics import redact_text, snapshot_value
 
 # 通过传播到根处理器的标准日志验证采集，测试不替换全局日志工厂。
 _LOGGER = logging.getLogger("interlace.test.node")
@@ -367,4 +368,68 @@ def test_diagnostics_batch_output_records_and_flush_before_node_finish(
         assert len(outputs) == 130
         assert outputs[-1]["id"] < finished["id"]
         assert calls.count(64) == 2
+        service.close()
+
+
+def test_redaction_matches_key_fragments_and_credentials_in_text() -> None:
+    """字段名按片段匹配，字符串中的 URL userinfo、认证头和凭据值被隐藏。"""
+
+    assert snapshot_value(
+        {
+            "db_password": "p",
+            "X-Api-Key": "k",
+            "sessionCookie": "c",
+            "Credentials": {"user": "u"},
+            "name": "postgres://user:pw@db:5432/app",
+        }
+    ) == {
+        "db_password": "[REDACTED]",
+        "X-Api-Key": "[REDACTED]",
+        "sessionCookie": "[REDACTED]",
+        "Credentials": "[REDACTED]",
+        "name": "postgres://[REDACTED]@db:5432/app",
+    }
+    assert (
+        redact_text("https://example.com/x?sslmode=require&api_key=abc&page=2")
+        == "https://example.com/x?sslmode=require&api_key=[REDACTED]&page=2"
+    )
+    assert "abc.def" not in redact_text("Authorization: Bearer abc.def")
+    assert redact_text('{"refresh_token": "xyz"}') == '{"refresh_token": "[REDACTED]"}'
+    assert redact_text("KeyError: 'missing'") == "KeyError: 'missing'"
+
+
+def test_logs_exceptions_and_execution_errors_are_redacted() -> None:
+    """日志消息、节点异常、生命周期堆栈与执行错误都不保存凭据原文。"""
+
+    class Leaky(Node):
+        """记录带凭据的连接串后失败。"""
+
+        def execute(self, inputs: Any, context: Any) -> Output:
+            """输出含凭据的日志并抛出含口令的异常。
+
+            Args:
+                inputs: 忽略的入口值。
+                context: 当前执行上下文。
+
+            Raises:
+                ValueError: 消息包含 password=hunter2。
+            """
+
+            del inputs, context
+            _LOGGER.warning("连接 %s", "https://user:pw-secret@example.com/db")
+            raise ValueError("login failed password=hunter2")
+
+    with Runtime() as runtime:
+        runtime.register("leaky", Graph(entrypoint="leaky").add(leaky=Leaky()))
+        service = GraphService(runtime)
+        handle = runtime.start("leaky", None)
+        with pytest.raises(Exception, match="hunter2"):
+            handle.result()
+        runtime.wait_idle()
+        records = service.store.events(handle.id)
+        stored = str(records) + str(service.execution(handle.id))
+        assert "pw-secret" not in stored and "hunter2" not in stored
+        assert any(item["kind"] == "node.log" for item in records)
+        assert any(item["kind"] == "node.exception" for item in records)
+        assert "password=[REDACTED]" in service.execution(handle.id)["error"]
         service.close()

@@ -21,14 +21,16 @@ class RuntimeEventKind(str, enum.Enum):
     """只读生命周期事件的固定类型。
 
     Attributes:
-        EXECUTION_STARTED: 执行开始事件。
-        EXECUTION_FINISHED: 执行终止事件。
-        NODE_STARTED: 节点触发开始事件。
-        NODE_FINISHED: 节点触发结束事件。
+        EXECUTION_STARTED: 执行宿主开始一次 execution。
+        EXECUTION_FINISHED: 执行器结束后发布，status 为即将写入的终态；观察者收到时
+            `Execution.status` 可能仍为 RUNNING。
+        NODE_STARTED: 一次 Node firing 计步后、调用 Context 工厂前发布。
+        NODE_FINISHED: 一次 Node firing 结束后发布，status 为 succeeded 或 failed。
         OUTPUT_ROUTED: 输出通过校验后的端口传播记录，不携带业务值。
-        EVENT_PUBLISHED: 领域事件已发布事件。
-        WORK_SUBMITTED: 工作已提交事件。
-        WORK_FINISHED: 工作交付结束事件。
+        EVENT_PUBLISHED: Router 开始向 EventBus 分发领域事件，先于该事件引起的
+            WORK_SUBMITTED；分发失败由 emit 抛出 EventDispatchError，不撤回本记录。
+        WORK_SUBMITTED: route 已把事件转换的 Work 交给任务发布端。
+        WORK_FINISHED: 一项 Work 交付结束。
     """
 
     EXECUTION_STARTED = "execution.started"
@@ -46,16 +48,16 @@ class RuntimeEvent:
     """不携带业务输入输出的轻量生命周期事实。
 
     Attributes:
-        kind: 生命周期事件的类型。
-        graph: 关联的 Graph 定义或注册名称。
-        execution_id: 关联 Execution 的标识。
-        node: 关联的节点实例或 Graph 内节点 ID。
-        work_id: 关联 Work 的标识。
-        event_type: 关联领域事件的类型。
-        status: 观测到的执行状态。
-        error_type: 观测到的异常类型名称，不携带业务异常对象。
-        attributes: 生命周期事件的只读附加属性。
-        occurred_at: 观测事件创建的 UTC 时间。
+        kind: 生命周期事件类型。
+        graph: 关联 Graph 的注册名称；与 Graph 无关时为 None。
+        execution_id: 关联 Execution 的标识；与执行无关时为 None。
+        node: 关联的节点 ID；与节点无关时为 None。
+        work_id: 关联 Work 的标识；与 Work 无关时为 None。
+        event_type: 关联领域事件的类型；与事件无关时为 None。
+        status: 结束类事件记录的状态字符串，其他事件为 None。
+        error_type: 失败时的异常类型名称，不携带异常对象。
+        attributes: 事件附加属性的只读快照。
+        occurred_at: 事件创建的 UTC 时间。
     """
 
     kind: RuntimeEventKind
@@ -70,10 +72,10 @@ class RuntimeEvent:
     occurred_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     def __post_init__(self) -> None:
-        """校验构造字段并固定需要保持不变的数据。
+        """把 attributes 冻结为只读快照。
 
         Raises:
-            TypeError: 参数类型或接口实现不符合当前契约。
+            TypeError: kind 不是 RuntimeEventKind。
         """
 
         if not isinstance(self.kind, RuntimeEventKind):
@@ -82,12 +84,15 @@ class RuntimeEvent:
 
 
 class RuntimeObserver(Protocol):
-    def __call__(self, event: RuntimeEvent) -> None:
-        """观察事件；返回值被忽略。
+    """接收只读生命周期事件的回调协议。
 
-        Args:
-            event: 需要发布、观察或处理的事件。
-        """
+    ObservationHub 在发布事件的线程上同步、按注册顺序调用观察者；Node 与输出事件
+    位于执行该 Graph 的线程。观察者阻塞会直接延迟业务执行，耗时处理应自行转交队列；
+    抛出的 Exception 被记录并忽略。
+    """
+
+    def __call__(self, event: RuntimeEvent) -> None:
+        """处理一项生命周期事件；返回值被忽略。"""
 
 
 # 仅携带观测身份；事件循环提交会复制当前上下文，不携带领域数据。
@@ -128,20 +133,15 @@ class ObserverHandle:
     """一项生命周期观察注册的卸载句柄。
 
     Attributes:
-        __slots__: 实例允许保存的字段名称，限制动态增加属性。
-        _hub: 当前观察者注册所属的分发中心。
-        _registration_id: 当前句柄独立拥有的观察注册编号。
+        __slots__: 固定实例字段。
+        _hub: 注册所属的分发中心。
+        _registration_id: 本句柄独立拥有的注册编号。
     """
 
     __slots__ = ("_hub", "_registration_id")
 
     def __init__(self, hub: ObservationHub, registration_id: int) -> None:
-        """绑定独立观察注册及其所属分发中心，供后续卸载。
-
-        Args:
-            hub: 分发只读事件的观察中心。
-            registration_id: 当前句柄负责卸载的唯一注册编号。
-        """
+        """绑定注册编号及其分发中心。"""
 
         self._hub = hub
         self._registration_id = registration_id
@@ -156,23 +156,19 @@ class CompositeObserverHandle:
     """统一卸载多个观察者注册的组合句柄。
 
     Attributes:
-        __slots__: 实例允许保存的字段名称，限制动态增加属性。
-        _handles: 需要统一卸载的观察句柄集合。
+        __slots__: 固定实例字段。
+        _handles: 需要统一卸载的观察句柄。
     """
 
     __slots__ = ("_handles",)
 
     def __init__(self, handles: tuple[ObserverHandle, ...]) -> None:
-        """保存需要统一卸载的观察句柄集合。
-
-        Args:
-            handles: 需要统一卸载的观察者句柄。
-        """
+        """保存需要统一卸载的观察句柄。"""
 
         self._handles = handles
 
     def detach(self) -> None:
-        """解除当前句柄对应的注册关系。"""
+        """依次卸载全部注册；每个句柄自身幂等。"""
 
         for handle in self._handles:
             handle.detach()
@@ -182,29 +178,29 @@ class ObservationHub:
     """线程安全地分发只读事件；观察者失败不会影响业务执行。
 
     Attributes:
-        _observers: 按注册顺序排列的注册编号与运行时观察者快照。
-        _counter: 分配独立注册编号的单调递增计数器。
-        _lock: 保护当前组件共享状态的进程内互斥锁。
+        _observers: 注册编号与观察者的不可变快照，按注册顺序排列。
+        _counter: 分配注册编号的单调计数器。
+        _lock: 保护快照替换的锁；分发时不持有。
     """
 
     def __init__(self) -> None:
-        """创建线程安全的观察者快照与注册锁。"""
+        """创建空的观察者快照。"""
 
         self._observers: tuple[tuple[int, RuntimeObserver], ...] = ()
         self._counter = itertools.count()
         self._lock = RLock()
 
     def attach(self, observer: RuntimeObserver) -> ObserverHandle:
-        """注册只读观察者并返回独立卸载句柄。
+        """注册只读观察者并返回独立卸载句柄；同一回调可注册多次。
 
         Args:
-            observer: 接收只读生命周期事件的观察者。
+            observer: 接收 RuntimeEvent 的可调用对象。
 
         Returns:
-            用于卸载本次注册的句柄。
+            只卸载本次注册的句柄。
 
         Raises:
-            TypeError: 参数类型或接口实现不符合当前契约。
+            TypeError: observer 不可调用。
         """
 
         if not callable(observer):
@@ -215,10 +211,12 @@ class ObservationHub:
         return ObserverHandle(self, registration_id)
 
     def publish(self, event: RuntimeEvent) -> None:
-        """分发只读生命周期事件，记录观察者错误但不改变业务结果。
+        """在当前线程按注册顺序同步调用全部观察者。
+
+        使用调用开始时的注册快照；观察者抛出的 Exception 被记录后继续调用其余观察者。
 
         Args:
-            event: 需要发布、观察或处理的事件。
+            event: 需要分发的生命周期事件。
         """
 
         with self._lock:
@@ -233,11 +231,7 @@ class ObservationHub:
                 )
 
     def _detach(self, registration_id: int) -> None:
-        """从当前注册集合中移除指定注册项。
-
-        Args:
-            registration_id: 需要移除的唯一观察注册编号。
-        """
+        """移除指定注册；编号不存在时无作用。"""
 
         with self._lock:
             self._observers = tuple(

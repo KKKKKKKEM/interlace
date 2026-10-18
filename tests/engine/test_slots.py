@@ -7,7 +7,7 @@ from threading import Event as ThreadEvent, Thread
 import pytest
 
 import interlace
-from interlace import SlotPool
+from interlace import Slot, SlotPool
 from interlace.spi import Delivery, SlotLease, Work
 
 
@@ -43,9 +43,8 @@ def test_pool_acquisition_reference_ownership_and_exhaustion() -> None:
     for operation in (lease.retain, lease.release, lambda: lease.slot):
         with pytest.raises(RuntimeError, match="released"):
             operation()
-    with pytest.raises(RuntimeError, match="released"):
-        with lease.execution():
-            pass
+    with pytest.raises(RuntimeError, match="released"), lease.execution():
+        pass
     next_lease = pool.acquire(0)
     assert next_lease.slot is slot
     next_lease.release()
@@ -74,21 +73,19 @@ def test_slot_resources_cannot_cross_serialization_boundary() -> None:
 
 
 def test_execution_keeps_slot_alive_until_exception_unwinds() -> None:
-    """验证异常展开完成前执行仍持有 Slot。
-
-    Raises:
-        ValueError: 参数值或字段组合不合法。
-    """
+    """验证异常展开完成前执行仍持有 Slot。"""
 
     pool = SlotPool(1)
     lease = pool.acquire()
     slot = lease.slot
-    with pytest.raises(ValueError, match="business failure"):
-        with lease.execution() as active:
-            assert active is slot
-            lease.release()
-            assert pool.available == 0
-            raise ValueError("business failure")
+    with (
+        pytest.raises(ValueError, match="business failure"),
+        lease.execution() as active,
+    ):
+        assert active is slot
+        lease.release()
+        assert pool.available == 0
+        raise ValueError("business failure")
     assert pool.available == 1
     pool.close()
 
@@ -120,6 +117,42 @@ def test_lease_serializes_executions_across_threads() -> None:
     pool.close()
 
 
+def test_slot_compares_and_hashes_by_identity() -> None:
+    """内容相同的 Slot 仍是不同资源，可作为集合成员与字典键。"""
+
+    first, second = Slot({"client": 1}, id="first"), Slot({"client": 1}, id="second")
+    assert first == first
+    assert first != second
+    assert dict(first) == dict(second)
+    assert len({first, second, first}) == 2
+    assert {first: "a", second: "b"}[second] == "b"
+
+
+def test_duplicate_subscriptions_are_detached_independently() -> None:
+    """同一函数的两次订阅各收通知，各自注销函数只移除对应那一次且幂等。"""
+
+    pool = SlotPool(1)
+    notifications = []
+
+    def listener() -> None:
+        """记录一次归还通知。"""
+
+        notifications.append(pool.available)
+
+    detach_first = pool.subscribe_available(listener)
+    detach_second = pool.subscribe_available(listener)
+    pool.acquire().release()
+    assert notifications == [1, 1]
+    detach_first()
+    detach_first()
+    pool.acquire().release()
+    assert notifications == [1, 1, 1]
+    detach_second()
+    pool.acquire().release()
+    assert notifications == [1, 1, 1]
+    pool.close()
+
+
 def test_release_notifies_all_subscribers_despite_failure_and_allows_detach(
     caplog,
 ) -> None:
@@ -133,11 +166,7 @@ def test_release_notifies_all_subscribers_despite_failure_and_allows_detach(
     notifications = []
 
     def broken():
-        """抛出测试指定的异常以验证失败传播与清理。
-
-        Raises:
-            ValueError: 参数值或字段组合不合法。
-        """
+        """抛出测试指定的异常以验证失败传播与清理。"""
 
         raise ValueError("listener failed")
 

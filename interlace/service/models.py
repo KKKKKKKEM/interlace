@@ -121,9 +121,10 @@ class RunRequest(Model):
     Attributes:
         graph: 当前 Runtime 中的注册名称，发布图包含版本后缀。
         inputs: 按入口端口组织的 JSON 数据。
-        options: 本次执行独立使用的领域配置。
+        options: 本次执行独立使用的领域配置；GraphService 只接受 allowed_options 中的顶层键。
         max_steps: 节点触发上限，零表示不限。
         timeout: Graph 执行时限，单位秒，None 表示不限。
+        max_queued: Graph 内待消费输入 token 总数上限，零表示不限。
     """
 
     graph: str = Field(min_length=1)
@@ -131,3 +132,4 @@ class RunRequest(Model):
     options: dict[str, Any] = Field(default_factory=dict)
     max_steps: int = Field(default=0, ge=0, strict=True)
     timeout: float | None = Field(default=None, gt=0, strict=True)
+    max_queued: int = Field(default=0, ge=0, strict=True)

@@ -9,22 +9,22 @@ class Counter(Node):
     """通过回边递增计数并在达到边界时结束的示例节点。
 
     Attributes:
-        input_ports: 节点声明的输入端口及其类型。
-        output_ports: 节点声明的输出端口及其类型。
+        input_ports: 输入端口，value 为当前计数，可来自入口或 again 回边。
+        output_ports: 输出端口，again 继续循环，done 输出最终计数。
     """
 
     input_ports = Ports(value=int)
     output_ports = Ports(again=int, done=int)
 
     def execute(self, inputs, context):
-        """根据当前输入执行节点行为，并返回声明端口上的输出。
+        """value 小于 3 时加一并经 again 回送，否则从 done 输出。
 
         Args:
-            inputs: 入口数据或按端口名称组织的输入映射。
-            context: 当前调用的执行或插件上下文。
+            inputs: 按输入端口名索引的值，value 为当前计数。
+            context: Node 执行上下文；本示例不使用。
 
         Returns:
-            未达到边界时返回继续循环的 Output，否则返回终端结果 Output。
+            未达到边界时返回 again 端口上的递增值，否则返回 done 端口上的最终计数。
         """
 
         del context
@@ -38,10 +38,10 @@ def run(value: int = 0) -> int:
     """沿自环递增，直到 Counter 从 done 端口退出。
 
     Args:
-        value: 当前操作处理的输入值。
+        value: 循环起始计数。
 
     Returns:
-        当前记录携带的数据值。
+        done 端口输出的最终计数；起始值小于 3 时为 3，否则为起始值本身。
     """
 
     graph = Graph.compose(

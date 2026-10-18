@@ -54,11 +54,11 @@ class TextNode(Node):
         self.config = config.model_copy(deep=True)
 
     async def execute(self, inputs: Mapping[str, Any], context: Context) -> Output:
-        """等待后添加前缀并转换为大写。
+        """等待后添加前缀、转换为大写，并追加本次执行配置的可选后缀。
 
         Args:
             inputs: text 端口的输入文本。
-            context: 本次节点执行上下文。
+            context: 本次节点执行上下文；options["text"]["suffix"] 为可选后缀。
 
         Returns:
             text 端口上的转换结果。
@@ -68,7 +68,8 @@ class TextNode(Node):
         await asyncio.sleep(self.config.delay)
         context.checkpoint()
         _LOGGER.info("文本处理完成")
-        return Output(self.config.prefix + inputs["text"].upper(), "text")
+        suffix = context.options.get("text", {}).get("suffix", "")
+        return Output(self.config.prefix + inputs["text"].upper() + suffix, "text")
 
 
 class SplitNode(Node):
@@ -117,11 +118,14 @@ def main() -> None:
     graph.connect("transform", "finish", source_port="text", target_port="text")
     with Runtime() as runtime:
         runtime.register("text.pipeline", graph)
-        service = GraphService(runtime, nodes=catalog, database=args.database)
-        try:
+        # 远程请求只能携带 text 命名空间的执行配置，其他 options 键返回 422。
+        with GraphService(
+            runtime,
+            nodes=catalog,
+            database=args.database,
+            allowed_options=["text"],
+        ) as service:
             service.serve(port=args.port)
-        finally:
-            service.close()
 
 
 if __name__ == "__main__":

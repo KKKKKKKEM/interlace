@@ -86,7 +86,7 @@ test("节点详情按触发次数显示参数、输出和日志", async ({ page 
     .getByText("领域配置", { exact: true })
     .locator("..")
     .locator("textarea")
-    .fill(JSON.stringify({ test: { tag: "node-details" } }));
+    .fill(JSON.stringify({ text: { tag: "node-details" } }));
   await page.getByRole("button", { name: "开始运行" }).click();
   await expect(page.locator(".active-run")).toContainText("已完成");
   await page.locator(".panel-body tbody tr").nth(1).click();

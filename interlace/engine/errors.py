@@ -30,10 +30,12 @@ class UnknownGraphError(InterlaceRuntimeError):
 class ExecutionError(InterlaceRuntimeError):
     """一次 Graph 或 Node 执行失败。
 
+    异常实例可以 pickle 往返；附加字段随实例状态一起恢复。
+
     Attributes:
-        graph: 关联的 Graph 定义或注册名称。
-        node: 关联的节点实例或 Graph 内节点 ID。
-        event: 与当前异常或执行相关的事件。
+        graph: 失败的 Graph 注册名或定义名；未知时为 None。
+        node: 失败的 Node ID；不对应具体节点时为 None。
+        event: 触发本次跨图执行的领域事件；直接调用时为 None。
     """
 
     def __init__(
@@ -48,9 +50,9 @@ class ExecutionError(InterlaceRuntimeError):
 
         Args:
             message: 面向调用方的错误说明。
-            graph: 失败的 Graph 注册名或定义名。
-            node: 失败的 Node ID。
-            event: 触发跨图执行的领域事件。
+            graph: 失败的 Graph 注册名或定义名；未知时为 None。
+            node: 失败的 Node ID；不对应具体节点时为 None。
+            event: 触发跨图执行的领域事件；直接调用时为 None。
         """
 
         super().__init__(message)
@@ -79,12 +81,20 @@ class StepLimitExceededError(ExecutionControlError):
     """Graph 尝试执行超过允许步数的 Node firing。"""
 
 
+class QueueLimitExceededError(ExecutionControlError):
+    """Graph 内等待消费的输入 token 总数超过允许上限。"""
+
+
 class HookExecutionError(ExecutionError):
     """Hook 返回非法数据、修改调用身份或在非法阶段发出信号。"""
 
 
 class IncompleteInputsError(ExecutionError):
     """Graph 静止时仍存在无法满足输入策略的数据。"""
+
+
+class PolicySelectionError(ExecutionError):
+    """输入选择器返回了违反 selector 契约的结果，或在选择时抛出异常。"""
 
 
 class InvalidOutputError(ExecutionError, TypeError):
@@ -98,9 +108,11 @@ class PortValueTypeError(ExecutionError, TypeError):
 class EventDispatchError(InterlaceRuntimeError):
     """事件订阅者或目标 Graph 执行失败。
 
+    异常实例可以 pickle 往返，事件与原始异常需要各自可 pickle。
+
     Attributes:
-        event: 与当前异常或执行相关的事件。
-        cause: 保留的原始异常实例。
+        event: 投递失败的领域事件。
+        cause: handler 或目标 Graph 抛出的原始异常。
     """
 
     def __init__(self, event: object, cause: BaseException) -> None:
@@ -114,6 +126,13 @@ class EventDispatchError(InterlaceRuntimeError):
         super().__init__(f"failed to dispatch event: {cause}")
         self.event = event
         self.cause = cause
+
+    def __reduce__(
+        self,
+    ) -> tuple[type[EventDispatchError], tuple[object, BaseException]]:
+        """按构造参数重建异常，避免默认实现只传入格式化后的消息。"""
+
+        return type(self), (self.event, self.cause)
 
 
 class RuntimeClosedError(InterlaceRuntimeError):

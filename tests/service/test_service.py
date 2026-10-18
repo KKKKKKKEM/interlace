@@ -20,6 +20,9 @@ from interlace import Graph, Node, Output, Ports, Runtime
 from interlace.service import GraphService, NodeCatalog, RunRequest
 from interlace.service.models import DraftRequest, GraphDefinition
 
+# 默认 Host 白名单只接受本机名称，测试客户端使用 localhost 而非 testserver。
+LOCAL = "http://localhost"
+
 
 class Config(BaseModel):
     """测试节点配置。
@@ -151,8 +154,10 @@ def api() -> Iterator[tuple[TestClient, GraphService]]:
 
     with Runtime() as runtime:
         runtime.register("code", Graph(entrypoint="upper").add(upper=Upper(Config())))
-        service = GraphService(runtime, nodes=catalog())
-        with TestClient(service.create_app()) as client:
+        with (
+            GraphService(runtime, nodes=catalog()) as service,
+            TestClient(service.create_app(), base_url=LOCAL) as client,
+        ):
             yield client, service
 
 
@@ -344,28 +349,30 @@ def test_cancel_timeout_and_independent_subscription(api: Any) -> None:
 def test_service_auth_and_cross_site_writes() -> None:
     """令牌保护所有 API，浏览器跨站调用被明确拒绝。"""
 
-    with Runtime() as runtime:
-        service = GraphService(runtime)
-        with TestClient(service.create_app(token="secret")) as client:
-            assert client.get("/api/graphs").status_code == 401
-            assert (
-                client.get(
-                    "/api/graphs", headers={"Authorization": "Bearer secret"}
-                ).status_code
-                == 200
-            )
-            assert (
-                client.post(
-                    "/api/drafts",
-                    json={},
-                    headers={
-                        "Authorization": "Bearer secret",
-                        "Origin": "https://other.example",
-                    },
-                ).status_code
-                == 403
-            )
-            assert client.get("/openapi.json").status_code == 401
+    with (
+        Runtime() as runtime,
+        GraphService(runtime) as service,
+        TestClient(service.create_app(token="secret"), base_url=LOCAL) as client,
+    ):
+        assert client.get("/api/graphs").status_code == 401
+        assert (
+            client.get(
+                "/api/graphs", headers={"Authorization": "Bearer secret"}
+            ).status_code
+            == 200
+        )
+        assert (
+            client.post(
+                "/api/drafts",
+                json={},
+                headers={
+                    "Authorization": "Bearer secret",
+                    "Origin": "https://other.example",
+                },
+            ).status_code
+            == 403
+        )
+        assert client.get("/openapi.json").status_code == 401
 
 
 def test_service_limits_request_body_and_active_executions() -> None:
@@ -373,8 +380,12 @@ def test_service_limits_request_body_and_active_executions() -> None:
 
     with Runtime() as runtime:
         runtime.register("wait", Graph(entrypoint="wait").add(wait=Waiting()))
-        service = GraphService(runtime, max_active_executions=1)
-        with TestClient(service.create_app(max_request_bytes=256)) as client:
+        with (
+            GraphService(runtime, max_active_executions=1) as service,
+            TestClient(
+                service.create_app(max_request_bytes=256), base_url=LOCAL
+            ) as client,
+        ):
             oversized = client.post(
                 "/api/call",
                 json={
@@ -429,7 +440,7 @@ def test_published_definitions_and_history_survive_restart(tmp_path: Path) -> No
         assert service.store.events(handle.id)
         assert service.store.outputs(handle.id) == [{"port": "text", "value": "OLD"}]
         assert service.execution(handle.id)["graph_snapshot"]["entrypoint"] == "a"
-        with TestClient(service.create_app()) as client:
+        with TestClient(service.create_app(), base_url=LOCAL) as client:
             replay = client.get(f"/api/executions/{handle.id}/outputs").text
             assert '"value": "OLD"' in replay
             assert "event: finished" in replay
@@ -455,6 +466,22 @@ def test_service_close_detaches_without_closing_runtime() -> None:
         service.close()
         service.close()
         assert runtime.run("code", "still usable")[0].value == "STILL USABLE"
+
+
+def test_app_shutdown_leaves_service_to_its_creator() -> None:
+    """ASGI 应用关闭不关闭服务；同一服务可再次创建应用，由创建者关闭后才拒绝执行。"""
+
+    request = {"graph": "code", "inputs": {"text": "again"}}
+    with Runtime() as runtime:
+        runtime.register("code", Graph(entrypoint="upper").add(upper=Upper(Config())))
+        with GraphService(runtime) as service:
+            with TestClient(service.create_app(), base_url=LOCAL) as client:
+                assert client.get("/api/graphs").status_code == 200
+            with TestClient(service.create_app(), base_url=LOCAL) as client:
+                result = client.post("/api/call", json=request)
+                assert result.json()["outputs"] == [{"port": "text", "value": "AGAIN"}]
+        with TestClient(service.create_app(), base_url=LOCAL) as client:
+            assert client.post("/api/call", json=request).status_code == 409
 
 
 def test_unknown_factory_and_configuration_fail_without_registration(api: Any) -> None:
@@ -519,7 +546,7 @@ def test_mounted_service_keeps_authentication() -> None:
         service = GraphService(runtime)
         parent = FastAPI()
         parent.mount("/studio", service.create_app(token="secret"))
-        with TestClient(parent) as client:
+        with TestClient(parent, base_url=LOCAL) as client:
             assert client.get("/studio/api/graphs").status_code == 401
             assert (
                 client.get(

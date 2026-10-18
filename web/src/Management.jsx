@@ -3,6 +3,7 @@ import React, {
   useCallback,
   useContext,
   useEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -40,6 +41,14 @@ import {
 } from "lucide-react";
 import { Dialog, Tool, RunStatus, dateText } from "./ui.jsx";
 import ThemePicker from "./ThemePicker.jsx";
+import {
+  ApiContext,
+  createApi,
+  createStream,
+  readToken,
+  saveToken,
+  useApi,
+} from "./api.js";
 
 const ServiceContext = createContext(null);
 const WorkbenchView = React.lazy(() => import("./WorkbenchView.jsx"));
@@ -54,14 +63,14 @@ const projectPath = (id) => `/projects/${encodeURIComponent(id)}`;
 const definitionPath = (id, name) =>
   `${projectPath(id)}/definitions/${encodeURIComponent(name)}`;
 
-/** 共享认证、项目导航和服务调用状态。 */
+/** 共享项目导航状态。 */
 function useService() {
   return useContext(ServiceContext);
 }
 
 /** 读取路由资源，丢弃旧路由的迟到响应，并提供显式重试。 */
 function useResource(path) {
-  const { api } = useService();
+  const { api } = useApi();
   const [data, setData] = useState(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
@@ -101,9 +110,7 @@ function useResource(path) {
 
 /** 管理后台统一使用项目侧栏和可返回的层级导航。 */
 export function Layout() {
-  const [token, setTokenValue] = useState(
-    sessionStorage.getItem("interlace.token") || "",
-  );
+  const [token, setToken] = useState(readToken);
   const [tokenInput, setTokenInput] = useState(token);
   const [login, setLogin] = useState(false);
   const [projects, setProjects] = useState([]);
@@ -124,36 +131,14 @@ export function Layout() {
   );
   const compact = workbench && !expanded;
   const navigate = useNavigate();
-  const setToken = useCallback((value) => {
-    sessionStorage.setItem("interlace.token", value);
-    setTokenValue(value);
-  }, []);
-  const api = useCallback(
-    async (path, body, method) => {
-      const response = await fetch(`./api/${path}`, {
-        method: method || (body === undefined ? "GET" : "POST"),
-        headers: {
-          "Content-Type": "application/json",
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        },
-        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-      });
-      if (response.status === 401) setLogin(true);
-      const value = await response.json();
-      if (!response.ok) {
-        const detail = value.detail || value;
-        throw new Error(
-          Array.isArray(detail)
-            ? detail.map((item) => item.msg).join("；")
-            : typeof detail === "string"
-              ? detail
-              : JSON.stringify(detail),
-        );
-      }
-      return value;
-    },
+  const service = useMemo(
+    () => ({
+      api: createApi(token, () => setLogin(true)),
+      stream: createStream(token),
+    }),
     [token],
   );
+  const { api } = service;
   const refreshProjects = useCallback(async () => {
     setProjectError("");
     setProjectsLoading(true);
@@ -174,161 +159,161 @@ export function Layout() {
     setSidebar(false);
   }, [location.pathname, location.search]);
   return (
-    <ServiceContext.Provider
-      value={{
-        api,
-        token,
-        setToken,
-        projects,
-        refreshProjects,
-        projectsLoading,
-        projectError,
-      }}
-    >
-      <div className={`management-shell ${compact ? "compact-nav" : ""}`}>
-        <header className="management-header material-glass">
-          <div className="management-brand">
-            <Tool
-              icon={Menu}
-              label="打开导航"
-              onClick={() => setSidebar(!sidebar)}
-            />
-            <Link className="brand-lockup" to="/projects">
-              <span className="brand-mark">
-                <Workflow size={20} strokeWidth={1.8} />
-              </span>
-              <span>Interlace</span>
-            </Link>
-          </div>
-          {workbench && (
-            <div className="navigation-toggle">
+    <ApiContext.Provider value={service}>
+      <ServiceContext.Provider
+        value={{
+          projects,
+          refreshProjects,
+          projectsLoading,
+          projectError,
+        }}
+      >
+        <div className={`management-shell ${compact ? "compact-nav" : ""}`}>
+          <header className="management-header material-glass">
+            <div className="management-brand">
               <Tool
-                icon={compact ? PanelLeftOpen : PanelLeftClose}
-                label={compact ? "展开导航" : "收起导航"}
-                onClick={() => setExpanded(!expanded)}
+                icon={Menu}
+                label="打开导航"
+                onClick={() => setSidebar(!sidebar)}
               />
+              <Link className="brand-lockup" to="/projects">
+                <span className="brand-mark">
+                  <Workflow size={20} strokeWidth={1.8} />
+                </span>
+                <span>Interlace</span>
+              </Link>
             </div>
+            {workbench && (
+              <div className="navigation-toggle">
+                <Tool
+                  icon={compact ? PanelLeftOpen : PanelLeftClose}
+                  label={compact ? "展开导航" : "收起导航"}
+                  onClick={() => setExpanded(!expanded)}
+                />
+              </div>
+            )}
+            <nav className="breadcrumbs" aria-label="当前位置">
+              <Link to="/projects">项目</Link>
+              {projectId && (
+                <>
+                  <ChevronRight size={14} />
+                  <Link to={projectPath(projectId)}>
+                    {current?.name || "项目详情"}
+                  </Link>
+                </>
+              )}
+              {detailMatch && (
+                <>
+                  <ChevronRight size={14} />
+                  <span>{detailMatch.params.definitionName}</span>
+                </>
+              )}
+            </nav>
+            <ThemePicker />
+            <Tool
+              icon={KeyRound}
+              label="访问令牌"
+              onClick={() => {
+                setTokenInput(token);
+                setLogin(true);
+              }}
+            />
+          </header>
+          {sidebar && (
+            <button
+              className="nav-backdrop"
+              aria-label="关闭导航"
+              onClick={() => setSidebar(false)}
+            />
           )}
-          <nav className="breadcrumbs" aria-label="当前位置">
-            <Link to="/projects">项目</Link>
+          <aside
+            className={`management-sidebar material-glass ${sidebar ? "open" : ""}`}
+          >
+            <Link
+              className={`management-nav ${!projectId ? "selected" : ""}`}
+              to="/projects"
+              title="项目管理"
+            >
+              <Folder size={17} />
+              <span>项目管理</span>
+            </Link>
             {projectId && (
               <>
-                <ChevronRight size={14} />
-                <Link to={projectPath(projectId)}>
-                  {current?.name || "项目详情"}
+                <label className="project-switch">
+                  <span>当前项目</span>
+                  <select
+                    aria-label="切换项目"
+                    value={projectId}
+                    onChange={(event) =>
+                      navigate(projectPath(event.target.value))
+                    }
+                  >
+                    {projects.map((project) => (
+                      <option key={project.id} value={project.id}>
+                        {project.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <Link
+                  className={`management-nav ${!query.get("view") ? "selected" : ""}`}
+                  to={projectPath(projectId)}
+                  title="定义列表"
+                >
+                  <List size={17} />
+                  <span>定义列表</span>
+                </Link>
+                <Link
+                  className={`management-nav ${query.get("view") === "runs" ? "selected" : ""}`}
+                  to={`${projectPath(projectId)}?view=runs`}
+                  title="运行记录"
+                >
+                  <Activity size={17} />
+                  <span>运行记录</span>
+                </Link>
+                <Link
+                  className={`management-nav ${query.get("view") === "settings" ? "selected" : ""}`}
+                  to={`${projectPath(projectId)}?view=settings`}
+                  title="项目设置"
+                >
+                  <Settings size={17} />
+                  <span>项目设置</span>
                 </Link>
               </>
             )}
-            {detailMatch && (
-              <>
-                <ChevronRight size={14} />
-                <span>{detailMatch.params.definitionName}</span>
-              </>
-            )}
-          </nav>
-          <ThemePicker />
-          <Tool
-            icon={KeyRound}
-            label="访问令牌"
-            onClick={() => {
-              setTokenInput(token);
-              setLogin(true);
-            }}
-          />
-        </header>
-        {sidebar && (
-          <button
-            className="nav-backdrop"
-            aria-label="关闭导航"
-            onClick={() => setSidebar(false)}
-          />
-        )}
-        <aside
-          className={`management-sidebar material-glass ${sidebar ? "open" : ""}`}
-        >
-          <Link
-            className={`management-nav ${!projectId ? "selected" : ""}`}
-            to="/projects"
-            title="项目管理"
-          >
-            <Folder size={17} />
-            <span>项目管理</span>
-          </Link>
-          {projectId && (
-            <>
-              <label className="project-switch">
-                <span>当前项目</span>
-                <select
-                  aria-label="切换项目"
-                  value={projectId}
-                  onChange={(event) =>
-                    navigate(projectPath(event.target.value))
-                  }
-                >
-                  {projects.map((project) => (
-                    <option key={project.id} value={project.id}>
-                      {project.name}
-                    </option>
-                  ))}
-                </select>
+            <div className="management-sidebar-bottom">
+              {projects.length} 个项目
+            </div>
+          </aside>
+          <main className="management-main">
+            <Outlet />
+          </main>
+        </div>
+        {login && (
+          <Dialog title="访问令牌" onClose={() => setLogin(false)}>
+            <form
+              onSubmit={(event) => {
+                event.preventDefault();
+                saveToken(tokenInput);
+                setToken(tokenInput);
+                setLogin(false);
+              }}
+            >
+              <label className="field">
+                <span>令牌</span>
+                <input
+                  type="password"
+                  value={tokenInput}
+                  onChange={(event) => setTokenInput(event.target.value)}
+                  autoFocus
+                />
               </label>
-              <Link
-                className={`management-nav ${!query.get("view") ? "selected" : ""}`}
-                to={projectPath(projectId)}
-                title="定义列表"
-              >
-                <List size={17} />
-                <span>定义列表</span>
-              </Link>
-              <Link
-                className={`management-nav ${query.get("view") === "runs" ? "selected" : ""}`}
-                to={`${projectPath(projectId)}?view=runs`}
-                title="运行记录"
-              >
-                <Activity size={17} />
-                <span>运行记录</span>
-              </Link>
-              <Link
-                className={`management-nav ${query.get("view") === "settings" ? "selected" : ""}`}
-                to={`${projectPath(projectId)}?view=settings`}
-                title="项目设置"
-              >
-                <Settings size={17} />
-                <span>项目设置</span>
-              </Link>
-            </>
-          )}
-          <div className="management-sidebar-bottom">
-            {projects.length} 个项目
-          </div>
-        </aside>
-        <main className="management-main">
-          <Outlet />
-        </main>
-      </div>
-      {login && (
-        <Dialog title="访问令牌" onClose={() => setLogin(false)}>
-          <form
-            onSubmit={(event) => {
-              event.preventDefault();
-              setToken(tokenInput);
-              setLogin(false);
-            }}
-          >
-            <label className="field">
-              <span>令牌</span>
-              <input
-                type="password"
-                value={tokenInput}
-                onChange={(event) => setTokenInput(event.target.value)}
-                autoFocus
-              />
-            </label>
-            <button className="primary wide">连接</button>
-          </form>
-        </Dialog>
-      )}
-    </ServiceContext.Provider>
+              <button className="primary wide">连接</button>
+            </form>
+          </Dialog>
+        )}
+      </ServiceContext.Provider>
+    </ApiContext.Provider>
   );
 }
 
@@ -371,7 +356,8 @@ function SearchField({ value, onChange, label }) {
 
 /** 入口直接展示持久项目列表。 */
 export function ProjectList() {
-  const { api, projects, refreshProjects, projectsLoading, projectError } =
+  const { api } = useApi();
+  const { projects, refreshProjects, projectsLoading, projectError } =
     useService();
   const [search, setSearch] = useState("");
   const [create, setCreate] = useState(false);
@@ -531,7 +517,8 @@ export function ProjectList() {
 export function ProjectDetail() {
   const { projectId } = useParams();
   const [query] = useSearchParams();
-  const { api, refreshProjects } = useService();
+  const { api } = useApi();
+  const { refreshProjects } = useService();
   const resource = useResource(
     `projects/${encodeURIComponent(projectId)}/definitions`,
   );
@@ -765,7 +752,8 @@ export function ProjectDetail() {
 
 /** 编辑项目的显示信息，空项目可删除。 */
 function ProjectSettings({ project, count, onSaved }) {
-  const { api, refreshProjects } = useService();
+  const { api } = useApi();
+  const { refreshProjects } = useService();
   const [name, setName] = useState(project.name);
   const [description, setDescription] = useState(project.description);
   const [error, setError] = useState("");
@@ -963,7 +951,8 @@ function ProjectRuns({ projectId }) {
 /** 单条定义详情将概览、编排和实例记录分成独立视图。 */
 export function DefinitionDetail() {
   const { projectId, definitionName } = useParams();
-  const { api, token, setToken, projects, refreshProjects } = useService();
+  const { api } = useApi();
+  const { projects, refreshProjects } = useService();
   const resource = useResource(
     `definitions/${encodeURIComponent(definitionName)}?project_id=${encodeURIComponent(projectId)}`,
   );
@@ -989,9 +978,10 @@ export function DefinitionDetail() {
   }, [blocker]);
   const tab = query.get("tab") || "overview";
   const runId = query.get("run");
+  const { reload } = resource;
   useEffect(() => {
-    resource.reload();
-  }, [tab, runId]);
+    reload();
+  }, [tab, runId, reload]);
   useEffect(() => {
     if (tab !== "runs" || runId) return;
     const timer = setInterval(resource.reload, 2500);
@@ -1256,8 +1246,6 @@ export function DefinitionDetail() {
               ]}
               autoRun={query.get("execute") === "1"}
               showRuns={Boolean(runId)}
-              accessToken={token}
-              onAccessToken={setToken}
               onDirtyChange={setDirty}
               onPublished={async (value) => {
                 setDirty(false);

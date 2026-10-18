@@ -6,10 +6,15 @@ import pytest
 
 from interlace import Graph, Node, Output, Ports, Runtime
 from interlace.adapters import memory
-from interlace.engine.errors import GraphValidationError, IncompleteInputsError
+from interlace.engine.errors import (
+    ExecutionError,
+    GraphValidationError,
+    IncompleteInputsError,
+    PolicySelectionError,
+)
 from interlace.engine.observation import RuntimeEventKind
-from interlace.engine.policies import PolicyRef
-from interlace.nodes import KeyedJoin, KeyedPair, KeyedValue
+from interlace.engine.policies import PolicyRef, PolicyRegistry
+from interlace.nodes import KeyedJoin, KeyedJoinOverflowError, KeyedPair, KeyedValue
 from interlace.spi import (
     DeliveryResult,
     Work,
@@ -28,15 +33,7 @@ class Source(Node):
     output_ports = Ports(value=int)
 
     def execute(self, inputs, context):
-        """执行当前测试场景的节点行为，供外层契约断言检查。
-
-        Args:
-            inputs: 入口数据或按端口名称组织的输入映射。
-            context: 当前调用的执行或插件上下文。
-
-        Returns:
-            测试节点或替代执行器产生的返回值。
-        """
+        """把 value 输入原样输出到 value 端口。"""
 
         del context
         return Output(inputs["value"], "value")
@@ -54,14 +51,7 @@ def test_runtime_observer_sees_read_only_lifecycle_and_cannot_break_work(
     events = []
 
     def observe(event) -> None:
-        """注册只读事件观察者，不建立目标 Graph 路由。
-
-        Args:
-            event: 需要发布、观察或处理的事件。
-
-        Raises:
-            RuntimeError: 当前生命周期状态或操作顺序不允许此操作。
-        """
+        """注册只读事件观察者，不建立目标 Graph 路由。"""
 
         events.append(event)
         raise RuntimeError("telemetry failed")
@@ -118,15 +108,7 @@ class ContributedNode(Node):
     input_policy = PolicyRef("example.test/any-two", {"count": 2})
 
     def execute(self, inputs, context):
-        """执行当前测试场景的节点行为，供外层契约断言检查。
-
-        Args:
-            inputs: 入口数据或按端口名称组织的输入映射。
-            context: 当前调用的执行或插件上下文。
-
-        Returns:
-            测试节点或替代执行器产生的返回值。
-        """
+        """输出全部输入值之和。"""
 
         del context
         return Output(sum(inputs.values()), "total")
@@ -144,15 +126,7 @@ class FanOut(Node):
     output_ports = Ports(a=int, b=int)
 
     def execute(self, inputs, context):
-        """执行当前测试场景的节点行为，供外层契约断言检查。
-
-        Args:
-            inputs: 入口数据或按端口名称组织的输入映射。
-            context: 当前调用的执行或插件上下文。
-
-        Returns:
-            测试节点或替代执行器产生的返回值。
-        """
+        """把输入值发往 a 端口，把加一后的值发往 b 端口。"""
 
         del context
         return Output(inputs["value"], "a"), Output(inputs["value"] + 1, "b")
@@ -281,15 +255,7 @@ class PairSource(Node):
     output_ports = Ports(left=KeyedValue, right=KeyedValue)
 
     def execute(self, inputs, context):
-        """执行当前测试场景的节点行为，供外层契约断言检查。
-
-        Args:
-            inputs: 入口数据或按端口名称组织的输入映射。
-            context: 当前调用的执行或插件上下文。
-
-        Returns:
-            测试节点或替代执行器产生的返回值。
-        """
+        """按 (端口, 值) 对把 items 中的每个值发往对应端口。"""
 
         del context
         return tuple(Output(item, side) for side, item in inputs["items"])
@@ -337,3 +303,80 @@ def test_keyed_join_rejects_unmatched_values_at_quiescence() -> None:
         runtime.register("join.graph", keyed_graph())
         with pytest.raises(IncompleteInputsError, match="unmatched"):
             runtime.run("join.graph", items)
+
+
+def test_keyed_join_overflow_raises_interlace_execution_error() -> None:
+    """超过 max_pending 时以 Interlace 执行错误失败，而不是内建 OverflowError。"""
+
+    items = (("left", KeyedValue("a", 1)), ("left", KeyedValue("b", 2)))
+    graph = (
+        Graph(entrypoint="source")
+        .add(source=PairSource(), join=KeyedJoin(max_pending=1))
+        .connect("source", "join", source_port="left", target_port="left")
+        .connect("source", "join", source_port="right", target_port="right")
+    )
+    with Runtime() as runtime:
+        runtime.register("join.graph", graph)
+        with pytest.raises(KeyedJoinOverflowError, match="max_pending=1") as caught:
+            runtime.run("join.graph", items)
+
+    assert isinstance(caught.value, ExecutionError)
+    assert not isinstance(caught.value, OverflowError)
+
+
+def test_policy_ref_compares_by_value_and_is_explicitly_unhashable() -> None:
+    """PolicyRef 按名称与冻结配置比较；只读配置不能稳定哈希，因此显式不可哈希。"""
+
+    first = PolicyRef("example.test/any-two", {"count": 2})
+
+    assert first == PolicyRef("example.test/any-two", {"count": 2})
+    assert first != PolicyRef("example.test/any-two", {"count": 3})
+    assert PolicyRef.__hash__ is None
+    with pytest.raises(TypeError, match="unhashable"):
+        hash(first)
+
+
+class SelectsEmptyPort:
+    """违反 selector 契约、总是选择空端口 c 的测试策略。"""
+
+    def select(self, ports, available, config):
+        """返回未持有 token 的端口。"""
+
+        del ports, available, config
+        return ("c",)
+
+
+def test_bound_policy_rejects_selector_contract_violation() -> None:
+    """BoundPolicy 把非法选择报告为 PolicySelectionError，graph 与 node 留给执行器补齐。"""
+
+    policies = PolicyRegistry()
+    policies.register("example.test/bad", SelectsEmptyPort())
+    bound = policies.bind(PolicyRef("example.test/bad"))
+
+    with pytest.raises(PolicySelectionError, match="invalid selection") as caught:
+        bound.select(("a", "b", "c"), {"a": [1], "b": [], "c": []})
+    assert caught.value.graph is None and caught.value.node is None
+
+
+def test_selector_violation_fails_execution_with_policy_selection_error() -> None:
+    """运行时 selector 违反契约时，execution 以带 graph 与 node 的 PolicySelectionError 失败。"""
+
+    class BadPolicyNode(ContributedNode):
+        """使用违约 selector 的贡献策略节点。"""
+
+        input_policy = PolicyRef("example.test/bad")
+
+    graph = (
+        Graph(entrypoint="source")
+        .add(source=FanOut(), join=BadPolicyNode())
+        .connect("source", "join", source_port="a", target_port="a")
+        .connect("source", "join", source_port="b", target_port="b")
+    )
+    with Runtime() as runtime:
+        runtime.register_policy("example.test/bad", SelectsEmptyPort())
+        runtime.register("bad.policy", graph)
+        with pytest.raises(PolicySelectionError) as caught:
+            runtime.run("bad.policy", 1)
+
+    assert caught.value.graph == "bad.policy"
+    assert caught.value.node == "join"

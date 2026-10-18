@@ -112,7 +112,10 @@ local = LocalRuntimePlugin(
 runtime = Runtime(plugins=(local,))
 ```
 
-这些注入组件默认由调用方管理；只有确认组件为该插件独占时才传 `close_injected=True`。
+这些注入组件默认由调用方管理；只有确认组件为该插件独占时才传 `close_injected=True`。`infrastructure=` 选择
+本插件自行提供的底层能力（`CAP_EVENT_BUS`、`CAP_TASK_BACKEND`、`CAP_GRAPH_EXECUTOR`、`CAP_EXECUTION_FACTORY`
+的子集，None 表示全部），其余能力声明为依赖并由其他插件提供；`history_limit=`（默认 1000）限制 GraphWorker
+保留的已结束 Execution 记录数，`direct_workers=` 限制 `start/iter/aiter` 直接执行线程数，None 使用标准库默认值。
 
 Router 与 Worker 需要独立部署或不由同一个进程插件管理时，仍可显式组装：
 
@@ -157,7 +160,7 @@ tasks = memory.TaskBackend()
 | `TaskConsumer` | 调度带 Slot 的 Work，并控制当前实例的本地并发 | `memory.TaskBackend` |
 | `TaskBackend` | 同时实现发布与消费的组合协议 | `memory.TaskBackend` |
 | `SlotProvider` | 申请资源、查询容量和可用通知 | `SlotPool` |
-| `RouterRole` / `WorkerRole` | Runtime 所依赖的事件与执行角色 | EventRouter / GraphWorker |
+| `RouterRole` / `WorkerRole` | Runtime 所依赖的事件与执行角色；WorkerRole 由 `ExecutionHost`、`HookHost`、`PolicyHost`、`ObservationHost` 组合 | EventRouter / GraphWorker |
 | `GraphExecutor` | 执行已冻结 Graph，通过 Execution 交付终端 Output | `Engine` |
 | `ContextFactory` | 从基础 Context 与当前输入创建领域 Context，通过 Graph 配置 | `Context.make` |
 | `HookableGraphExecutor` | GraphExecutor 的可选动态 Hook 能力 | `Engine` |
@@ -196,16 +199,22 @@ Runtime 不依赖默认内存实现的私有字段。
 
 ## 核心实现的替换
 
-`RouterRole`、`WorkerRole` 是结构化协议，替换角色无需继承 EventRouter 或 GraphWorker。显式装配时仍需提供完整
+`RouterRole`、`WorkerRole` 是结构化协议，替换角色无需继承 EventRouter 或 GraphWorker。WorkerRole 是四个窄协议的组合：
+`ExecutionHost`（注册、消费、执行与等待关闭）、`HookHost`（`attach()`、`contribute_hook()`）、`PolicyHost`
+（`register_policy()`）和 `ObservationHost`（`observe_runtime()`）；RouterRole 同样包含 `ObservationHost`。Runtime 门面
+要求完整角色，PluginHost 安装贡献时只检查所需的窄协议。显式装配时仍需提供完整
 角色组合；可以只替换其中一个角色的实现，另一个使用默认类。插件装配时使用 `CAP_EVENT_ROUTER` 和
 `CAP_GRAPH_WORKER` 提供角色。PluginHost 通过公开角色统一安装标准贡献，完整替代角色无需重复编写安装逻辑；
 自定义角色插件仍负责自己提供的角色及底层组件的生命周期。即使只直接使用 PluginHost，标准贡献也必须有相应角色
 消费，缺少角色时不能仅登记贡献后成功启动。
 
-WorkerRole 的 `register_policy()` 接收具名 selector；`contribute_hook()` 接收固定插件 Hook；二者均返回独立幂等的
+selector 贡献要求 Worker 实现 `PolicyHost`，Hook 贡献要求 `HookHost`，Observer 贡献要求 Router 与 Worker 都实现
+`ObservationHost`；不满足时在启动前以 TypeError 失败。`register_policy()` 接收具名 selector；`contribute_hook()`
+接收固定插件 Hook；二者均返回独立幂等的
 `Callable[[], None]`。selector 注销不能改变 Graph 已绑定的实现快照。Hook 在目标 Graph 尚未注册时可以延迟绑定，
 返回的注销函数必须在绑定前后都有效。`observe_runtime()` 返回可独立卸载的观察句柄。Host 保存三类贡献的注销能力，
-在关闭和启动回滚时统一清理。
+在关闭和启动回滚时统一清理。`consume()` 返回幂等释放函数：撤销本次调用新建的消费者绑定及其自建 SlotPool；
+队列此前已由相同配置消费时为空操作。
 
 WorkerRole 的基本执行入口是 `start()`，同步 `Runtime.run()` 和异步 `Runtime.arun()` 分别等待它返回的同一个
 Execution。`iter()`、`aiter()` 必须先建立输出订阅再启动执行，保证首批输出也受到背压约束。替换 Worker 仍须在注册时
@@ -335,15 +344,23 @@ worker.consume("orders", concurrency=8)
 
 `on(event_type, graph=..., queue=..., concurrency=...)` 是 Runtime 上组合 `consume()` 与 `route()` 的常用入口。
 它先准备本地消费者，再暴露 Event route，避免消费端配置失败后留下仍会投递 Work 的 route。
-`observe(event_type, handler)` 独立用于观察 Event。只有需要独立部署 Router 和 Worker，或多条 route 共享一次
+`observe(event_type, handler)` 独立用于观察 Event：观察者在发布线程内调用，抛出的普通异常写入
+`interlace.runtime.router` 日志后被隔离，不影响其他订阅者和 `emit()` 结果；观察者内部再次 `emit()` 不继承源
+execution 的 Slot lease，产生的 Work 开始新的 Slot 链。route 的 Work 提交失败仍以 `EventDispatchError` 传回
+`emit()` 调用方。Router 在把 Event 交给 EventBus 之前发布 `EVENT_PUBLISHED`，因此它先于同一 Event 引起的
+`WORK_SUBMITTED`；分发失败不撤回这条观测。只有需要独立部署 Router 和 Worker，或多条 route 共享一次
 queue 消费配置时，才需要显式调用 `route()` 与 `consume()`。
 
 ## 组件生命周期
 
 插件模式下，PluginHost 按依赖顺序调用所有插件的 `setup()`，安装标准 selector、Hook 和 Observer 后，再按相同
 顺序调用 `start()`。标准贡献通过公开 RouterRole、WorkerRole 安装，因此默认角色与替代角色共享同一流程。
-任何阶段失败都会先逆序注销已经安装的 selector、Hook 和 Observer，再逆序调用已进入 setup 的插件 `stop()`。
-`Runtime.close()` 排空工作后关闭 PluginHost，使用相同的贡献清理和插件停止流程。
+任何阶段失败都会先逆序注销已经安装的 selector、Hook 和 Observer，再逆序调用已进入 setup 的插件 `stop()`；单项清理
+失败不跳过后续步骤。启动回滚重新抛出原始失败，清理失败全部写入 `interlace.plugins.host` 日志；
+`Runtime.close()` 排空工作后关闭 PluginHost，使用相同的贡献清理和插件停止流程，抛出首个清理失败并记录其余失败。
+
+`provide()`、`contribute()` 返回的 `RegistrationHandle` 可在 setup 阶段撤销并重新登记，也可在关闭和启动回滚期间
+（包括插件自己的 `stop()` 内）撤销；宿主运行期间撤销会抛出 RuntimeError，避免已取得 capability 的组件看到注册消失。
 
 插件构造器只保存配置，线程、连接等资源应在 `setup()` 中创建。LocalRuntimePlugin 同样在 `setup()` 中创建默认
 传输和 Engine，因此依赖校验失败不会启动后台线程；setup 中途失败时，已创建的资源也会通过 `stop()` 回收。
@@ -381,11 +398,16 @@ GraphWorker 保存每次 `bind()` 返回的注销函数；角色退出后，共�
 注销消费者时，handler 返回只代表业务处理结束，消费端仍须等待交付所持 lease 完成释放，才能关闭相应资源。
 其他消费者仍使用同一 SlotProvider 时，必须保留它们需要的可用通知。
 
-默认内存后端区分从未消费和已经退订的通道：从未绑定消费者时可以先提交 Work；最后一个成功绑定的消费者注销时，
-先排空该通道已接受的队列和在途交付，包括同通道续作及 lease 清理，再原子地完成退订。此后 `submit()` 和
-`submit_local()` 拒绝新 Work，直到新的消费者成功绑定；失败绑定不会把原本允许排队的通道改成退订状态。
-如果外部 Event 恰好在 Worker 完成退订、Router 尚未关闭的间隙触发旧 route，任务提交会明确失败，不会留下无人处理
-的排队 Work。远程适配器应单独说明其退订与队列接收语义。
+默认内存后端只向已有消费者的通道接受 Work：从未绑定消费者或最后一个消费者已经注销的通道，`submit()` 和
+`submit_local()` 立即抛出 RuntimeError（`no active consumers`），Router 把它包装为 `EventDispatchError` 传回 `emit()`。
+因此只建立 route 而未 `consume()` 时，`emit()` 立即失败，不会留下让 `wait_idle()` 或 `close()` 挂起的排队 Work。
+最后一个消费者注销时，先排空该通道已接受的队列和在途交付，包括同通道续作及 lease 清理，再原子地完成退订；
+新的消费者成功绑定后恢复接收，失败的绑定会被撤下。如果外部 Event 恰好在 Worker 完成退订、Router 尚未关闭的间隙
+触发旧 route，任务提交同样明确失败。远程适配器应单独说明其退订与队列接收语义。
+
+默认内存组件的 `close()` 可以并发调用：TaskBackend 先进入 CLOSING，拒绝新绑定但继续接受已有消费者通道的续作，
+排空后在同一临界区撤下全部消费者，并发调用方等待同一次关闭完成；EventRouter 进入 CLOSING 后拒绝新的注册与发布。
+memory.EventBus 的关闭是一次原子切换，不等待在途分发。
 
 `Runtime(router=..., worker=...)` 显式拥有两个传入角色，`Runtime.close()` 会依次关闭 Worker 和 Router；
 角色底层注入组件是否被关闭仍由各自的 `close_injected` 决定。插件模式与显式角色模式不能在同一个 Runtime
@@ -402,8 +424,13 @@ TaskConsumer 向 handler 交付 `Delivery`，其中包含 `work` 和从 1 开始
 - `DeliveryResult.retry(error)`：请求重新投递；
 - `DeliveryResult.reject(error)`：永久拒绝，并向等待方报告错误。
 
-默认内存适配器支持立即重试，默认最多交付 3 次，可用 `memory.TaskBackend(max_delivery_attempts=...)` 调整。
-handler 必须返回一个 `DeliveryResult`；缺少返回值或返回其他类型属于协议错误。
+默认内存适配器支持立即重试，默认最多交付 3 次，可用 `memory.TaskBackend(max_delivery_attempts=...)` 调整；通道已无
+消费者时不再重排，直接记为失败。handler 必须返回一个 `DeliveryResult`；缺少返回值或返回其他类型属于协议错误。
+交付失败只保留首个待传播异常，由下一次 `wait_idle()` 或 `close()` 抛出并清除；其间出现的其他失败在发生时写入
+`interlace.adapters.memory` 的 ERROR 日志，不在内存中累积。
+
+`Work.id` 同时作为本地 Execution ID。同一 id 的重投递（通常 attempt 更高）在前一次 Execution 已进入终态时替换其
+保留记录，`get_execution(id)` 返回最新一次尝试；前一次仍在执行时 Worker 以 REJECT 拒绝本次交付，不并发执行同一 Work。
 持久任务适配器应自行实现 consumer lease、visibility timeout、redelivery、最大重试次数和 dead-letter 策略；核心协议不宣称
 这些能力已经由接口自动提供。
 
@@ -433,7 +460,8 @@ observer 抛出的异常会被隔离，因此日志、Tracing 和指标插件不
 各消费一个 token 的端口元组或 `None`。Graph 注册时会绑定 selector 快照；缺失、重复、空端口或不存在端口的选择
 都会失败。因此两种方式都必须发生在使用该策略的 Graph 注册之前。默认 Runtime 中应先 `runtime.register()` 冻结
 Graph，再调用 `graph.plan()`；自行组装 Runtime 时也可以显式将同一 `PolicyRegistry` 交给 GraphWorker 和
-`graph.plan(..., policies=registry)`。
+`graph.plan(..., policies=registry)`（仅对尚未冻结的 Graph 生效；已冻结 Graph 保留冻结时的策略快照，再传 `policies=`
+会抛出 `ValueError`）。
 
 高级接口 `PolicyRegistry.register()` 和 `WorkerRole.register_policy()` 返回本次注册的幂等注销函数。
 注销后，新 Graph 冻结时无法再解析该名称，已冻结 Graph 继续使用原快照；旧注销函数也不会影响后来建立的同名注册。
@@ -481,7 +509,9 @@ handle = runtime.attach(
 handle.detach()
 ```
 
-`enter()` 转换 Node 输入，`exit(call, output)` 逐项转换结果，`error()` 可以返回结果来恢复普通异常。三者都可以是同步或异步方法；
+`enter()` 转换 Node 输入，`exit(call, output)` 逐项转换结果，`error()` 可以返回结果来恢复普通异常；控制异常与引擎契约
+错误（`HookExecutionError`、`InvalidOutputError`、`PortValueTypeError`、`PolicySelectionError`）不会交给 `error()`，
+直接传播。三者都可以是同步或异步方法；
 Engine 把 awaitable 提交给常驻后台 event loop，并在执行 Graph 的 worker 中等待结果。Hook 无需、也不能手动推进
 Node 执行：`enter()` 正常返回后 Engine 默认执行 Node。
 
@@ -520,13 +550,13 @@ Hook 通过两个信号显式改变流程：
   当前 Node 的 output port/type 校验后继续走既有 Edge。
 - `StopGraph(*outputs)` 可以从 enter、exit 或 error 变换阶段发出。它立即停止后续 Node 执行，将携带的 outputs 追加到已经产生的
   terminal Output 后，按相同顺序发布到输出流并返回完整结果。已发布的数据不会被替换，空参数也会保留此前输出。
-  当前 Graph 没有 graph-level output schema，因此对这些附加输出只校验它们是 `Output`。
+  这些附加输出按停止节点声明的 output port 与类型校验，但不沿 Edge 路由。
 
 Hook 按注册顺序进入，每项输出按逆序经过出口转换。短路后，已经进入的 Hook 仍会对短路输出执行 `exit()`；终止 Graph 则不会继续执行剩余
 生命周期。每次 Graph execution 在开始时固定 Hook 快照，所以 `attach()`/`detach()` 不会改变已经在途的执行，
 但会作用于下一次执行。`detach()` 是幂等的，也不会等待旧快照结束。
 
-Hook 最终产生的结果仍受 Graph 契约约束：除 `StopGraph` 的整图终端结果外，Hook 不能产生未声明的 output port
+Hook 最终产生的结果仍受 Graph 契约约束：Hook（包括 `StopGraph` 携带的终端结果）不能产生未声明的 output port
 或错误类型，也不能替换 Graph、Node、Context，或增删 Node input port。
 
 [上一章：Runtime 内部架构](06-runtime-architecture.md) · [下一章：编排模式](08-patterns.md)

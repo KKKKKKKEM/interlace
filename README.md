@@ -51,8 +51,9 @@ Graph -- Event / Runtime --> Graph
 顶层 API 还提供进程内的 `Slot` 与 `SlotPool`：队列 Work 可以在同一进程中跨 Consumer 传递并复用代理、Cookie、
 连接等执行状态，而不依赖具体线程。Slot 不跨进程或消息边界传输。
 
-执行默认不限步数和时长；`run()`、`start()` 和事件 route 可按需设置 `max_steps` 与 Graph `timeout`，单次
-Node firing 的时限由该 Node 的 `timeout` 属性声明。`start()` 返回可查询和协作式取消的 `Execution`。
+执行默认不限步数、时长和 Graph 内积压；`run()`、`start()` 和事件 route 可按需设置 `max_steps`、Graph `timeout`
+与待消费输入上限 `max_queued`，单次 Node firing 的时限由该 Node 的 `timeout` 属性声明。`start()` 返回可查询和
+协作式取消的 `Execution`。
 `Execution` 可调用 `result()`、直接 `await`，也可同步或异步迭代 terminal Output；`Runtime.iter()` 和
 `Runtime.aiter()` 提供对应便利入口。
 
@@ -82,17 +83,17 @@ with Runtime() as runtime:
     print(runtime.run("upper.graph", "interlace"))
 ```
 
-完整内容按一本手册组织，从[文档目录](docs/README.md)开始：
+完整内容按一本手册组织，从[文档目录](https://github.com/KKKKKKKEM/interlace/blob/main/docs/README.md)开始：
 
-1. [设计哲学与心智模型](docs/01-design-philosophy.md)
-2. [第一张 Graph](docs/02-first-graph.md)
-3. [Graph 数据流](docs/03-graph-dataflow.md)
-4. [Event 与跨图工作流](docs/04-events-and-workflows.md)
-5. [Execution、并发与失败](docs/05-execution.md)
-6. [Runtime 内部架构](docs/06-runtime-architecture.md)
-7. [插件、SPI 与适配器开发](docs/07-plugins.md)
-8. [编排模式](docs/08-patterns.md)
-9. [RPC 与可视化工作台](docs/09-service-and-studio.md)
+1. [设计哲学与心智模型](https://github.com/KKKKKKKEM/interlace/blob/main/docs/01-design-philosophy.md)
+2. [第一张 Graph](https://github.com/KKKKKKKEM/interlace/blob/main/docs/02-first-graph.md)
+3. [Graph 数据流](https://github.com/KKKKKKKEM/interlace/blob/main/docs/03-graph-dataflow.md)
+4. [Event 与跨图工作流](https://github.com/KKKKKKKEM/interlace/blob/main/docs/04-events-and-workflows.md)
+5. [Execution、并发与失败](https://github.com/KKKKKKKEM/interlace/blob/main/docs/05-execution.md)
+6. [Runtime 内部架构](https://github.com/KKKKKKKEM/interlace/blob/main/docs/06-runtime-architecture.md)
+7. [插件、SPI 与适配器开发](https://github.com/KKKKKKKEM/interlace/blob/main/docs/07-plugins.md)
+8. [编排模式](https://github.com/KKKKKKKEM/interlace/blob/main/docs/08-patterns.md)
+9. [RPC 与可视化工作台](https://github.com/KKKKKKKEM/interlace/blob/main/docs/09-service-and-studio.md)
 
 ## 可选 RPC 与可视化
 
@@ -118,7 +119,7 @@ service = GraphService(runtime, database=".interlace/studio.sqlite3")
 service.serve()
 ```
 
-安装、节点目录、HTTP/JSON-RPC 调用及服务所有权见[第九章](docs/09-service-and-studio.md)。
+安装、节点目录、HTTP/JSON-RPC 调用及服务所有权见[第九章](https://github.com/KKKKKKKEM/interlace/blob/main/docs/09-service-and-studio.md)。
 
 ## 当前范围
 
@@ -128,7 +129,7 @@ service.serve()
 死信队列或 exactly-once 语义。
 
 源码按 `engine`、`runtime`、`plugins`、`spi`、`adapters` 和可复用 `nodes` 分层；各包职责、目录树和允许的
-依赖方向见[Runtime 内部架构](docs/06-runtime-architecture.md#源码目录与包职责)。
+依赖方向见[Runtime 内部架构](https://github.com/KKKKKKKEM/interlace/blob/main/docs/06-runtime-architecture.md#源码目录与包职责)。
 
 ```bash
 uv run python examples/linear.py
@@ -138,5 +139,5 @@ uv run python examples/event_routing.py
 uv run python examples/async_node.py
 uv run python examples/output_stream.py
 uv run python examples/domain_context.py
-uv run --with pytest pytest -q
+uv run pytest -q
 ```

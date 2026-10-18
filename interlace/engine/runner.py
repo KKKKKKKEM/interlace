@@ -5,25 +5,39 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import inspect
-from collections.abc import Callable
+import logging
+from contextlib import suppress
 from threading import Event as ThreadEvent
 from threading import RLock, Thread, current_thread
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .execution import Execution
+
+_LOGGER = logging.getLogger(__name__)
+
+# close() 等待后台 loop 线程退出的最长秒数；超过后记录警告并放弃等待。
+_CLOSE_JOIN_TIMEOUT = 5.0
 
 
 class LocalRunner:
-    """同步调用普通函数，并在常驻后台 event loop 上解析 awaitable。
+    """同步返回普通值，并在私有后台 event loop 线程上等待 awaitable。
+
+    异步 Node 与 Hook 的协程运行在本 Runner 独占的 loop 线程上，而不是调用方自己的
+    event loop；同一 Graph execution 的调用串行推进，因此 loop 绑定的资源（client、
+    锁、Future 等）必须在节点协程内部创建，不得跨 loop 复用。取消通过向协程任务发送
+    CancelledError 实现，抑制 CancelledError 的协程会阻塞取消和关闭。
 
     Attributes:
-        _loop: 用于运行异步调用的后台事件循环。
-        _ready: 通知后台事件循环已经就绪的同步事件。
-        _lock: 保护当前组件共享状态的进程内互斥锁。
-        _closed: 当前组件是否已停止接受新工作。
-        _thread: 承载后台事件循环的专用线程。
+        _loop: 后台线程独占运行的 event loop。
+        _ready: 后台线程已设置当前 loop 并即将进入 run_forever 的信号。
+        _lock: 保护 _closed 与任务提交顺序的锁。
+        _closed: 是否已调用 close；关闭后拒绝新的 awaitable。
+        _thread: 运行 _loop 的守护线程。
     """
 
     def __init__(self) -> None:
-        """创建后台事件循环线程并等待其准备完成。"""
+        """启动后台 loop 线程，并等待它就绪后返回。"""
 
         self._loop = asyncio.new_event_loop()
         self._ready = ThreadEvent()
@@ -37,29 +51,68 @@ class LocalRunner:
         self._thread.start()
         self._ready.wait()
 
-    def resolve(
-        self,
-        value: Any,
-        *,
-        checkpoint: Callable[[], None] | None = None,
-        wait_timeout: Callable[[], float | None] | None = None,
-    ) -> Any:
-        """原样返回同步值，或同步等待后台 loop 上的 awaitable。
+    def resolve(self, value: Any, *, execution: Execution | None = None) -> Any:
+        """原样返回非 awaitable 值，或阻塞等待后台 loop 上的 awaitable 结果。
+
+        提供 execution 时，等待由任务完成或取消请求直接唤醒，不轮询；Graph 与 Node
+        deadline 到期同样唤醒。控制条件触发后先取消协程任务，并等待它完成清理
+        （包括 finally）再重新抛出控制异常。
 
         Args:
-            value: 同步结果或需要在后台循环等待的 awaitable。
-            checkpoint: 协作式取消和超时检查函数。
-            wait_timeout: 计算当前剩余等待秒数的函数。
+            value: 普通返回值或需要等待的 awaitable。
+            execution: 施加取消与超时约束的执行句柄；None 时无约束地等待结果。
 
         Returns:
-            同步调用或异步等待完成后的处理结果。
+            value 本身，或 awaitable 的结果。
 
         Raises:
-            RuntimeError: 当前生命周期状态或操作顺序不允许此操作。
+            RuntimeError: Runner 已关闭，或在 Runner 自身的 loop 线程上同步等待。
+            ExecutionControlError: 等待期间检测到取消、Graph timeout 或 Node timeout。
+            BaseException: awaitable 自身抛出的异常。
         """
 
         if not inspect.isawaitable(value):
             return value
+        future, scheduled = self._submit(value)
+        if execution is None:
+            return future.result()
+        wake = ThreadEvent()
+        future.add_done_callback(lambda _: wake.set())
+        remove_listener = execution._add_cancel_listener(wake.set)
+        try:
+            while True:
+                # wait_timeout 先执行 checkpoint，取消或超时时直接抛出。
+                remaining = execution.wait_timeout()
+                if future.done():
+                    return future.result()
+                wake.wait(remaining)
+        except BaseException:
+            # 代理 Future 可能先于协程清理完成；必须等实际任务退出才释放执行资源。
+            if not future.done():
+                task = scheduled.result()
+                self._loop.call_soon_threadsafe(task.cancel)
+                with suppress(BaseException):
+                    future.result()
+            raise
+        finally:
+            remove_listener()
+
+    def _submit(
+        self, value: Any
+    ) -> tuple[
+        concurrent.futures.Future[Any],
+        concurrent.futures.Future[asyncio.Future[Any]],
+    ]:
+        """把 awaitable 提交到后台 loop。
+
+        Returns:
+            `(result, task)`：result 转交任务结果或异常；task 在调度成功后给出 loop 内任务，
+            供取消使用。
+
+        Raises:
+            RuntimeError: Runner 已关闭，或调用方位于 Runner 自身的 loop 线程。
+        """
+
         with self._lock:
             if self._closed:
                 if inspect.iscoroutine(value):
@@ -77,11 +130,7 @@ class LocalRunner:
             )
 
             def completed(task: asyncio.Future[Any]) -> None:
-                """将后台异步任务的结果或异常转交给同步等待方。
-
-                Args:
-                    task: 已经调度的异步任务。
-                """
+                """把 loop 内任务的结果或异常转交给同步等待方。"""
 
                 try:
                     future.set_result(task.result())
@@ -89,7 +138,7 @@ class LocalRunner:
                     future.set_exception(exc)
 
             def schedule() -> None:
-                """将待等待对象提交到后台事件循环。"""
+                """在 loop 线程内创建任务；创建失败时同时结束两个 Future。"""
 
                 try:
                     task = asyncio.ensure_future(value, loop=self._loop)
@@ -100,43 +149,30 @@ class LocalRunner:
                     future.set_exception(exc)
 
             self._loop.call_soon_threadsafe(schedule)
-        if checkpoint is None:
-            return future.result()
-        try:
-            while True:
-                checkpoint()
-                remaining = None if wait_timeout is None else wait_timeout()
-                poll = 0.05 if remaining is None else min(0.05, remaining)
-                try:
-                    return future.result(timeout=poll)
-                except concurrent.futures.TimeoutError:
-                    if future.done():
-                        return future.result()
-                    checkpoint()
-        except BaseException:
-            # 代理 Future 可能在协程清理前就标记为已取消。
-            # 必须等待实际任务退出，才能释放该执行持有的资源。
-            if not future.done():
-                task = scheduled.result()
-                self._loop.call_soon_threadsafe(task.cancel)
-                try:
-                    future.result()
-                except BaseException:
-                    pass
-            raise
+        return future, scheduled
 
     def close(self) -> None:
-        """停止后台 loop，并等待专用线程退出。"""
+        """停止后台 loop，取消残留任务并有界等待线程退出；重复调用无作用。
+
+        残留任务收到 CancelledError 并完成清理后 loop 才关闭。若协程抑制取消或清理
+        超过 `_CLOSE_JOIN_TIMEOUT` 秒，close 记录警告后返回，守护线程继续运行到任务结束。
+        """
 
         with self._lock:
             if self._closed:
                 return
             self._closed = True
             self._loop.call_soon_threadsafe(self._loop.stop)
-        self._thread.join()
+        self._thread.join(_CLOSE_JOIN_TIMEOUT)
+        if self._thread.is_alive():
+            _LOGGER.warning(
+                "async runner thread did not exit within %.1f seconds; "
+                "a coroutine may be suppressing cancellation",
+                _CLOSE_JOIN_TIMEOUT,
+            )
 
     def _run_loop(self) -> None:
-        """运行后台事件循环，退出时取消残留任务并关闭循环。"""
+        """运行后台 loop；停止后取消并等待残留任务，再关闭 loop。"""
 
         asyncio.set_event_loop(self._loop)
         self._ready.set()

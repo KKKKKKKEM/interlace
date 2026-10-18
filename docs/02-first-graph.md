@@ -67,10 +67,10 @@ uv run python examples/event_routing.py
 uv run python examples/async_node.py
 ```
 
-测试依赖尚未写入项目依赖组；在本地可临时安装并运行：
+测试工具位于 `pyproject.toml` 的 `dev` 依赖组，`uv run` 默认同步该组：
 
 ```bash
-uv run --with pytest pytest -q
+uv run pytest -q
 ```
 
 [上一章：设计哲学与心智模型](01-design-philosophy.md) · [下一章：Graph 数据流](03-graph-dataflow.md)

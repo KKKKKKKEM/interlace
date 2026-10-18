@@ -9,6 +9,7 @@ import pytest
 
 from interlace import Event, Graph, Node, Runtime, Slot, SlotPool
 from interlace.adapters import memory
+from interlace.engine.errors import RuntimeClosedError
 from interlace.runtime import EventRouter, GraphWorker, LocalRuntimePlugin
 from interlace.spi import Delivery, DeliveryResult, SlotLease, Work, WorkHandler
 
@@ -183,9 +184,13 @@ def test_failed_initial_dispatch_rolls_back_binding(failure_at: int) -> None:
 
     stale_calls: list[str] = []
     healthy_calls: list[str] = []
+    held_calls: list[str] = []
     failures: list[BaseException] = []
     tasks = memory.TaskBackend()
     slots = FailingPool()
+    # 占位消费者的唯一 Slot 已被测试持有，只让通道接受投递而不取走工作。
+    holder_slots = SlotPool(1)
+    held = holder_slots.acquire()
 
     def stale(delivery: Delivery) -> DeliveryResult:
         """阻塞已分配的交付，验证绑定回滚在锁外等待。
@@ -215,6 +220,19 @@ def test_failed_initial_dispatch_rolls_back_binding(failure_at: int) -> None:
         healthy_calls.append(delivery.work.graph)
         return DeliveryResult.ack()
 
+    def hold(delivery: Delivery) -> DeliveryResult:
+        """记录占位消费者意外收到的交付。
+
+        Args:
+            delivery: 不应分配给占位消费者的交付。
+
+        Returns:
+            确认结果。
+        """
+
+        held_calls.append(delivery.work.graph)
+        return DeliveryResult.ack()
+
     def bind() -> None:
         """记录失败绑定的错误及其清理完成时机。"""
 
@@ -225,6 +243,7 @@ def test_failed_initial_dispatch_rolls_back_binding(failure_at: int) -> None:
         finally:
             binding_finished.set()
 
+    unbind_holder = tasks.bind("queue", hold, concurrency=1, slots=holder_slots)
     tasks.submit("queue", Work("first"))
     if failure_at == 2:
         tasks.submit("queue", Work("second"))
@@ -240,8 +259,8 @@ def test_failed_initial_dispatch_rolls_back_binding(failure_at: int) -> None:
         thread.join(1)
     assert not thread.is_alive()
     try:
-        tasks.submit("queue", Work("later"))
         tasks.bind("queue", healthy, concurrency=1)
+        tasks.submit("queue", Work("later"))
         tasks.wait_idle(1)
         assert len(failures) == 1
         assert str(failures[0]) == "initial dispatch failed"
@@ -249,13 +268,17 @@ def test_failed_initial_dispatch_rolls_back_binding(failure_at: int) -> None:
         assert healthy_calls == (
             ["first", "later"] if failure_at == 1 else ["second", "later"]
         )
+        assert held_calls == []
         assert slots.available == slots.size
         assert slots.subscriptions == 0
         if failure_at == 2:
             assert not returned_before_release
     finally:
+        unbind_holder()
+        held.release()
         tasks.close()
         slots.close()
+        holder_slots.close()
 
 
 def test_idle_waits_for_final_delivery_lease_release() -> None:
@@ -691,3 +714,95 @@ def test_runtime_close_drains_inflight_cross_graph_events() -> None:
     assert failures == []
     assert seen == ["child"]
     assert slots.available == 1
+
+
+@pytest.mark.parametrize("target", ["runtime", "worker"])
+def test_concurrent_close_shares_one_drain_and_rejects_new_roots(target: str) -> None:
+    """CLOSING 期间拒绝新的根执行，并发 close 等待同一次排空完成。
+
+    Args:
+        target: 被关闭的对象，Runtime 门面或单独的 GraphWorker。
+    """
+
+    entered = ThreadEvent()
+    release = ThreadEvent()
+    draining = ThreadEvent()
+    finished = [ThreadEvent(), ThreadEvent()]
+    failures: list[BaseException] = []
+
+    class Block(Node):
+        """阻塞到测试放行的节点。"""
+
+        def execute(self, inputs, context) -> None:
+            """通知已开始执行并等待放行。
+
+            Args:
+                inputs: 未使用的入口数据。
+                context: 未使用的执行上下文。
+            """
+
+            del inputs, context
+            entered.set()
+            assert release.wait(2)
+
+    class SignalledTasks(memory.TaskBackend):
+        """在关闭开始排空时发出信号的任务后端。"""
+
+        def wait_idle(self, timeout: float | None = None) -> None:
+            """标记排空已经开始，再等待后端空闲。
+
+            Args:
+                timeout: 最长等待秒数，None 表示不限时。
+            """
+
+            draining.set()
+            super().wait_idle(timeout)
+
+    tasks = SignalledTasks()
+    owner: Runtime | GraphWorker
+    if target == "runtime":
+        owner = Runtime(plugins=(LocalRuntimePlugin(tasks=tasks, close_injected=True),))
+    else:
+        owner = GraphWorker(consumer=tasks, close_injected=True)
+    owner.register("block", Graph(entrypoint="node").add("node", Block()))
+    blocked = owner.start("block")
+    assert entered.wait(1)
+
+    def close(index: int) -> None:
+        """关闭目标并记录失败与完成时机。
+
+        Args:
+            index: 本次关闭调用在 finished 中的位置。
+        """
+
+        try:
+            owner.close()
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            finished[index].set()
+
+    threads = [Thread(target=close, args=(index,)) for index in range(2)]
+    try:
+        threads[0].start()
+        assert draining.wait(1)
+        with pytest.raises(RuntimeClosedError):
+            owner.start("block")
+        if isinstance(owner, Runtime):
+            with pytest.raises(RuntimeClosedError):
+                owner.emit("value")
+        threads[1].start()
+        # 第二个 close 不能在排空完成前返回。
+        assert not finished[1].wait(0.05)
+        assert not finished[0].is_set()
+    finally:
+        release.set()
+        for thread in threads:
+            if thread.ident is not None:
+                thread.join(2)
+    assert all(event.is_set() for event in finished)
+    assert failures == []
+    assert blocked.result() == ()
+    with pytest.raises(RuntimeClosedError):
+        owner.start("block")
+    owner.close()

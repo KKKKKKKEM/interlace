@@ -6,7 +6,8 @@
 ## Event 是最小领域事实
 
 `Event(type, payload)` 只包含事件类型和领域 payload。内核不会自动添加时间、来源、关联 ID、幂等键或 tracing
-字段；需要时应把它们放入领域 payload，或交给 Runtime Observer。
+字段；需要时应把它们放入领域 payload，或交给 Runtime Observer。Event 按 type 与 payload 的值比较；只有 payload
+可哈希时 Event 才可哈希，payload 为 dict 等可变容器时 `hash(event)` 抛出 `TypeError`。Runtime 不依赖其哈希。
 
 Node 使用 `Context.emit()` 发布事件：
 
@@ -107,8 +108,10 @@ runtime.observe("*", trace_all_events)
 事件一旦被 EventBus 接受就是渐进提交。源 Node 随后失败不会撤销已经发布的事件，下游 Work 也不会回到源 Graph
 的事务中。默认实现不自动执行领域重试或 payload 去重。
 
-同步观察者或事件传输失败会在发布点表现为 `EventDispatchError`。队列中的下游 Graph 是独立 execution，它的失败
-由 `wait_idle()` 报告。
+路由处理（把事件转换为 Work 并提交到队列）或事件传输失败会在发布点表现为 `EventDispatchError`；路由到尚无
+消费者绑定的队列同样在发布点被拒绝，不会让 `wait_idle()` 或 `close()` 挂起。`observe()` 注册的观察者相互隔离，
+其异常只记录日志，不传播到 `emit()`。队列中的下游 Graph 是独立 execution，它的失败由 `wait_idle()` 报告。
+`EventDispatchError` 与各 `ExecutionError` 可以 pickle 往返，附带的 event、cause、graph 与 node 一并恢复。
 
 ## Slot 如何跨 Graph 延续
 
@@ -139,11 +142,17 @@ Slot 适合保存代理、Cookie、连接或链路缓存。领域持久状态仍
 
 ## Context 的边界
 
-Context 不提供数据库、HTTP client、Runtime 或队列。外部依赖通过 Node 构造器注入。扩展 Node 可以使用：
+Context 不提供数据库、HTTP client、Runtime 或队列。外部依赖通过 Node 构造器注入。Context 提供：
 
+- `emit(event_type, payload)`：提交跨图 Event；
+- `slot`、`options`：当前逻辑执行链的 Slot 与本次 firing 的只读配置快照；
+- `cancelled`、`checkpoint()`：查询取消请求，并让同步 Node 协作式响应取消和 timeout；
 - `state(namespace)`：保存当前 execution、当前 Node binding 内的临时状态；
-- `on_quiescence(callback)`：注册 Graph 静止阶段的校验或清理；
-- `checkpoint()`：让同步 Node 协作式响应取消和 timeout。
+- `on_quiescence(callback)`：注册数据流自然静止、execution 成功结束前运行的校验或清理；Node 失败、取消、超时
+  或残留输入时不调用，回调失败使 execution 失败。
+
+基础 Context 由执行器为每次 Node firing 绑定，公开构造器只接受 `Context(parent=base)`：领域 Context 通过它组合
+基础上下文，全部能力委托给 base，不能重新绑定 emit、取消、状态或配置。
 
 这些接口都不会把领域基础设施变成隐式全局依赖。
 

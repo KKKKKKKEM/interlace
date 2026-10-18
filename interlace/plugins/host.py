@@ -2,19 +2,21 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from ..engine.core import require_non_empty_string
+from .._validation import require_non_empty_string
 from ..engine.hooks import HookPhase, NodeHook
 from ..engine.observation import RuntimeObserver
 from ..engine.policies import InputSelector
-from ..spi.roles import RouterRole, WorkerRole
+from ..spi.roles import HookHost, ObservationHost, PolicyHost
 
 _VERSION = re.compile(r"^[0-9]+(?:\.[0-9]+){0,2}(?:[-+][A-Za-z0-9.-]+)?$")
+_logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,13 +24,13 @@ class PluginDescriptor:
     """插件身份、依赖以及声明提供的能力。
 
     Attributes:
-        id: 当前对象的唯一标识。
-        version: 插件版本。
-        requires: 必须先装配的插件标识集合。
-        provides: 插件声明提供的单例能力集合。
-        api_version: 插件声明兼容的 SPI 主版本。
-        requires_capabilities: 插件启动前必须存在的能力集合。
-        contributes: 插件声明提供的聚合贡献类别。
+        id: 含 ``/`` 的命名空间插件标识。
+        version: 插件自身的简单语义化版本。
+        requires: 必须先 setup/start 的插件标识。
+        provides: 插件必须在 setup 中提供的单例 capability。
+        api_version: 插件兼容的 SPI 主版本字符串，必须与宿主一致。
+        requires_capabilities: 必须由其他插件提供的单例 capability，提供者先于本插件装配。
+        contributes: 插件必须在 setup 中至少贡献一项的聚合 capability。
     """
 
     id: str
@@ -40,11 +42,12 @@ class PluginDescriptor:
     contributes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        """校验构造字段并固定需要保持不变的数据。
+        """校验标识、版本格式和各 capability 声明之间的一致性。
 
         Raises:
-            TypeError: 参数类型或接口实现不符合当前契约。
-            ValueError: 参数值或字段组合不合法。
+            TypeError: 任一声明集合不是 tuple，或元素不是字符串。
+            ValueError: 标识缺少命名空间、版本格式不合法、声明重复、依赖自身，或同一 capability
+                同时声明为单例与聚合、同时提供与依赖。
         """
 
         plugin_id = require_non_empty_string(self.id, "plugin id")
@@ -81,7 +84,7 @@ class PluginDescriptor:
 
 
 class Plugin(Protocol):
-    """一个可以向宿主贡献能力并参与生命周期的插件。
+    """向宿主提供 capability 或贡献、并参与 setup/start/stop 生命周期的插件协议。
 
     Attributes:
         descriptor: 插件身份、依赖和能力声明。
@@ -90,24 +93,24 @@ class Plugin(Protocol):
     descriptor: PluginDescriptor
 
     def setup(self, context: PluginContext) -> None:
-        """注册能力；此阶段不能使用尚未启动的外部资源。
+        """登记声明的 capability 与贡献；此阶段不能使用尚未启动的外部资源。
 
         Args:
-            context: 当前调用的执行或插件上下文。
+            context: 绑定当前插件身份的宿主上下文。
         """
 
     def start(self, context: PluginContext) -> None:
-        """在全部插件完成 setup 后启动。
+        """在全部插件完成 setup 且标准贡献安装后，按依赖顺序启动。
 
         Args:
-            context: 当前调用的执行或插件上下文。
+            context: 绑定当前插件身份的宿主上下文。
         """
 
     def stop(self, context: PluginContext) -> None:
-        """释放资源；宿主按照启动顺序的逆序调用。
+        """释放资源；宿主按 setup 顺序的逆序调用，setup 中途失败的插件也会被调用。
 
         Args:
-            context: 当前调用的执行或插件上下文。
+            context: 绑定当前插件身份的宿主上下文。
         """
 
 
@@ -116,10 +119,10 @@ class Contribution:
     """一个插件登记的具名聚合能力贡献。
 
     Attributes:
-        plugin: 贡献所属的插件标识。
-        capability: 当前贡献所属的能力类别。
-        name: 当前注册项或具名策略的名称。
-        value: 当前记录携带的数据值。
+        plugin: 登记该贡献的插件标识。
+        capability: 贡献所属的聚合 capability。
+        name: 在该 capability 内唯一的命名空间名称。
+        value: 贡献对象，例如 InputSelector、NodeHook 或 RuntimeObserver；不参与比较和 repr。
     """
 
     plugin: str
@@ -133,10 +136,10 @@ class NodeHookContribution:
     """一个带作用域的动态 Node Hook 贡献。
 
     Attributes:
-        hook: 注册的节点 Hook 实例。
-        phase: 函数 Hook 对应的执行阶段。
-        graph: 关联的 Graph 定义或注册名称。
-        node: 关联的节点实例或 Graph 内节点 ID。
+        hook: NodeHook 对象或单阶段回调；不参与比较和 repr。
+        phase: 函数 Hook 的执行阶段；NodeHook 对象必须为 None。
+        graph: 限定生效的 Graph 注册名称，None 表示全部 Graph。
+        node: 限定生效的 Graph 内节点 ID，需要同时指定 graph。
     """
 
     hook: NodeHook | Callable[..., object] = field(compare=False, repr=False)
@@ -145,11 +148,11 @@ class NodeHookContribution:
     node: str | None = None
 
     def __post_init__(self) -> None:
-        """校验构造字段并固定需要保持不变的数据。
+        """校验 Hook 类型、阶段与作用域组合。
 
         Raises:
-            TypeError: 参数类型或接口实现不符合当前契约。
-            ValueError: 参数值或字段组合不合法。
+            TypeError: hook 既不是 NodeHook 也不可调用，或 NodeHook 对象指定了 phase。
+            ValueError: phase 不是有效阶段、node 缺少 graph，或作用域名称为空字符串。
         """
 
         if not isinstance(self.hook, NodeHook) and not callable(self.hook):
@@ -167,70 +170,73 @@ class NodeHookContribution:
 
 
 class RegistrationHandle:
-    """控制一项尚未冻结的能力注册。
+    """撤销一项插件注册的幂等句柄。
+
+    setup 阶段可以撤销并重新登记；宿主冻结后、开始关闭或回滚前撤销会失败，避免已取得 capability 的组件
+    看到注册消失；关闭和启动回滚期间（包括插件 stop 内）撤销总是成功。
 
     Attributes:
-        __slots__: 实例允许保存的字段名称，限制动态增加属性。
-        _detach: 解除注册关系的回调。
-        _detached: 是否已完成卸载，避免重复释放。
+        __slots__: 限制实例只保存下列字段。
+        _detach: 执行实际撤销的回调。
+        _detached: 是否已经成功撤销；成功后再次调用不产生作用。
     """
 
     __slots__ = ("_detach", "_detached")
 
     def __init__(self, detach: Callable[[], None]) -> None:
-        """保存可幂等调用的注册卸载回调。
+        """保存执行撤销的回调。
 
         Args:
-            detach: 执行注册项卸载的回调。
+            detach: 从宿主移除本次注册的回调。
         """
 
         self._detach = detach
         self._detached = False
 
     def detach(self) -> None:
-        """解除当前句柄对应的注册关系。"""
+        """撤销本次注册；成功后重复调用不产生作用。
+
+        Raises:
+            RuntimeError: 宿主已冻结且尚未开始关闭或回滚。
+        """
 
         if not self._detached:
             self._detach()
             self._detached = True
 
-    def __enter__(self) -> RegistrationHandle:  # noqa: PYI034
-        """进入资源作用域并返回当前句柄。
+    def __enter__(self) -> RegistrationHandle:
+        """进入作用域并返回当前句柄。
 
         Returns:
-            当前资源管理对象。
+            当前句柄。
         """
 
         return self
 
     def __exit__(self, *args: object) -> None:
-        """退出资源作用域，执行对应的关闭或卸载操作。
-
-        Args:
-            *args: 调用协议传入的位置参数。
-        """
+        """离开作用域时撤销本次注册。"""
 
         del args
         self.detach()
 
 
 class PluginContext:
-    """插件可见的最小宿主接口。
+    """绑定单个插件身份的最小宿主接口。
 
     Attributes:
-        __slots__: 实例允许保存的字段名称，限制动态增加属性。
-        _host: 当前上下文所属的插件宿主。
-        _plugin: 当前上下文绑定的插件声明。
+        __slots__: 限制实例只保存下列字段。
+        _host: 所属的插件宿主。
+        _plugin: 绑定的插件标识，所有注册以该身份登记。
     """
 
     __slots__ = ("_host", "_plugin")
 
     def __init__(self, host: PluginHost, plugin: str) -> None:
-        """将插件身份绑定到宿主公开的受控装配入口。
+        """把插件标识绑定到宿主的受控注册入口。
 
         Args:
-            host: 装配插件和管理能力的宿主。
-            plugin: 当前插件实例或其声明身份。
+            host: 所属的插件宿主。
+            plugin: 插件标识。
         """
 
         self._host = host
@@ -238,23 +244,27 @@ class PluginContext:
 
     @property
     def plugin(self) -> str:
-        """返回当前插件上下文绑定的插件声明。
+        """返回绑定的插件标识。
 
         Returns:
-            当前上下文绑定的插件声明。
+            含命名空间的插件标识。
         """
 
         return self._plugin
 
     def provide(self, capability: str, value: Any) -> RegistrationHandle:
-        """提供一个排他的单例能力。
+        """提供一项已在 descriptor.provides 声明的单例 capability。
 
         Args:
-            capability: 需要提供、取得或移除的能力名称。
-            value: 插件提供的单例实现或具名贡献对象。
+            capability: 单例 capability 名称。
+            value: capability 的实现对象。
 
         Returns:
-            用于卸载本次注册的句柄。
+            撤销本次提供的句柄。
+
+        Raises:
+            RuntimeError: 宿主已结束 setup 阶段。
+            ValueError: capability 未声明，或已被其他插件提供。
         """
 
         return self._host._provide(self._plugin, capability, value)
@@ -265,39 +275,46 @@ class PluginContext:
         name: str,
         value: Any,
     ) -> RegistrationHandle:
-        """向可聚合能力提供一个具名贡献。
+        """向已在 descriptor.contributes 声明的聚合 capability 登记一项具名贡献。
 
         Args:
-            capability: 需要提供、取得或移除的能力名称。
-            name: 注册或查找使用的名称。
-            value: 插件提供的单例实现或具名贡献对象。
+            capability: 聚合 capability 名称。
+            name: 在该 capability 内唯一的命名空间名称。
+            value: 贡献对象。
 
         Returns:
-            用于卸载本次注册的句柄。
+            撤销本次贡献的句柄。
+
+        Raises:
+            RuntimeError: 宿主已结束 setup 阶段。
+            ValueError: capability 未声明、name 缺少命名空间或已经存在。
         """
 
         return self._host._contribute(self._plugin, capability, name, value)
 
     def require(self, capability: str) -> Any:
-        """取得已经完成 setup 的单例能力。
+        """取得已经提供的单例 capability。
 
         Args:
-            capability: 需要提供、取得或移除的能力名称。
+            capability: 单例 capability 名称。
 
         Returns:
-            指定能力的已装配实现。
+            capability 的实现对象。
+
+        Raises:
+            LookupError: capability 尚未被提供。
         """
 
         return self._host.require(capability)
 
     def contributions(self, capability: str) -> tuple[Contribution, ...]:
-        """取得当前上下文可见的聚合能力贡献。
+        """取得聚合 capability 当前的全部贡献。
 
         Args:
-            capability: 需要提供、取得或移除的能力名称。
+            capability: 聚合 capability 名称。
 
         Returns:
-            当前能力或插件上下文可见的贡献快照。
+            按登记顺序排列的贡献快照。
         """
 
         return self._host.contributions(capability)
@@ -306,28 +323,37 @@ class PluginContext:
 class PluginHost:
     """解析插件依赖，并管理统一能力注册和生命周期。
 
+    启动失败或关闭时先逆序注销已安装的标准贡献，再逆序停止已进入 setup 的插件；单项失败不跳过后续清理。
+    关闭时抛出首个失败，其余失败写入 ``interlace.plugins.host`` 的 ERROR 日志；启动回滚时重新抛出原始
+    启动失败，清理失败全部写入日志。
+
     Attributes:
-        API_VERSION: 当前宿主支持的 SPI 主版本。
-        _plugins: 按依赖顺序排列的插件实例。
-        _capabilities: 已经注册的单例能力及其提供者。
-        _contributions: 按能力类别组织的具名贡献。
-        _contexts: 按插件身份保存的受控装配上下文。
-        _started: 已接管生命周期、需要逆序关闭的插件集合。
-        _contribution_detachers: 标准贡献安装后的注销函数，按逆序执行。
-        _frozen: 是否已完成冻结，冻结后不再接受定义修改。
-        _closed: 当前组件是否已停止接受新工作。
+        API_VERSION: 宿主支持的 SPI 主版本字符串。
+        _plugins: 按依赖顺序排列的 (声明, 插件) 对。
+        _capabilities: 单例 capability 名称到 (提供者标识, 实现) 的映射。
+        _contributions: 聚合 capability 名称到 {贡献名称: 贡献} 的映射。
+        _contexts: 插件标识到其宿主上下文的映射。
+        _started: 已进入 setup、需要逆序 stop 的插件，按 setup 顺序保存。
+        _contribution_detachers: 标准贡献安装后的注销函数，按安装顺序保存、逆序执行。
+        _frozen: setup 阶段是否已结束；结束后拒绝新注册。
+        _closed: 是否已开始关闭或启动回滚；开始后允许撤销注册，拒绝再次启动。
     """
 
     API_VERSION = "2"
 
     def __init__(self, plugins: Iterable[Plugin]) -> None:
-        """校验插件依赖并初始化能力、贡献和生命周期记录。
+        """校验插件声明并按依赖关系确定装配顺序。
 
         Args:
-            plugins: 待装配的插件实例集合。
+            plugins: 待装配的插件。
+
+        Raises:
+            TypeError: plugins 不可迭代，或插件缺少 PluginDescriptor 与生命周期方法。
+            ValueError: 插件重复、SPI 版本不兼容、单例 capability 冲突、依赖缺失或循环依赖。
         """
 
-        self._plugins = self._normalize(plugins)
+        candidates = _collect(plugins)
+        self._plugins = _order(candidates, _index_providers(candidates))
         self._capabilities: dict[str, tuple[str, Any]] = {}
         self._contributions: dict[str, dict[str, Contribution]] = defaultdict(dict)
         self._contexts = {
@@ -344,19 +370,22 @@ class PluginHost:
         """返回按装配顺序排列的插件声明快照。
 
         Returns:
-            按装配顺序排列的插件声明。
+            按依赖顺序排列的插件声明。
         """
 
         return tuple(descriptor for descriptor, _ in self._plugins)
 
     def start(self) -> PluginHost:
-        """按依赖顺序装配和启动插件，失败时执行逆序回滚。
+        """依次 setup 全部插件、安装标准贡献并 start；已启动时直接返回。
+
+        任一步骤失败时执行回滚，回滚中的清理失败写入日志，随后重新抛出原始失败，宿主进入关闭状态。
 
         Returns:
-            本次操作得到的 PluginHost 实例。
+            当前宿主。
 
         Raises:
-            RuntimeError: 当前生命周期状态或操作顺序不允许此操作。
+            RuntimeError: 宿主已经关闭，或插件未兑现声明的 capability。
+            BaseException: 插件 setup/start 或贡献安装抛出的原始异常。
         """
 
         if self._closed:
@@ -368,46 +397,31 @@ class PluginHost:
                 # setup 即使中途失败也可能已经创建资源，因此先纳入回滚栈。
                 self._started.append((descriptor, plugin))
                 plugin.setup(self._contexts[descriptor.id])
-                actual = {
-                    capability
-                    for capability, (owner, _) in self._capabilities.items()
-                    if owner == descriptor.id
-                }
-                contributed = {
-                    capability
-                    for capability, entries in self._contributions.items()
-                    if any(item.plugin == descriptor.id for item in entries.values())
-                }
-                missing = (set(descriptor.provides) - actual) | (
-                    set(descriptor.contributes) - contributed
-                )
-                if missing:
-                    raise RuntimeError(
-                        f"plugin {descriptor.id!r} did not provide declared capabilities: "
-                        f"{sorted(missing)!r}"
-                    )
+                self._ensure_fulfilled(descriptor)
             self._frozen = True
             self._install_runtime_contributions()
             for descriptor, plugin in self._started:
                 plugin.start(self._contexts[descriptor.id])
         except BaseException:
             self._frozen = True
-            self._stop_started()
             self._closed = True
+            failure = self._stop_started()
+            if failure is not None:
+                _logger.error("plugin host rollback failed", exc_info=failure)
             raise
         return self
 
     def require(self, capability: str) -> Any:
-        """按能力名称取得已经装配的单例实现。
+        """按名称取得已经提供的单例 capability。
 
         Args:
-            capability: 需要提供、取得或移除的能力名称。
+            capability: 单例 capability 名称。
 
         Returns:
-            指定能力的已装配实现。
+            capability 的实现对象。
 
         Raises:
-            LookupError: 指定能力尚未由插件提供。
+            LookupError: capability 尚未被提供。
         """
 
         capability = require_non_empty_string(capability, "capability")
@@ -419,20 +433,24 @@ class PluginHost:
             ) from exc
 
     def contributions(self, capability: str) -> tuple[Contribution, ...]:
-        """返回当前可见的具名能力贡献快照。
+        """返回聚合 capability 当前的全部贡献。
 
         Args:
-            capability: 需要提供、取得或移除的能力名称。
+            capability: 聚合 capability 名称。
 
         Returns:
-            当前能力或插件上下文可见的贡献快照。
+            按登记顺序排列的贡献快照，没有贡献时为空元组。
         """
 
         capability = require_non_empty_string(capability, "capability")
         return tuple(self._contributions.get(capability, {}).values())
 
     def close(self) -> None:
-        """逆序关闭已接管的插件，单个关闭失败不跳过后续插件。"""
+        """逆序注销标准贡献并停止插件；重复调用不产生作用。
+
+        Raises:
+            BaseException: 清理中出现的首个失败；其余失败已写入日志。
+        """
 
         if self._closed:
             return
@@ -442,18 +460,11 @@ class PluginHost:
             raise failure
 
     def _provide(self, plugin: str, capability: str, value: Any) -> RegistrationHandle:
-        """登记插件提供的单例能力并检查声明与冲突。
-
-        Args:
-            plugin: 当前插件实例或其声明身份。
-            capability: 需要提供、取得或移除的能力名称。
-            value: 插件提供的单例实现或具名贡献对象。
-
-        Returns:
-            用于卸载本次注册的句柄。
+        """以插件身份登记单例 capability，并返回撤销句柄。
 
         Raises:
-            ValueError: 参数值或字段组合不合法。
+            RuntimeError: 宿主已结束 setup 阶段。
+            ValueError: capability 未声明，或已被其他插件提供。
         """
 
         self._ensure_registering()
@@ -470,19 +481,11 @@ class PluginHost:
     def _contribute(
         self, plugin: str, capability: str, name: str, value: Any
     ) -> RegistrationHandle:
-        """向宿主登记一项具名的聚合能力贡献。
-
-        Args:
-            plugin: 当前插件实例或其声明身份。
-            capability: 需要提供、取得或移除的能力名称。
-            name: 注册或查找使用的名称。
-            value: 插件提供的单例实现或具名贡献对象。
-
-        Returns:
-            用于卸载本次注册的句柄。
+        """以插件身份登记聚合 capability 的具名贡献，并返回撤销句柄。
 
         Raises:
-            ValueError: 参数值或字段组合不合法。
+            RuntimeError: 宿主已结束 setup 阶段。
+            ValueError: capability 未声明、name 缺少命名空间或已经存在。
         """
 
         self._ensure_registering()
@@ -502,15 +505,10 @@ class PluginHost:
     def _ensure_declared(
         self, plugin: str, capability: str, *, aggregate: bool
     ) -> None:
-        """检查插件是否兑现全部声明的单例和聚合能力。
-
-        Args:
-            plugin: 当前插件实例或其声明身份。
-            capability: 需要提供、取得或移除的能力名称。
-            aggregate: 是否读取同一能力的多个具名贡献。
+        """拒绝登记插件未在 provides（aggregate=False）或 contributes 中声明的 capability。
 
         Raises:
-            ValueError: 参数值或字段组合不合法。
+            ValueError: capability 未声明。
         """
 
         descriptor = next(item for item, _ in self._plugins if item.id == plugin)
@@ -520,210 +518,265 @@ class PluginHost:
                 f"plugin {plugin!r} did not declare capability {capability!r}"
             )
 
-    def _remove_capability(self, plugin: str, capability: str) -> None:
-        """回滚插件登记的单例能力。
+    def _ensure_fulfilled(self, descriptor: PluginDescriptor) -> None:
+        """确认插件 setup 后兑现了声明的全部单例与聚合 capability。
 
-        Args:
-            plugin: 当前插件实例或其声明身份。
-            capability: 需要提供、取得或移除的能力名称。
+        Raises:
+            RuntimeError: 存在未提供的单例或没有任何贡献的聚合 capability。
         """
 
-        self._ensure_registering()
+        actual = {
+            capability
+            for capability, (owner, _) in self._capabilities.items()
+            if owner == descriptor.id
+        }
+        contributed = {
+            capability
+            for capability, entries in self._contributions.items()
+            if any(item.plugin == descriptor.id for item in entries.values())
+        }
+        missing = (set(descriptor.provides) - actual) | (
+            set(descriptor.contributes) - contributed
+        )
+        if missing:
+            raise RuntimeError(
+                f"plugin {descriptor.id!r} did not provide declared capabilities: "
+                f"{sorted(missing)!r}"
+            )
+
+    def _remove_capability(self, plugin: str, capability: str) -> None:
+        """撤销插件自己登记的单例 capability；已被替换为其他提供者时不产生作用。"""
+
+        self._ensure_detachable()
         if self._capabilities.get(capability, (None,))[0] == plugin:
             del self._capabilities[capability]
 
     def _remove_contribution(self, plugin: str, capability: str, name: str) -> None:
-        """回滚插件登记的具名贡献。
+        """撤销插件自己登记的具名贡献；已被替换为其他插件的贡献时不产生作用。"""
 
-        Args:
-            plugin: 当前插件实例或其声明身份。
-            capability: 需要提供、取得或移除的能力名称。
-            name: 注册或查找使用的名称。
-        """
-
-        self._ensure_registering()
+        self._ensure_detachable()
         entry = self._contributions.get(capability, {}).get(name)
         if entry is not None and entry.plugin == plugin:
             del self._contributions[capability][name]
 
     def _ensure_registering(self) -> None:
-        """确保插件宿主仍处于允许注册能力的阶段。
+        """只在 setup 阶段允许新注册。
 
         Raises:
-            RuntimeError: 当前生命周期状态或操作顺序不允许此操作。
+            RuntimeError: 宿主已冻结或已关闭。
         """
 
         if self._frozen or self._closed:
             raise RuntimeError("plugin registrations are frozen")
 
+    def _ensure_detachable(self) -> None:
+        """允许 setup 阶段与关闭/回滚期间撤销注册，拒绝运行期间撤销。
+
+        Raises:
+            RuntimeError: 宿主已冻结且尚未开始关闭或回滚。
+        """
+
+        if self._frozen and not self._closed:
+            raise RuntimeError("plugin registrations are frozen while the host runs")
+
     def _stop_started(self) -> BaseException | None:
-        """按启动顺序的逆序停止插件，并收集关闭失败。
+        """逆序注销标准贡献，再逆序停止已进入 setup 的插件；单项失败不跳过后续清理。
 
         Returns:
-            关闭过程中最先出现的异常，全部成功时为 None。
+            首个清理失败，全部成功时为 None；其余失败已写入 ERROR 日志。
         """
 
         failure: BaseException | None = None
+
+        def record(exc: BaseException) -> None:
+            """保留首个清理失败，其余失败写入日志。"""
+
+            nonlocal failure
+            if failure is None:
+                failure = exc
+            else:
+                _logger.error("plugin host cleanup failed", exc_info=exc)
+
         for detach in reversed(self._contribution_detachers):
             try:
                 detach()
-            except BaseException as exc:  # noqa: BLE001
-                if failure is None:
-                    failure = exc
+            except BaseException as exc:
+                record(exc)
         self._contribution_detachers.clear()
         for descriptor, plugin in reversed(self._started):
             try:
                 plugin.stop(self._contexts[descriptor.id])
-            except BaseException as exc:  # noqa: BLE001
-                if failure is None:
-                    failure = exc
+            except BaseException as exc:
+                record(exc)
         self._started.clear()
         return failure
 
     def _install_runtime_contributions(self) -> None:
-        """通过公开角色安装标准贡献，使所有角色实现遵循相同装配路径。
+        """通过最窄的公开角色协议安装标准贡献，默认角色与替代角色走同一路径。
+
+        selector 需要 Worker 实现 PolicyHost，Hook 需要 HookHost，Observer 需要 Router 与 Worker 都实现
+        ObservationHost；没有标准贡献时不要求任何角色。
 
         Raises:
             LookupError: 标准贡献需要的角色 capability 缺失。
-            TypeError: 角色实现不满足公开协议，或贡献值不符合角色契约。
+            TypeError: 角色不满足所需协议，或贡献值不符合角色契约。
         """
 
         selectors = self.contributions(CAP_INPUT_SELECTOR)
         hooks = self.contributions(CAP_NODE_HOOK)
         observers = self.contributions(CAP_RUNTIME_OBSERVER)
-        if not (selectors or hooks or observers):
-            return
-        worker = self.require(CAP_GRAPH_WORKER)
-        if not isinstance(worker, WorkerRole):
-            raise TypeError("worker must implement WorkerRole")
-        for contribution in selectors:
-            self._contribution_detachers.append(
-                worker.register_policy(contribution.name, contribution.value)
-            )
-        for contribution in hooks:
-            value = contribution.value
-            configured = (
-                value
-                if isinstance(value, NodeHookContribution)
-                else NodeHookContribution(value)
-            )
-            self._contribution_detachers.append(
-                worker.contribute_hook(
-                    configured.hook,
-                    phase=configured.phase,
-                    graph=configured.graph,
-                    node=configured.node,
+        if selectors:
+            policies = self.require(CAP_GRAPH_WORKER)
+            if not isinstance(policies, PolicyHost):
+                raise TypeError("worker must implement PolicyHost")
+            for contribution in selectors:
+                self._contribution_detachers.append(
+                    policies.register_policy(contribution.name, contribution.value)
                 )
-            )
+        if hooks:
+            hook_host = self.require(CAP_GRAPH_WORKER)
+            if not isinstance(hook_host, HookHost):
+                raise TypeError("worker must implement HookHost")
+            for contribution in hooks:
+                value = contribution.value
+                configured = (
+                    value
+                    if isinstance(value, NodeHookContribution)
+                    else NodeHookContribution(value)
+                )
+                self._contribution_detachers.append(
+                    hook_host.contribute_hook(
+                        configured.hook,
+                        phase=configured.phase,
+                        graph=configured.graph,
+                        node=configured.node,
+                    )
+                )
         if observers:
-            router = self.require(CAP_EVENT_ROUTER)
-            if not isinstance(router, RouterRole):
-                raise TypeError("router must implement RouterRole")
+            roles: list[ObservationHost] = []
+            for capability, label in (
+                (CAP_EVENT_ROUTER, "router"),
+                (CAP_GRAPH_WORKER, "worker"),
+            ):
+                role = self.require(capability)
+                if not isinstance(role, ObservationHost):
+                    raise TypeError(f"{label} must implement ObservationHost")
+                roles.append(role)
             for contribution in observers:
-                for role in (router, worker):
+                for role in roles:
                     handle = role.observe_runtime(contribution.value)
                     self._contribution_detachers.append(handle.detach)
 
-    @staticmethod
-    def _normalize(
-        plugins: Iterable[Plugin],
-    ) -> tuple[tuple[PluginDescriptor, Plugin], ...]:
-        """校验插件声明并按依赖关系确定装配顺序。
 
-        Args:
-            plugins: 待装配的插件实例集合。
+def _collect(plugins: Iterable[Plugin]) -> dict[str, tuple[PluginDescriptor, Plugin]]:
+    """按插件标识收集插件，校验声明类型、生命周期方法、唯一性与 SPI 版本。
 
-        Returns:
-            按依赖顺序排列的插件声明与实例对。
+    Raises:
+        TypeError: plugins 不可迭代，或插件缺少 PluginDescriptor 与生命周期方法。
+        ValueError: 插件标识重复或 SPI 版本与宿主不一致。
+    """
 
-        Raises:
-            TypeError: 参数类型或接口实现不符合当前契约。
-            ValueError: 参数值或字段组合不合法。
-        """
+    try:
+        values = tuple(plugins)
+    except TypeError as exc:
+        raise TypeError("plugins must be iterable") from exc
+    candidates: dict[str, tuple[PluginDescriptor, Plugin]] = {}
+    for plugin in values:
+        descriptor = getattr(plugin, "descriptor", None)
+        if not isinstance(descriptor, PluginDescriptor):
+            raise TypeError("plugin must define a PluginDescriptor")
+        for method in ("setup", "start", "stop"):
+            if not callable(getattr(plugin, method, None)):
+                raise TypeError(f"plugin must define {method}()")
+        if descriptor.id in candidates:
+            raise ValueError(f"duplicate plugin {descriptor.id!r}")
+        if descriptor.api_version != PluginHost.API_VERSION:
+            raise ValueError(
+                f"plugin {descriptor.id!r} requires API {descriptor.api_version}, "
+                f"host provides {PluginHost.API_VERSION}"
+            )
+        candidates[descriptor.id] = (descriptor, plugin)
+    return candidates
 
-        candidates: dict[str, tuple[PluginDescriptor, Plugin]] = {}
-        try:
-            values = tuple(plugins)
-        except TypeError as exc:
-            raise TypeError("plugins must be iterable") from exc
-        for plugin in values:
-            descriptor = getattr(plugin, "descriptor", None)
-            if not isinstance(descriptor, PluginDescriptor):
-                raise TypeError("plugin must define a PluginDescriptor")
-            for method in ("setup", "start", "stop"):
-                if not callable(getattr(plugin, method, None)):
-                    raise TypeError(f"plugin must define {method}()")
-            if descriptor.id in candidates:
-                raise ValueError(f"duplicate plugin {descriptor.id!r}")
-            if descriptor.api_version != PluginHost.API_VERSION:
+
+def _index_providers(
+    candidates: dict[str, tuple[PluginDescriptor, Plugin]],
+) -> dict[str, str]:
+    """建立单例 capability 到提供者标识的索引，并校验冲突与缺失的必需 capability。
+
+    Returns:
+        单例 capability 名称到提供者插件标识的映射。
+
+    Raises:
+        ValueError: capability 同时作为单例与聚合、被多个插件提供，或必需 capability 无人提供。
+    """
+
+    aggregates = {
+        capability
+        for descriptor, _ in candidates.values()
+        for capability in descriptor.contributes
+    }
+    providers: dict[str, str] = {}
+    for descriptor, _ in candidates.values():
+        for capability in descriptor.provides:
+            if capability in aggregates:
                 raise ValueError(
-                    f"plugin {descriptor.id!r} requires API {descriptor.api_version}, "
-                    f"host provides {PluginHost.API_VERSION}"
+                    f"capability {capability!r} cannot be both singleton and aggregate"
                 )
-            candidates[descriptor.id] = (descriptor, plugin)
+            existing = providers.get(capability)
+            if existing is not None:
+                raise ValueError(
+                    f"capability {capability!r} is already provided by "
+                    f"{existing!r}; {descriptor.id!r} also declares it"
+                )
+            providers[capability] = descriptor.id
+    for descriptor, _ in candidates.values():
+        for capability in descriptor.requires_capabilities:
+            if capability not in providers:
+                raise ValueError(
+                    f"missing required capability {capability!r} "
+                    f"for plugin {descriptor.id!r}"
+                )
+    return providers
 
-        providers: dict[str, str] = {}
-        aggregates = {
-            capability
-            for descriptor, _ in candidates.values()
-            for capability in descriptor.contributes
-        }
-        for descriptor, _ in candidates.values():
-            for capability in descriptor.provides:
-                if capability in aggregates:
-                    raise ValueError(
-                        f"capability {capability!r} cannot be both singleton and aggregate"
-                    )
-                existing = providers.get(capability)
-                if existing is not None:
-                    raise ValueError(
-                        f"capability {capability!r} is already provided by "
-                        f"{existing!r}; {descriptor.id!r} also declares it"
-                    )
-                providers[capability] = descriptor.id
 
-        for descriptor, _ in candidates.values():
-            for capability in descriptor.requires_capabilities:
-                if capability not in providers:
-                    raise ValueError(
-                        f"missing required capability {capability!r} "
-                        f"for plugin {descriptor.id!r}"
-                    )
+def _order(
+    candidates: dict[str, tuple[PluginDescriptor, Plugin]],
+    providers: dict[str, str],
+) -> tuple[tuple[PluginDescriptor, Plugin], ...]:
+    """按插件依赖与 capability 提供者拓扑排序，同层保持传入顺序。
 
-        ordered: list[tuple[PluginDescriptor, Plugin]] = []
-        visiting: set[str] = set()
-        visited: set[str] = set()
+    Raises:
+        ValueError: 依赖的插件缺失或存在循环依赖。
+    """
 
-        def visit(plugin_id: str) -> None:
-            """递归访问插件依赖，并检测循环依赖。
+    ordered: list[tuple[PluginDescriptor, Plugin]] = []
+    visiting: set[str] = set()
+    visited: set[str] = set()
 
-            Args:
-                plugin_id: 带命名空间的插件标识。
+    def visit(plugin_id: str) -> None:
+        """深度优先访问插件依赖，先追加依赖再追加自身。"""
 
-            Raises:
-                ValueError: 参数值或字段组合不合法。
-            """
+        if plugin_id in visiting:
+            raise ValueError(f"cyclic plugin dependency involving {plugin_id!r}")
+        if plugin_id in visited:
+            return
+        try:
+            descriptor, plugin = candidates[plugin_id]
+        except KeyError as exc:
+            raise ValueError(f"missing required plugin {plugin_id!r}") from exc
+        visiting.add(plugin_id)
+        for required in descriptor.requires:
+            visit(required)
+        for capability in descriptor.requires_capabilities:
+            visit(providers[capability])
+        visiting.remove(plugin_id)
+        visited.add(plugin_id)
+        ordered.append((descriptor, plugin))
 
-            if plugin_id in visiting:
-                raise ValueError(f"cyclic plugin dependency involving {plugin_id!r}")
-            if plugin_id in visited:
-                return
-            try:
-                descriptor, plugin = candidates[plugin_id]
-            except KeyError as exc:
-                raise ValueError(f"missing required plugin {plugin_id!r}") from exc
-            visiting.add(plugin_id)
-            for required in descriptor.requires:
-                visit(required)
-            for capability in descriptor.requires_capabilities:
-                visit(providers[capability])
-            visiting.remove(plugin_id)
-            visited.add(plugin_id)
-            ordered.append((descriptor, plugin))
-
-        for plugin_id in candidates:
-            visit(plugin_id)
-        return tuple(ordered)
+    for plugin_id in candidates:
+        visit(plugin_id)
+    return tuple(ordered)
 
 
 CAP_EVENT_BUS = "interlace.runtime/event-bus"
@@ -741,10 +794,10 @@ class ContributionPlugin:
     """把常见 Policy、Hook 和 Observer 组合成一个声明式插件。
 
     Attributes:
-        _selectors: 带命名空间的输入策略实现映射。
-        _hooks: 准备贡献的具名节点 Hook。
-        _observers: 按注册顺序排列的运行时观察者快照。
-        descriptor: 插件身份、依赖和能力声明。
+        _selectors: 贡献名称到 InputSelector 的映射副本。
+        _hooks: 贡献名称到 NodeHookContribution、NodeHook 或单阶段回调的映射副本。
+        _observers: 贡献名称到 RuntimeObserver 的映射副本。
+        descriptor: 按非空贡献类别生成的插件声明。
     """
 
     def __init__(
@@ -758,15 +811,19 @@ class ContributionPlugin:
         | None = None,
         observers: Mapping[str, RuntimeObserver] | None = None,
     ) -> None:
-        """固定待注册的策略、Hook 和观察者贡献。
+        """复制待贡献的选择器、Hook 和观察者，并据此生成插件声明。
 
         Args:
             plugin_id: 带命名空间的插件标识。
-            version: 插件自身版本。
-            requires: 当前插件依赖的插件标识集合。
-            selectors: 待注册的具名输入选择器。
-            hooks: 待装配的节点 Hook 集合。
-            observers: 待装配的运行时观察者集合。
+            version: 插件自身的简单语义化版本。
+            requires: 必须先装配的插件标识。
+            selectors: 命名空间名称到 InputSelector 的映射。
+            hooks: 命名空间名称到 Hook 贡献的映射。
+            observers: 命名空间名称到 RuntimeObserver 的映射。
+
+        Raises:
+            TypeError: requires 不是 tuple。
+            ValueError: plugin_id、version 或 requires 不符合 PluginDescriptor 校验。
         """
 
         self._selectors = {} if selectors is None else dict(selectors)
@@ -789,10 +846,10 @@ class ContributionPlugin:
         )
 
     def setup(self, context: PluginContext) -> None:
-        """在插件装配阶段登记声明的能力或贡献。
+        """向宿主登记全部选择器、Hook 和观察者贡献。
 
         Args:
-            context: 当前调用的执行或插件上下文。
+            context: 绑定当前插件身份的宿主上下文。
         """
 
         for name, selector in self._selectors.items():
@@ -803,19 +860,19 @@ class ContributionPlugin:
             context.contribute(CAP_RUNTIME_OBSERVER, name, observer)
 
     def start(self, context: PluginContext) -> None:
-        """完成纯贡献插件的启动阶段，无额外外部资源需要启动。
+        """纯贡献插件没有需要启动的资源。
 
         Args:
-            context: 当前调用的执行或插件上下文。
+            context: 绑定当前插件身份的宿主上下文。
         """
 
         del context
 
     def stop(self, context: PluginContext) -> None:
-        """完成纯贡献插件的停止阶段，无额外外部资源需要释放。
+        """纯贡献插件没有需要释放的资源；贡献由宿主注销。
 
         Args:
-            context: 当前调用的执行或插件上下文。
+            context: 绑定当前插件身份的宿主上下文。
         """
 
         del context

@@ -11,19 +11,19 @@ class DelayedUpper(Node):
     """异步等待后将输入文本转为大写的示例节点。
 
     Attributes:
-        input_ports: 节点声明的输入端口及其类型。
-        output_ports: 节点声明的输出端口及其类型。
+        input_ports: 输入端口，text 为待转换的字符串。
+        output_ports: 输出端口，result 为转换后的大写字符串。
     """
 
     input_ports = Ports(text=str)
     output_ports = Ports(result=str)
 
     async def execute(self, inputs, context):
-        """根据当前输入执行节点行为，并返回声明端口上的输出。
+        """模拟一次异步 I/O 等待，再把 text 转为大写。
 
         Args:
-            inputs: 入口数据或按端口名称组织的输入映射。
-            context: 当前调用的执行或插件上下文。
+            inputs: 按输入端口名索引的值，text 为待转换文本。
+            context: Node 执行上下文；本示例不使用。
 
         Returns:
             result 端口上的大写文本 Output。
@@ -41,7 +41,7 @@ def run(text: str = "asynchronous") -> str:
         text: 示例需要转换的输入文本。
 
     Returns:
-        当前记录携带的数据值。
+        result 端口上的大写文本。
     """
 
     graph = Graph(entrypoint="upper").add(upper=DelayedUpper())

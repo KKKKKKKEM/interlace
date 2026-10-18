@@ -115,6 +115,7 @@ export function RunStatus({ status }) {
     cancelled: "已取消",
     timed_out: "已超时",
     step_limited: "达到步数上限",
+    queue_limited: "达到队列上限",
     interrupted: "已中断",
   };
   return status ? (

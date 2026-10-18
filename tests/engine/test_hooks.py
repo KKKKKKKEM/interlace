@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from threading import Event as ThreadEvent
 from threading import get_ident
 
 import pytest
 
-from interlace import Graph, Node, Output, Ports, Runtime
-from interlace.engine.errors import HookExecutionError, InvalidOutputError
+from interlace import Execution, Graph, Node, Output, Ports, Runtime
+from interlace.engine.errors import (
+    HookExecutionError,
+    InvalidOutputError,
+    PortValueTypeError,
+)
+from interlace.engine.executor import Engine
 from interlace.engine.hooks import (
     NodeCall,
     NodeHook,
@@ -36,15 +42,7 @@ class AddOne(Node):
         self.calls = 0
 
     def execute(self, inputs, context) -> Output:
-        """执行当前测试场景的节点行为，供外层契约断言检查。
-
-        Args:
-            inputs: 入口数据或按端口名称组织的输入映射。
-            context: 当前调用的执行或插件上下文。
-
-        Returns:
-            测试节点或替代执行器产生的返回值。
-        """
+        """记录调用次数，并输出加一后的值。"""
 
         del context
         self.calls += 1
@@ -52,14 +50,7 @@ class AddOne(Node):
 
 
 def single_node_graph(node: Node) -> Graph:
-    """构造只有一个节点的 Hook 契约测试 Graph。
-
-    Args:
-        node: 节点实例或作用域中的节点 ID，以接口类型为准。
-
-    Returns:
-        包含指定测试节点的 Graph。
-    """
+    """构造只有一个节点的 Hook 契约测试 Graph。"""
 
     return Graph(entrypoint="work").add("work", node)
 
@@ -126,15 +117,7 @@ def test_short_circuit_skips_node_and_continues_through_edges() -> None:
         output_ports = Ports(result=int)
 
         def execute(self, inputs, context):
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-
-            Returns:
-                测试节点或替代执行器产生的返回值。
-            """
+            """输出两倍的输入值。"""
 
             del context
             return Output(inputs["value"] * 2, "result")
@@ -270,14 +253,14 @@ def test_stop_graph_ends_without_running_remaining_nodes() -> None:
             """
 
             del call, outputs
-            raise StopGraph(Output(99, "stopped"))
+            raise StopGraph(Output(99, "result"))
 
     with Runtime() as runtime:
         runtime.register("work.graph", graph)
         runtime.attach(Stop(), graph="work.graph", node="first")
         outputs = runtime.run("work.graph", 1)
 
-    assert outputs == (Output(99, "stopped"),)
+    assert outputs == (Output(99, "result"),)
     assert first.calls == 1
     assert second.calls == 0
 
@@ -299,15 +282,7 @@ def test_error_hook_recovers_and_then_runs_outer_exit() -> None:
         output_ports = Ports(result=int)
 
         def execute(self, inputs, context):
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-
-            Raises:
-                ValueError: 参数值或字段组合不合法。
-            """
+            """抛出可被 Hook 恢复的业务异常。"""
 
             del inputs, context
             raise ValueError("temporary")
@@ -472,15 +447,7 @@ def test_async_node_and_async_hooks_share_background_loop() -> None:
         output_ports = Ports(result=int)
 
         async def execute(self, inputs, context):
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-
-            Returns:
-                测试节点或替代执行器产生的返回值。
-            """
+            """在 runner 循环线程上记录线程 ID，并输出加一后的值。"""
 
             del context
             await asyncio.sleep(0)
@@ -564,15 +531,7 @@ def test_execution_uses_hook_snapshot_until_graph_finishes() -> None:
 
     class First(AddOne):
         def execute(self, inputs, context):
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-
-            Returns:
-                测试节点或替代执行器产生的返回值。
-            """
+            """通知已进入，等测试放行后再执行父类逻辑。"""
 
             entered.set()
             release.wait(1)
@@ -678,12 +637,7 @@ def test_control_signal_is_rejected_when_raised_by_node() -> None:
         output_ports = Ports(result=int)
 
         def execute(self, inputs, context):
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-            """
+            """违规地在节点内抛出 StopGraph。"""
 
             del inputs, context
             raise StopGraph(Output(1, "result"))
@@ -707,14 +661,14 @@ def test_async_hook_can_stop_graph() -> None:
 
             del call
             await asyncio.sleep(0)
-            raise StopGraph(Output(11, "stopped"))
+            raise StopGraph(Output(11, "result"))
 
     with Runtime() as runtime:
         runtime.register("work.graph", single_node_graph(AddOne()))
         runtime.attach(Stop(), graph="work.graph")
         outputs = runtime.run("work.graph", 1)
 
-    assert outputs == (Output(11, "stopped"),)
+    assert outputs == (Output(11, "result"),)
 
 
 @pytest.mark.parametrize(
@@ -741,29 +695,13 @@ def test_stop_graph_preserves_published_outputs_in_result_and_stream(
         output_ports = Ports(default=object, next=object)
 
         def execute(self, inputs, context):
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-
-            Returns:
-                测试节点或替代执行器产生的返回值。
-            """
+            """先输出默认端口，再把值发往 next 端口。"""
 
             return (Output("before"), Output("next", "next"))
 
     class End(Node):
         def execute(self, inputs, context):
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-
-            Raises:
-                AssertionError: 内部不变量或测试契约断言不成立。
-            """
+            """图停止后不应被执行，执行即判定测试失败。"""
 
             raise AssertionError("stopped node must not execute")
 
@@ -901,15 +839,7 @@ def test_function_error_hook_can_recover_async_node_error() -> None:
         output_ports = Ports(result=int)
 
         async def execute(self, inputs, context):
-            """执行当前测试场景的节点行为，供外层契约断言检查。
-
-            Args:
-                inputs: 入口数据或按端口名称组织的输入映射。
-                context: 当前调用的执行或插件上下文。
-
-            Raises:
-                LookupError: 指定编码不存在或不是文本编码。
-            """
+            """让出一次事件循环后抛出 LookupError。"""
 
             del inputs, context
             await asyncio.sleep(0)
@@ -937,3 +867,165 @@ def test_function_error_hook_can_recover_async_node_error() -> None:
         outputs = runtime.run("work.graph", 1)
 
     assert outputs == (Output(3, "result"),)
+
+
+def run_on_engine(node: Node, *hooks: NodeHook) -> Execution:
+    """在独立 Engine 上执行单节点 Graph，依次注册 hooks，并按结果结束 Execution。
+
+    Returns:
+        已进入终态的 Execution；失败时 error 保存 Engine 抛出的异常。
+    """
+
+    graph = single_node_graph(node).freeze()
+    engine = Engine()
+    execution = Execution("work")
+    try:
+        for hook in hooks:
+            engine.attach(hook, graph="work")
+        execution.start(graph)
+        try:
+            engine.execute("work", graph, 1, lambda event: None, execution=execution)
+        except BaseException as exc:
+            execution.fail(exc)
+        else:
+            execution.succeed()
+    finally:
+        engine.close()
+    return execution
+
+
+@pytest.mark.parametrize(
+    ("violation", "expected"),
+    [
+        ("node-output", InvalidOutputError),
+        ("hook-call", HookExecutionError),
+        ("hook-input-type", PortValueTypeError),
+    ],
+)
+def test_engine_contract_errors_bypass_outer_error_hook(violation, expected) -> None:
+    """Engine 契约错误像控制异常一样穿过外层 hook.error，不被当作业务异常恢复。
+
+    Args:
+        violation: node-output 为 Node 返回非 Output，hook-call 为内层 enter 返回非
+            NodeCall，hook-input-type 为内层 enter 把输入替换为错误类型。
+        expected: 调用方应看到的契约错误类型。
+    """
+
+    recovered: list[BaseException] = []
+
+    class Invalid(Node):
+        """node-output 场景返回字符串，其余场景正常加一。"""
+
+        input_ports = Ports(value=int)
+        output_ports = Ports(result=int)
+
+        def execute(self, inputs, context):
+            """按场景返回非法值或合法 Output。"""
+
+            del context
+            if violation == "node-output":
+                return "not an output"
+            return Output(inputs["value"] + 1, "result")
+
+    class Recover(NodeHook):
+        """外层 Hook：记录交给 error 的异常并尝试恢复。"""
+
+        def error(self, call, error):
+            """记录异常并返回恢复输出。"""
+
+            del call
+            recovered.append(error)
+            return Output(0, "result")
+
+    class Break(NodeHook):
+        """内层 Hook：按场景破坏 enter 契约。"""
+
+        def enter(self, call):
+            """返回非 NodeCall 或替换为错误类型的输入。"""
+
+            if violation == "hook-call":
+                return "not a call"
+            if violation == "hook-input-type":
+                return call.with_inputs({"value": "text"})
+            return call
+
+    execution = run_on_engine(Invalid(), Recover(), Break())
+
+    assert isinstance(execution.error, expected)
+    assert recovered == []
+
+
+@pytest.mark.parametrize(
+    ("output", "expected"),
+    [
+        (Output(1, "undeclared"), InvalidOutputError),
+        (Output("text", "result"), PortValueTypeError),
+    ],
+)
+def test_stop_graph_outputs_obey_stopping_node_contract(output, expected) -> None:
+    """StopGraph 携带的输出按停止节点声明的端口与类型校验。
+
+    Args:
+        output: Hook 随 StopGraph 交付的输出。
+        expected: 违反端口或类型契约时的错误类型。
+    """
+
+    class Stop(NodeHook):
+        """在入口阶段携带参数化输出停止 Graph。"""
+
+        def enter(self, call):
+            """抛出携带 output 的 StopGraph。"""
+
+            raise StopGraph(output)
+
+    execution = run_on_engine(AddOne(), Stop())
+
+    assert isinstance(execution.error, expected)
+    assert (execution.error.graph, execution.error.node) == ("work", "work")
+    with pytest.raises(expected):
+        next(iter(execution))
+
+
+def test_failing_inspect_is_logged_once_per_execution_with_count(caplog) -> None:
+    """持续失败的 inspect 只记录一次 traceback，结束时汇总失败次数。
+
+    Args:
+        caplog: 捕获 Engine 日志。
+    """
+
+    class Many(Node):
+        """产出三项输出，使 inspect 在 ENTER 与每项 EXIT 各被调用一次。"""
+
+        output_ports = Ports(result=int)
+
+        def execute(self, inputs, context):
+            """返回三项输出。"""
+
+            del context
+            return tuple(
+                Output(inputs["default"] + index, "result") for index in range(3)
+            )
+
+    class Broken(NodeHook):
+        """每次 inspect 都抛错的诊断 Hook。"""
+
+        def inspect(self, call, phase, value):
+            """总是失败。
+
+            Raises:
+                RuntimeError: 预设的诊断失败。
+            """
+
+            raise RuntimeError("inspect failed")
+
+    with caplog.at_level(logging.WARNING, logger="interlace.engine.executor"):
+        execution = run_on_engine(Many(), Broken())
+
+    assert execution.result() == (
+        Output(1, "result"),
+        Output(2, "result"),
+        Output(3, "result"),
+    )
+    errors = [record for record in caplog.records if record.levelno == logging.ERROR]
+    assert len(errors) == 1 and "inspect failed" in caplog.text
+    assert "failed 4 times" in caplog.text

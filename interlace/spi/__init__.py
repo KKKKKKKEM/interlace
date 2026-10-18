@@ -11,16 +11,23 @@ from .runtime import (
     GraphExecutor,
     HookableGraphExecutor,
     LocalTaskPublisher,
-    SlotLease,
-    SlotProvider,
     TaskBackend,
     TaskConsumer,
     TaskPublisher,
     Work,
     WorkHandler,
 )
-from .roles import GraphCatalog, RouterRole, WorkerRole
+from .roles import (
+    ExecutionHost,
+    GraphCatalog,
+    HookHost,
+    ObservationHost,
+    PolicyHost,
+    RouterRole,
+    WorkerRole,
+)
 from ..engine.execution_resources import ExecutionNotifier, OutputStore
+from ..engine.slots import SlotLease, SlotProvider
 from ..engine.events import ContextFactory
 
 __all__ = [
@@ -32,11 +39,16 @@ __all__ = [
     "EventBus",
     "EventHandler",
     "ExecutionFactory",
+    "ExecutionHost",
     "ExecutionNotifier",
+    "GraphCatalog",
     "GraphExecutor",
+    "HookHost",
     "HookableGraphExecutor",
     "LocalTaskPublisher",
+    "ObservationHost",
     "OutputStore",
+    "PolicyHost",
     "RouterRole",
     "SlotLease",
     "SlotProvider",
@@ -46,5 +58,4 @@ __all__ = [
     "Work",
     "WorkHandler",
     "WorkerRole",
-    "GraphCatalog",
 ]

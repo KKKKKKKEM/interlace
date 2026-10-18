@@ -17,6 +17,7 @@ from interlace.engine.errors import (
     ExecutionError,
     NodeTimeoutError,
 )
+from interlace.engine.events import bind_context
 from interlace.engine.hooks import NodeCall, NodeHook
 from interlace.spi import ContextFactory
 
@@ -142,7 +143,7 @@ def test_composition_delegates_capabilities_without_copying_state() -> None:
     checked = []
     cancelled = False
     slot = Slot({"client": object()})
-    base = Context(
+    base = bind_context(
         events.append,
         slot,
         checkpoint=lambda: checked.append(True),
@@ -513,13 +514,13 @@ def test_factory_binding_is_readonly_and_parent_rejects_rebinding() -> None:
     assert graph.context_factory is factory
     with pytest.raises(AttributeError):
         graph.context_factory = Context.make
-    base = Context(lambda event: None)
-    with pytest.raises(TypeError, match="execution bindings"):
-        Context(parent=base, options={})
-    with pytest.raises(TypeError, match="execution bindings"):
-        Context(lambda event: None, parent=base)
+    base = bind_context(lambda event: None, None)
+    with pytest.raises(TypeError):
+        Context(parent=base, options={})  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        Context(lambda event: None, parent=base)  # type: ignore[misc]
     with pytest.raises(TypeError, match="parent must"):
-        Context(parent=object())
+        Context(parent=object())  # type: ignore[arg-type]
 
 
 def test_callable_factory_reads_input_snapshot_with_execution_plan() -> None:

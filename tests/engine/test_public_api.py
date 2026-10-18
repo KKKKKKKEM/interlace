@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pickle
 from collections.abc import Mapping
 from dataclasses import fields
 from typing import TYPE_CHECKING, Any
@@ -10,6 +11,7 @@ import pytest
 
 import interlace
 from interlace import Event, Ports, adapters, engine, nodes, plugins, runtime, spi
+from interlace.engine import errors
 from interlace.spi import Work
 
 if TYPE_CHECKING:
@@ -102,7 +104,12 @@ def test_advanced_packages_expose_explicit_architecture_boundaries() -> None:
     assert "EventBus" in spi.__all__
     assert "PluginHost" in plugins.__all__
     assert "ContributionPlugin" in plugins.__all__
-    assert nodes.__all__ == ["KeyedJoin", "KeyedPair", "KeyedValue"]
+    assert nodes.__all__ == [
+        "KeyedJoin",
+        "KeyedJoinOverflowError",
+        "KeyedPair",
+        "KeyedValue",
+    ]
     assert not hasattr(engine, "Runtime")
     assert not hasattr(engine, "PluginHost")
     assert not hasattr(interlace, "AsyncNode")
@@ -151,3 +158,46 @@ def test_work_contains_only_transportable_execution_data() -> None:
         "limits",
         "options",
     )
+
+
+def _error_classes() -> list[type[errors.InterlaceError]]:
+    """收集 engine.errors 与官方 Node 中定义的全部公共错误类型。"""
+
+    candidates = [*vars(errors).values(), nodes.KeyedJoinOverflowError]
+    return [
+        value
+        for value in candidates
+        if isinstance(value, type) and issubclass(value, errors.InterlaceError)
+    ]
+
+
+@pytest.mark.parametrize("error_type", _error_classes(), ids=lambda cls: cls.__name__)
+def test_public_errors_round_trip_through_pickle(error_type) -> None:
+    """公共错误跨进程传递时保留类型、消息与附加字段。
+
+    Args:
+        error_type: 待检查的公共错误类型。
+    """
+
+    event = Event("example.failed", {"id": 1})
+    if issubclass(error_type, errors.EventDispatchError):
+        error = error_type(event, ValueError("boom"))
+    elif issubclass(error_type, errors.ExecutionError):
+        error = error_type("failed", graph="flow", node="step", event=event)
+    else:
+        error = error_type("failed")
+
+    restored = pickle.loads(pickle.dumps(error))
+
+    assert type(restored) is error_type
+    assert str(restored) == str(error)
+    if isinstance(error, errors.EventDispatchError):
+        assert restored.event == event
+        assert type(restored.cause) is ValueError
+        assert restored.cause.args == ("boom",)
+    if isinstance(error, errors.ExecutionError):
+        assert (restored.graph, restored.node, restored.event) == (
+            "flow",
+            "step",
+            event,
+        )

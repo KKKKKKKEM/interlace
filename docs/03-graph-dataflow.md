@@ -93,6 +93,8 @@ flowchart LR
 
 冻结会拒绝以下定义：空图或未知入口、重复节点/边、未知端口、端口类型不兼容、不可从入口到达的节点、`ALL`
 Node 的必需端口没有任何入边，以及不合法的输入策略。`Runtime.register()` 会自动冻结尚未冻结的 Graph。
+构建方法与冻结互斥：冻结进行中的并发 `add()`、`entry()` 或 `connect()` 会等待冻结结束，再以 `GraphFrozenError`
+失败，未校验的定义不会进入已冻结的 Graph。
 
 ```mermaid
 stateDiagram-v2
@@ -150,7 +152,9 @@ full = graph.plan(include={"load", "parse", "enrich", "save"})
 runtime.run("document.graph", payload, plan=fast)
 ```
 
-`plan()` 会在需要时先冻结 Graph。缺省保留所选节点间的原有 Edge，也可通过 `edges=` 显式选择原图连接。
+`plan()` 会在需要时先冻结 Graph：尚未冻结时使用 `policies=` 提供的策略注册表（缺省只含内建策略）。已冻结的 Graph
+保留冻结时绑定的策略快照，此时再传 `policies=` 会抛出 `ValueError`，不会静默忽略。
+缺省保留所选节点间的原有 Edge，也可通过 `edges=` 显式选择原图连接。
 连接始终按原图顺序保存，不会跨过未选节点自动补边，也不允许新增或改写连接。
 `entrypoint=` 可指定所选节点中的任意入口，省略时使用原图入口；本次输入按该入口的 Ports 校验。
 入口不在计划内、所选 Node 从该入口不可达，或其他 `ALL` Node 缺少输入端口时，创建计划会立即失败。
@@ -176,9 +180,9 @@ runtime.run("document.graph", document, plan=parse_only)
 `boundary_edges` 包含从所选节点出发但被排除的连接：扇出只裁掉部分目标时，它仍在此列出，但不新增终端输出。
 `describe()` 返回入口类型、节点、连接和上述边界的独立可 JSON 编码快照，不运行任何节点，也不保证每个端口都会产出。
 
-高级调用为 `ExecutionPlan(frozen_graph, nodes, entrypoint=..., edges=..., outputs=...)`。
-`dataclasses.replace` 会重新校验并保留原计划入口与边；缩小节点集合时可显式传 `edges=None` 重新派生连接。
-派生出口与索引不能直接替换。通常重新调用 `graph.plan(...)` 更直观。
+高级调用为 `ExecutionPlan(frozen_graph, nodes, entrypoint=..., edges=..., outputs=...)`。构造参数是选择请求，
+`nodes`、`entrypoint`、`edges`、`outputs` 等属性是校验后的只读结果；计划按身份比较，不是 dataclass，
+不支持 `dataclasses.replace`。需要不同选择时构造新计划或重新调用 `graph.plan(...)`。
 
 计划不复制节点、不建立嵌套执行，也不撤销副作用。选中节点的 Hook、Event、写库与新任务提交照常发生；
 新任务不会自动继承当前计划。
@@ -196,5 +200,9 @@ runtime.run("document.graph", document, plan=parse_only)
 `ON_START` 只能用于零输入入口 Node。执行器为每个端口维护 FIFO 队列，并用 FIFO 就绪队列调度 Node；每次
 调度只消费一组输入，再把仍然就绪的 Node 放到队尾，因此持续循环不会独占其他已就绪分支。如果 Graph 静止后
 还剩无法组合的值，例如 `ALL` Node 只收到一半输入，会抛出 `IncompleteInputsError`。
+
+三种固定策略对应内建 selector `interlace.core/all`、`interlace.core/any` 与 `interlace.core/on-start`。
+通过插件贡献的 selector 返回非元组、空元组、重复端口、未声明端口或空端口，或在选择时抛出异常，execution 都以
+`PolicySelectionError` 失败；该错误属于 `ExecutionError`，带有 graph 与 node，原异常保留为 `__cause__`。
 
 [上一章：第一张 Graph](02-first-graph.md) · [下一章：Event 与跨图工作流](04-events-and-workflows.md)

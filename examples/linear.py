@@ -9,19 +9,19 @@ class Strip(Node):
     """移除输入文本首尾空白的示例节点。
 
     Attributes:
-        input_ports: 节点声明的输入端口及其类型。
-        output_ports: 节点声明的输出端口及其类型。
+        input_ports: 输入端口，text 为原始文本。
+        output_ports: 输出端口，text 为去除首尾空白后的文本。
     """
 
     input_ports = Ports(text=str)
     output_ports = Ports(text=str)
 
     def execute(self, inputs, context):
-        """根据当前输入执行节点行为，并返回声明端口上的输出。
+        """去除 text 首尾空白后传给下游。
 
         Args:
-            inputs: 入口数据或按端口名称组织的输入映射。
-            context: 当前调用的执行或插件上下文。
+            inputs: 按输入端口名索引的值，text 为原始文本。
+            context: Node 执行上下文；本示例不使用。
 
         Returns:
             text 端口上已去除首尾空白的文本 Output。
@@ -35,19 +35,19 @@ class Upper(Node):
     """将输入文本转换为大写的示例节点。
 
     Attributes:
-        input_ports: 节点声明的输入端口及其类型。
-        output_ports: 节点声明的输出端口及其类型。
+        input_ports: 输入端口，text 为待转换文本。
+        output_ports: 输出端口，result 为大写文本；该端口未连线，成为终端输出。
     """
 
     input_ports = Ports(text=str)
     output_ports = Ports(result=str)
 
     def execute(self, inputs, context):
-        """根据当前输入执行节点行为，并返回声明端口上的输出。
+        """把 text 转为大写后从 result 输出。
 
         Args:
-            inputs: 入口数据或按端口名称组织的输入映射。
-            context: 当前调用的执行或插件上下文。
+            inputs: 按输入端口名索引的值，text 为待转换文本。
+            context: Node 执行上下文；本示例不使用。
 
         Returns:
             result 端口上的大写文本 Output。
@@ -61,10 +61,10 @@ def run(text: str = "  hello, interlace  ") -> str:
     """执行一条两节点的数据流，并返回未连接的终端输出。
 
     Args:
-        text: 示例需要转换的输入文本。
+        text: 原始输入文本，可包含首尾空白。
 
     Returns:
-        当前记录携带的数据值。
+        去除首尾空白并转为大写后的文本。
     """
 
     graph = Graph.compose(

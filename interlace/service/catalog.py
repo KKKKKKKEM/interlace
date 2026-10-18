@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from interlace import Graph, Node
 from interlace.engine.policies import PolicyRegistry
 
+from .errors import InvalidRequestError
 from .models import GraphDefinition, Model
 
 C = TypeVar("C", bound=BaseModel)
@@ -132,14 +133,15 @@ class NodeCatalog:
             工厂返回的 Node。
 
         Raises:
-            ValueError: 类型未登记或配置非法。
+            InvalidRequestError: 类型未登记。
+            pydantic.ValidationError: 配置不符合登记的配置模型。
             TypeError: 工厂未返回 Node。
         """
 
         with self._lock:
             item = self._types.get(name)
         if item is None:
-            raise ValueError(f"unknown node type: {name}")
+            raise InvalidRequestError(f"unknown node type: {name}")
         node = item.factory(item.model.model_validate(config))
         if not isinstance(node, Node):
             raise TypeError("node factory must return a Node")
@@ -155,7 +157,8 @@ class NodeCatalog:
             已通过核心校验的冻结 Graph。
 
         Raises:
-            ValueError: 类型或配置非法。
+            InvalidRequestError: 节点类型未登记。
+            pydantic.ValidationError: 节点配置非法。
             GraphError: 图结构、端口或可达性非法。
         """
 

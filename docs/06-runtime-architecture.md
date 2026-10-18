@@ -11,7 +11,7 @@
 | 用户门面 | `interlace.runtime`，由 `interlace` 导出 | Runtime | 注册 Graph，代理执行、事件、观察和控制入口 |
 | 装配宿主 | `interlace.plugins`、`interlace.runtime.plugin` | PluginHost、LocalRuntimePlugin | 解析插件依赖，注册 capability，安装标准贡献并管理生命周期 |
 | 运行角色 | `interlace.runtime` | EventRouter、GraphWorker | 分别处理 Event -> Work 与 Work -> Graph execution |
-| 能力端口 | `interlace.spi` | RouterRole、WorkerRole、EventBus、任务传输、GraphExecutor、SlotProvider、执行资源协议 | 隔离编排、传输、执行和资源实现 |
+| 能力端口 | `interlace.spi` | RouterRole、WorkerRole（由 ExecutionHost、HookHost、PolicyHost、ObservationHost 组合）、EventBus、任务传输、GraphExecutor、SlotProvider、执行资源协议 | 隔离编排、传输、执行和资源实现 |
 | 默认适配器 | `interlace.adapters.memory`、`interlace.engine.executor` | EventBus、TaskBackend、Engine | 提供单进程内存运行时 |
 | 可选官方服务 | `interlace.service` | GraphService、NodeCatalog、Studio | 提供 RPC、图编辑发布与观测历史，按 extra 安装 |
 
@@ -40,9 +40,12 @@ interlace/
 ├── runtime/                 # Runtime 门面和运行角色
 │   ├── facade.py            # Runtime
 │   ├── router.py            # EventRouter
-│   ├── worker.py            # GraphWorker
+│   ├── worker.py            # GraphWorker：注册、消费与执行宿主编排
+│   ├── history.py           # Execution 记录保留与活跃计数
+│   ├── direct.py            # 直接执行线程池
+│   ├── contributions.py     # 目标 Graph 注册前的延迟 Hook 贡献
 │   ├── plugin.py            # LocalRuntimePlugin
-│   └── _utils.py            # 私有生命周期辅助函数
+│   └── _utils.py            # 私有生命周期状态机与关闭辅助函数
 ├── plugins/                 # PluginHost、descriptor、capability 与 contribution
 ├── spi/                     # EventBus、任务传输、GraphExecutor 等窄协议
 ├── adapters/                # 随包提供的具体部署适配器
@@ -116,17 +119,19 @@ flowchart TB
     Selectors --> Host
     Hooks --> Host
     Observers --> Host
-    Host -->|install through WorkerRole| Worker
-    Host -->|install through RouterRole| Router
+    Host -->|PolicyHost / HookHost / ObservationHost| Worker
+    Host -->|ObservationHost| Router
 ```
 
 `Runtime()` 根据已声明 capability 让 LocalRuntimePlugin 逐项补齐缺失的 EventBus、TaskBackend、GraphExecutor 和 ExecutionFactory，
-再组装 Router 与 Worker。内建实现和应用插件使用相同的依赖解析、capability 注册、启动和停止流程。显式
+再组装 Router 与 Worker。补齐范围通过公开构造参数 `LocalRuntimePlugin(infrastructure=...)` 表达：所列底层能力由插件自行提供，
+其余声明为依赖，descriptor 随实例选择生成。内建实现和应用插件使用相同的依赖解析、capability 注册、启动和停止流程。显式
 `Runtime(router=..., worker=...)` 用于 Router/Worker 独立部署，此模式不创建 PluginHost。
 
-全部插件完成 `setup()` 后，PluginHost 先通过 `RouterRole`、`WorkerRole` 安装 selector、Hook 和 Observer，
-再按依赖顺序调用 `start()`。因此插件在启动阶段注册 Graph 时，标准贡献已经可用。提供完整替代角色的插件同样经过
-这条安装路径；缺少贡献所需的角色会在启动前失败。LocalRuntimePlugin 只负责提供默认能力与角色，不单独安装贡献。
+全部插件完成 `setup()` 后，PluginHost 先通过公开角色安装 selector、Hook 和 Observer：selector 只要求 Worker 实现
+`PolicyHost`，Hook 只要求 `HookHost`，Observer 要求 Router 与 Worker 实现 `ObservationHost`；然后按依赖顺序调用
+`start()`。因此插件在启动阶段注册 Graph 时，标准贡献已经可用。提供完整替代角色的插件同样经过
+这条安装路径；缺少贡献所需的角色或窄协议会在启动前失败。LocalRuntimePlugin 只负责提供默认能力与角色，不单独安装贡献。
 
 ## 直接执行路径
 
@@ -143,6 +148,14 @@ flowchart LR
 
 GraphWorker 管理注册表、Execution 句柄和直接执行线程；GraphExecutor 只负责执行一张已经冻结的 Graph。这个边界
 允许替换执行器，而不把 Graph 注册、队列消费或事件路由混入执行算法。
+
+直接执行线程池大小由 `GraphWorker(direct_workers=...)` 指定，None 使用标准库 ThreadPoolExecutor 的默认值。Worker 最多保留
+`history_limit`（默认 1000）条 Execution 记录，超出时按登记顺序淘汰已结束的记录，尚未收尾的执行始终保留；两个参数均可经
+`LocalRuntimePlugin(history_limit=..., direct_workers=...)` 传入。`idle` 与 `wait_idle()` 只统计尚未收尾的执行，不随历史记录数增长。
+
+执行宿主在调用 `succeed()`/`fail()` 唤醒等待方之前发布 `execution.finished`，状态由 `terminal_status(error)` 计算；因此
+`run()` 返回或 `Execution.wait()` 醒来时，观察者已经收到终态事件，而观察者回调内读到的 `execution.status` 可能仍为 RUNNING，
+应以事件的 `status` 与 `error_type` 为准。写入成功前宿主先执行一次 `checkpoint()`，使取消与超时反映在终态事件中。
 
 Runtime 按 `RouterRole`、`WorkerRole` 接受结构化实现，具体的 EventRouter 与 GraphWorker 是默认角色实现。
 ExecutionFactory 为直接执行和队列 Work 创建同一类句柄，可注入 OutputStore 与 ExecutionNotifier。宿主调用公开的
@@ -179,6 +192,9 @@ sequenceDiagram
 EventRouter 不需要目标 Graph 定义，只负责把匹配 Event 转成 Work。GraphWorker 不需要源 Event，只按 Work 中的
 注册名寻找 Graph。两者可以位于不同进程，只要 EventBus 和任务传输实现对应部署语义；进程边界不会延续 Slot，
 接收端 TaskConsumer 会为该 Work 开始新的本地 Slot 链。
+
+`Work.id` 同时作为本地 Execution ID。同一 id 的重投递在前一次 Execution 已收尾时替换其保留记录，`get_execution(id)` 返回最新一次
+尝试；前一次仍在执行时 Worker 以 REJECT 拒绝本次交付，不并发执行同一 Work。
 
 ## Graph 冻结边界
 
@@ -219,19 +235,22 @@ flowchart LR
 | Node Hook | execution start | 在途 execution 不受 attach/detach 影响 |
 | Runtime Observer | 发布每个 RuntimeEvent 时读取 | 支持动态观察且不干预业务结果 |
 
-Observer 异常会被隔离。Hook 可以转换输入、输出或流程，但最终结果仍受 Graph 端口和执行控制契约约束。
+Runtime Observer 与 `observe()` 注册的 Event 观察者的异常都会被记录并隔离；只有 route 的 Work 提交失败以
+`EventDispatchError` 传回 `emit()`。Hook 可以转换输入、输出或流程，但最终结果仍受 Graph 端口和执行控制契约约束。
 
 ## Slot 租约与分支
 
 Event 和 Work 都不携带 lease。同一进程内，TaskConsumer 为根 Work 从 SlotPool 获取 lease；本地 Router 与
 TaskBackend 通过仅限进程内的发布上下文和 Delivery 为每个下游分支保留引用，交付完成后释放，最后一个分支结束时
-Slot 回到池中。同一个 Slot 使用 execution lock 保证 Graph 不会并发修改链路状态。远程传输只序列化 Event/Work；
+Slot 回到池中。发布上下文只由 route 的 Work 提交读取；`observe()` 观察者调用期间该上下文被清空，观察者内部的
+emit 开始新的 Slot 链。同一个 Slot 使用 execution lock 保证 Graph 不会并发修改链路状态。远程传输只序列化 Event/Work；
 接收端反序列化后创建新的本地根 Delivery 和 Slot 链。
 
 ## 生命周期与所有权
 
 插件模式下，Runtime 排空工作后关闭 PluginHost。宿主先逆序注销已安装的 selector、Hook 和 Observer，再逆序停止已进入
-`setup()` 的插件；贡献安装或 `start()` 中途失败也按同一清理流程回滚。延迟 Hook 在目标 Graph 注册前后均可注销，
+`setup()` 的插件；贡献安装或 `start()` 中途失败也按同一清理流程回滚，单项清理失败不跳过后续步骤并写入日志，回滚
+最终重新抛出原始失败。延迟 Hook 在目标 Graph 注册前后均可注销，
 注入执行器不会因宿主退出而留下本次贡献。LocalRuntimePlugin 关闭它提供的角色和自己创建的底层组件。
 注入组件默认由调用方管理，`close_injected=True` 才转移所有权。
 selector 注销只影响后续 Graph 冻结，已经绑定的 Graph 保留原选择器快照；共享 PolicyRegistry 可供后续装配继续使用。
@@ -242,9 +261,17 @@ selector 注销只影响后续 Graph 冻结，已经绑定的 Graph 保留原选
 Router 保存并注销自己的 Event 订阅，Worker 保存并注销自己的消费绑定。共享传输可以继续供其他角色使用。
 消费注销需要等待已分配交付完成最终 lease 释放，再回收该绑定的线程资源和不再使用的 Slot 可用通知。
 
-默认内存通道的最后一个消费者注销前，还会排空该通道已经接受的排队和在途 Work，包括产生的同通道续作，然后
-原子地移除消费者并停止该通道接收新 Work。退订后的 `submit()`、`submit_local()` 明确抛错，重新成功绑定消费者后
-恢复接收；从未绑定消费者的通道仍允许先排队。这个边界避免 Router 与 Worker 关闭的间隙留下无人处理的新 Work。
+Runtime 与 GraphWorker 使用同一 OPEN -> CLOSING -> CLOSED 状态机。首个 `close()` 原子进入 CLOSING：Runtime 拒绝新的 `emit()`、
+直接执行与配置变更，GraphWorker 同样拒绝新的直接执行、注册与消费绑定，并以 RuntimeClosedError 报告；已绑定通道中的 Work 及其
+跨图延续继续排空。排空后 Worker 关闭直接执行池、注销消费绑定、关闭自有组件并进入 CLOSED。并发 `close()` 等待同一次关闭完成后返回。
+`Runtime.on()` 先绑定消费者再注册 route；route 失败时撤销本次新建的消费绑定，此前已存在的消费者不受影响。
+
+默认内存通道只在已有消费者时接受 Work：从未绑定或最后消费者已经注销的通道，`submit()`、`submit_local()` 立即抛错，
+route 因而以 `EventDispatchError` 让 `emit()` 快速失败，不会留下使 `wait_idle()`、`close()` 挂起的排队 Work。
+最后一个消费者注销前，会排空该通道已经接受的排队和在途 Work，包括产生的同通道续作，然后原子地移除消费者；重新
+成功绑定消费者后恢复接收。这个边界避免 Router 与 Worker 关闭的间隙留下无人处理的新 Work。EventRouter 与
+memory.TaskBackend 关闭时先进入 CLOSING：Router 拒绝新的注册与发布，TaskBackend 拒绝新绑定、继续接受已有消费者
+通道的续作并在排空后撤下消费者；并发 `close()` 等待同一次关闭完成。
 
 ## 架构边界
 

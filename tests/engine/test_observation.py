@@ -70,9 +70,11 @@ def test_runtime_observer_rolls_back_router_if_worker_registration_fails() -> No
             raise RuntimeError("worker registration failed")
 
         runtime.worker.observe_runtime = reject
+        seen: list[object] = []
         with pytest.raises(RuntimeError, match="worker registration failed"):
-            runtime.observe_runtime(lambda event: None)
-        assert runtime.router._observations._observers == ()
+            runtime.observe_runtime(seen.append)
         runtime.worker.observe_runtime = original
+        runtime.emit("probe")
+        assert seen == []
     finally:
         runtime.close()

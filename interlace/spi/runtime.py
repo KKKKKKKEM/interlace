@@ -8,8 +8,9 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 from uuid import uuid4
 
-from ..engine.core import require_non_empty_string
-from ..engine.events import Event, snapshot_options
+from .._validation import require_non_empty_string
+from ..engine.events import Event
+from ..engine.options import snapshot_options
 from ..engine.execution import Execution, ExecutionLimits
 from ..engine.graph import ExecutionPlan, Graph
 from ..engine.hooks import HookHandle, HookPhase, NodeHook
@@ -20,15 +21,19 @@ EventHandler = Callable[[Event], None]
 
 @dataclass(frozen=True, slots=True)
 class Work:
-    """TaskBackend 搬运的可序列化执行请求。
+    """任务传输搬运的一次 Graph 执行请求，不携带进程内 Slot 或 lease。
+
+    ``id`` 同时作为本地 Execution ID。同一 id 的重投递（通常 attempt 更高）在前一次 Execution 已进入终态时
+    替换其保留记录，``get_execution(id)`` 返回最新一次尝试；前一次仍在执行时 Worker 以 REJECT 拒绝本次
+    交付，不并发执行同一 Work。
 
     Attributes:
-        graph: 关联的 Graph 定义或注册名称。
-        inputs: 节点调用或工作请求的输入数据。
-        trigger: 触发当前 Work 的领域事件。
-        id: 当前对象的唯一标识。
-        limits: 单次执行的步数与超时限制。
-        options: 当前工作独立持有的执行配置快照，传输方负责值的序列化。
+        graph: 目标 Graph 的注册名称。
+        inputs: 交给目标 Graph 入口的输入数据，跨进程传输时由适配器序列化。
+        trigger: 触发本 Work 的 Event；不参与相等比较和 repr。
+        id: 非空唯一标识，默认生成 UUID4 字符串，适配器可传入以恢复已有 ID。
+        limits: 本次执行独立使用的步数、时长与队列限制。
+        options: 构造时深复制的执行配置快照，值的序列化由传输方负责。
     """
 
     graph: str
@@ -39,10 +44,11 @@ class Work:
     options: Mapping[str, Any] = field(default_factory=dict, kw_only=True)
 
     def __post_init__(self) -> None:
-        """校验构造字段并固定需要保持不变的数据。
+        """校验 graph、id 与 limits，并固定 options 的深复制快照。
 
         Raises:
-            TypeError: 参数类型或接口实现不符合当前契约。
+            TypeError: limits 不是 ExecutionLimits，或 graph、id 不是字符串。
+            ValueError: graph 或 id 为空字符串。
         """
 
         require_non_empty_string(self.graph, "work graph")
@@ -54,12 +60,14 @@ class Work:
 
 @dataclass(frozen=True, slots=True)
 class Delivery:
-    """一次本地可确认投递；attempt 从 1 开始并随重投递递增。
+    """TaskConsumer 交给 handler 的一次本地交付。
+
+    重投递使用同一个 Work 和递增的 attempt；Worker 对重投递的处理规则见 Work。
 
     Attributes:
-        work: 本次投递携带的工作请求。
-        attempt: 当前投递次数，从 1 开始。
-        slot_lease: 当前进程内随投递传递的 Slot 引用，不跨进程序列化。
+        work: 本次交付的 Work。
+        attempt: 交付次数，首次为 1，每次重投递加 1。
+        slot_lease: 随交付传递的进程内 Slot 引用，由交付方在交付结束后释放；不参与比较、repr 或序列化。
     """
 
     work: Work
@@ -72,11 +80,11 @@ class Delivery:
     )
 
     def __post_init__(self) -> None:
-        """校验构造字段并固定需要保持不变的数据。
+        """校验 work、attempt 与 slot_lease 的类型和取值。
 
         Raises:
-            TypeError: 参数类型或接口实现不符合当前契约。
-            ValueError: 参数值或字段组合不合法。
+            TypeError: work 不是 Work，或 slot_lease 不实现 SlotLease。
+            ValueError: attempt 不是正整数。
         """
 
         if not isinstance(self.work, Work):
@@ -88,12 +96,12 @@ class Delivery:
 
 
 class DeliveryOutcome(str, enum.Enum):
-    """后端处理单次交付结果的固定决定。
+    """handler 对单次交付的处理决定。
 
     Attributes:
-        ACK: 接受本次交付，不要求重投递。
-        RETRY: 要求任务后端重投递。
-        REJECT: 拒绝本次交付。
+        ACK: 交付已完成，不再投递。
+        RETRY: 请求 backend 按自身策略重新投递。
+        REJECT: 拒绝本次交付，不再投递；携带的错误交给 backend 的失败处理。
     """
 
     ACK = "ack"
@@ -103,21 +111,22 @@ class DeliveryOutcome(str, enum.Enum):
 
 @dataclass(frozen=True, slots=True)
 class DeliveryResult:
-    """由 handler 返回给 backend 的唯一交付决定。
+    """handler 返回给 backend 的唯一交付决定。
 
     Attributes:
-        outcome: 后端应执行的接受、重试或拒绝决定。
-        error: 当前结果携带的原始异常，正常结果为 None。
+        outcome: ACK、RETRY 或 REJECT。
+        error: RETRY 或 REJECT 携带的原始异常；ACK 必须为 None，不参与比较和 repr。
     """
 
     outcome: DeliveryOutcome
     error: BaseException | None = field(default=None, compare=False, repr=False)
 
     def __post_init__(self) -> None:
-        """校验构造字段并固定需要保持不变的数据。
+        """校验 outcome 与 error 的组合。
 
         Raises:
-            TypeError: 参数类型或接口实现不符合当前契约。
+            TypeError: outcome 不是 DeliveryOutcome，或 error 不是异常实例。
+            ValueError: ACK 携带了 error。
         """
 
         if not isinstance(self.outcome, DeliveryOutcome):
@@ -129,50 +138,50 @@ class DeliveryResult:
 
     @classmethod
     def ack(cls) -> DeliveryResult:
-        """创建接受本次投递的交付决定。
+        """创建 ACK 决定。
 
         Returns:
-            包含交付决定和可选异常的 DeliveryResult。
+            不携带错误的 ACK 结果。
         """
 
         return cls(DeliveryOutcome.ACK)
 
     @classmethod
     def retry(cls, error: BaseException | None = None) -> DeliveryResult:
-        """创建请求后端重新投递的交付决定。
+        """创建请求重新投递的决定。
 
         Args:
-            error: 需要传播、记录或用于恢复的异常。
+            error: 本次失败的原因；重投递耗尽时 backend 可将其作为最终失败。
 
         Returns:
-            包含交付决定和可选异常的 DeliveryResult。
+            RETRY 结果。
         """
 
         return cls(DeliveryOutcome.RETRY, error)
 
     @classmethod
     def reject(cls, error: BaseException | None = None) -> DeliveryResult:
-        """创建拒绝本次投递的交付决定。
+        """创建拒绝本次交付的决定。
 
         Args:
-            error: 需要传播、记录或用于恢复的异常。
+            error: 拒绝原因；None 表示无需上报的拒绝。
 
         Returns:
-            包含交付决定和可选异常的 DeliveryResult。
+            REJECT 结果。
         """
 
         return cls(DeliveryOutcome.REJECT, error)
 
 
 class EventBus(Protocol):
-    """发布和订阅 Event 的替换协议。"""
+    """Event 发布、订阅和投递生命周期的替换协议，不接触 Slot 或 lease。"""
 
     @property
     def idle(self) -> bool:
-        """返回当前是否没有尚未投递完成的 Event。
+        """判断是否没有尚未投递完成的 Event。
 
         Returns:
-            没有未完成工作时为 True，否则为 False。
+            没有在途投递时为 True。
         """
         ...
 
@@ -183,75 +192,79 @@ class EventBus(Protocol):
         *,
         subscription: str | None = None,
     ) -> Callable[[], None]:
-        """订阅 Event；同名 subscription 的实例竞争消费。
+        """订阅 Event；同名 subscription 的注册竞争消费，不同 subscription 各收到一份。
 
         Args:
-            event_type: 用于订阅或路由匹配的事件类型。
-            handler: 接收事件或投递的处理函数。
+            event_type: 精确事件类型，或匹配全部类型的 ``"*"``。
+            handler: 接收 Event 的处理函数。
             subscription: 竞争消费组名称，None 创建独立订阅。
 
         Returns:
-            仅注销本次注册的幂等函数；已接受的投递仍可完成。
+            仅注销本次注册的幂等函数；已经选中的投递仍可完成。
         """
 
     def publish(self, event: Event) -> None:
-        """发布一个 Event。
+        """发布一个 Event；正常返回表示传输已接受该 Event。
 
         Args:
-            event: 需要发布、观察或处理的事件。
+            event: 需要发布的 Event。
         """
 
     def wait_idle(self, timeout: float | None = None) -> None:
-        """等待已接受 Event 投递完成。
+        """等待已接受的 Event 投递完成。
 
         Args:
-            timeout: 等待或执行时限，单位秒；None 表示不设置时限。
+            timeout: 最长等待秒数；None 表示一直等待。
         """
 
     def close(self) -> None:
-        """关闭传输。"""
+        """停止接受新的订阅和发布，并释放传输资源。"""
 
 
 WorkHandler = Callable[[Delivery], DeliveryResult]
 
 
 class TaskPublisher(Protocol):
-    """向命名任务通道投递 Work。"""
+    """向命名任务通道投递 Work 的发布端协议。"""
 
     def submit(self, queue: str, work: Work) -> None:
         """向命名通道提交 Work；正常返回表示后端已接受。
 
         Args:
             queue: 命名消费通道。
-            work: 需要投递或执行的工作请求。
+            work: 需要执行的 Work。
         """
 
     def close(self) -> None:
         """关闭发布端持有的资源。"""
 
 
+@runtime_checkable
 class LocalTaskPublisher(TaskPublisher, Protocol):
-    """可在当前进程延续 Slot 链的可选任务发布能力。"""
+    """可在当前进程延续 Slot 链的可选任务发布能力，按结构化协议识别。"""
 
     def submit_local(self, queue: str, work: Work, lease: SlotLease) -> None:
-        """正常返回时接管一个 lease 引用；抛错时引用仍由调用方持有。
+        """提交延续 lease 所属 Slot 链的 Work。
+
+        正常返回时接管调用方转交的一个 lease 引用；抛错时引用仍由调用方释放，接收方不得为同一交接
+        再次 retain。
 
         Args:
             queue: 命名消费通道。
-            work: 需要投递或执行的工作请求。
-            lease: 当前进程内执行槽的引用与串行执行能力。
+            work: 需要执行的 Work。
+            lease: 当前进程内的 Slot 引用，不跨进程序列化。
         """
 
 
 class TaskConsumer(Protocol):
-    """从命名任务通道消费 Work。"""
+    """从命名任务通道消费 Work，并控制本地并发与 Slot 分配的消费端协议。"""
 
     @property
     def idle(self) -> bool:
-        """返回当前实例是否没有尚未完成的 Work。
+        """判断是否没有尚未完成的交付。
 
         Returns:
-            没有未完成工作时为 True，否则为 False。
+            没有排队或在途交付时为 True。
         """
         ...
 
@@ -267,19 +280,19 @@ class TaskConsumer(Protocol):
 
         Args:
             queue: 命名消费通道。
-            handler: 接收事件或投递的处理函数。
-            concurrency: 当前消费者允许并行执行的完整 Graph 数量。
-            slots: 提供本地执行槽的资源池能力。
+            handler: 处理 Delivery 并返回 DeliveryResult 的函数。
+            concurrency: 本次绑定同时执行的 Delivery 上限。
+            slots: 为根 Work 申请 Slot 的提供方；None 时由实现自建。
 
         Returns:
-            注销本次绑定并等待已接受交付清理的幂等函数；排队工作遵循后端的排空契约。
+            注销本次绑定并等待已分配交付完成 lease 清理的幂等函数；排队工作遵循后端声明的排空契约。
         """
 
     def wait_idle(self, timeout: float | None = None) -> None:
-        """等待当前实例已接受的 Work 完成。
+        """等待已接受的 Work 完成，并传播实现记录的交付失败。
 
         Args:
-            timeout: 等待或执行时限，单位秒；None 表示不设置时限。
+            timeout: 最长等待秒数；None 表示一直等待。
         """
 
     def close(self) -> None:
@@ -287,7 +300,7 @@ class TaskConsumer(Protocol):
 
 
 class TaskBackend(TaskPublisher, TaskConsumer, Protocol):
-    """兼具任务发布和消费能力的便捷组合协议。"""
+    """同时实现发布与消费的组合协议。"""
 
 
 Emit = Callable[[Event], None]
@@ -295,7 +308,7 @@ Emit = Callable[[Event], None]
 
 @runtime_checkable
 class GraphExecutor(Protocol):
-    """执行单张 Graph 的替换协议。"""
+    """执行单张冻结 Graph 的替换协议，不管理队列、Graph 注册表或 Execution 终态。"""
 
     def execute(
         self,
@@ -308,13 +321,13 @@ class GraphExecutor(Protocol):
         slot: Slot | None = None,
         options: Mapping[str, Any] | None = None,
         execution: Execution,
-    ) -> None | Awaitable[None]:
+    ) -> Awaitable[None] | None:
         """执行冻结 Graph，通过 execution.publish_output/apublish_output 交付结果。
 
         Args:
-            name: 注册或查找使用的名称。
+            name: Graph 的注册名称，用于观测与错误上下文。
             graph: 冻结的目标图；执行器每次节点调用使用 graph.context_factory 创建上下文。
-            inputs: 入口数据或按端口名称组织的输入映射。
+            inputs: 已按入口端口名组织的初始输入映射。
             emit: 发布跨图事件的回调。
             plan: 限定本次执行范围的计划，None 使用完整 Graph。
             slot: 当前逻辑执行链使用的本地执行槽。
@@ -345,17 +358,19 @@ class HookableGraphExecutor(GraphExecutor, Protocol):
 
         Args:
             hook: 节点 Hook 对象或单阶段回调。
-            phase: 函数 Hook 对应的执行阶段。
-            graph: 目标 Graph 定义或其注册名称，以类型声明为准。
-            node: 节点实例或作用域中的节点 ID，以接口类型为准。
+            phase: 函数 Hook 对应的执行阶段；NodeHook 对象必须为 None。
+            graph: 限定生效的 Graph 注册名称，None 表示全部 Graph。
+            node: 限定生效的 Graph 内节点 ID，需要同时指定 graph。
 
         Returns:
-            用于卸载本次注册的句柄。
+            可独立卸载本次挂载的句柄。
         """
         ...
 
 
 class ExecutionFactory(Protocol):
+    """为直接执行和队列 Work 创建 Execution 句柄的工厂协议，可注入 OutputStore 与 ExecutionNotifier。"""
+
     def __call__(
         self,
         graph: str,
@@ -364,15 +379,15 @@ class ExecutionFactory(Protocol):
         id: str | None = None,
         output_buffer: int = 64,
     ) -> Execution:
-        """创建全新的 Execution，可为其注入独立存储和通知实现。
+        """创建一个尚未开始的全新 Execution。
 
         Args:
-            graph: 目标 Graph 定义或其注册名称，以类型声明为准。
-            limits: 本次执行独立使用的步数和时长限制。
-            id: 对象标识，允许缺省时由实现生成。
+            graph: 目标 Graph 的注册名称。
+            limits: 本次执行独立使用的步数、时长与队列限制。
+            id: Execution ID；队列 Work 传入 Work.id，None 时由实现生成。
             output_buffer: 每个活跃输出流允许积压的输出条数。
 
         Returns:
-            本次操作得到的 Execution 实例。
+            处于未开始状态、由宿主调用 start/succeed/fail 的 Execution。
         """
         ...
