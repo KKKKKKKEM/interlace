@@ -2,19 +2,19 @@
 
 from __future__ import annotations
 
-from interlace import Graph, Node, Ports, Runtime
+from interlace import Graph, Node, Runtime
 
 
 class Publish(Node):
     """通过上下文发布跨图事件的示例节点。
 
     Attributes:
-        input_ports: 输入端口，message 为要发布的消息文本。
-        output_ports: 空输出端口；节点只发布事件，不产生 Output。
+        inputs: 输入端口，message 为要发布的消息文本。
+        outputs: 空输出端口；节点只发布事件，不产生 Output。
     """
 
-    input_ports = Ports(message=str)
-    output_ports = Ports()
+    inputs = {"message": str}
+    outputs = {}
 
     def execute(self, inputs, context):
         """把 message 作为 message.created 事件发布，不产生本图 Output。
@@ -31,13 +31,13 @@ class Collect(Node):
     """将事件输入追加到调用方消息列表的示例节点。
 
     Attributes:
-        input_ports: 输入端口，message 接收路由过来的事件载荷。
-        output_ports: 空输出端口；节点只记录消息，不产生 Output。
+        inputs: 输入端口，message 接收路由过来的事件载荷。
+        outputs: 空输出端口；节点只记录消息，不产生 Output。
         _received: 调用方传入的消息列表，节点向其追加收到的消息以便观察结果。
     """
 
-    input_ports = Ports(message=str)
-    output_ports = Ports()
+    inputs = {"message": str}
+    outputs = {}
 
     def __init__(self, received: list[str]) -> None:
         """保存调用方提供的消息收集列表。

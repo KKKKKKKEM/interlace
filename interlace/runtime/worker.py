@@ -13,7 +13,12 @@ from typing import Any
 
 from .._validation import require_non_empty_string, validate_timeout
 from ..engine.core import Output
-from ..engine.errors import ExecutionError, InterlaceRuntimeError, UnknownGraphError
+from ..engine.errors import (
+    ExecutionError,
+    InterlaceRuntimeError,
+    RuntimeClosedError,
+    UnknownGraphError,
+)
 from ..engine.events import Event
 from ..engine.execution import (
     Execution,
@@ -22,35 +27,36 @@ from ..engine.execution import (
     terminal_status,
 )
 from ..engine.executor import Engine
+from ..engine.extension import HookBus, Registration
 from ..engine.graph import ExecutionPlan, Graph
-from ..engine.hooks import HookHandle, HookPhase, NodeHook
-from ..engine.observation import (
-    ObservationHub,
-    ObserverHandle,
-    RuntimeEvent,
-    RuntimeEventKind,
-    RuntimeObserver,
-)
+from ..engine.observation import RuntimeEvent, RuntimeEventKind
 from ..engine.options import snapshot_options
-from ..engine.policies import InputSelector, PolicyRegistry
+from ..engine.points import RUNTIME_EVENT
 from ..engine.runner import LocalRunner
 from ..engine.slots import Slot, SlotPool
 from ..spi import (
     Delivery,
+    DeliveryOutcome,
     DeliveryResult,
     Emit,
     ExecutionFactory,
     GraphExecutor,
-    HookableGraphExecutor,
     SlotLease,
     SlotProvider,
     TaskConsumer,
     Work,
 )
 from ._utils import _close_components, _Lifecycle, _remaining, _unique
-from .contributions import _DeferredHooks, _HookContribution
 from .direct import _DirectRunner
 from .history import _ExecutionHistory
+from .points import EXECUTION_RUN, WORK_DELIVER, ExecutionCall
+
+# 交付结果写入 WORK_FINISHED 的状态字符串。
+_DELIVERY_STATUS = {
+    DeliveryOutcome.ACK: "acked",
+    DeliveryOutcome.RETRY: "retried",
+    DeliveryOutcome.REJECT: "rejected",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,7 +81,7 @@ class GraphWorker:
 
     生命周期为 OPEN -> CLOSING -> CLOSED。首个 `close()` 进入 CLOSING：拒绝新的直接执行和配置变更，
     已绑定通道中的 Work 及其延续继续排空；排空后注销消费者、释放自有组件并进入 CLOSED。并发的
-    `close()` 等待同一次关闭完成。
+    `close()` 等待同一次关闭完成。交付经 WORK_DELIVER 包裹，执行外层经 EXECUTION_RUN 包裹。
 
     Attributes:
         _consumer: 绑定命名通道并交付 Work 的任务消费能力。
@@ -86,15 +92,14 @@ class GraphWorker:
         _emit_local: 携带 Slot lease 发布跨图事件的回调，None 时退化为 _emit。
         _owned_components: Worker 自建并负责关闭的组件。
         _close_injected: 关闭时是否同时关闭注入的 consumer 与 executor。
-        _observations: Worker 生命周期事件的分发中心。
-        _policies: 冻结 Graph 时使用的输入策略注册表。
+        _hooks: 所属 Runtime 的钩子总线：交付与执行中间件、生命周期通知和输入选择器注册表。
+        _accepting: begin_close 之前为 True；之后拒绝新的直接执行。
         _graphs: 按注册名保存的冻结 Graph，只增不减。
         _queues: 按通道名保存的消费者绑定，受 _configure_lock 保护。
-        _hooks: 等待目标 Graph 注册的插件 Hook 贡献，受 _lock 保护。
         _history: 本地 Execution 记录与活跃计数。
         _direct: 直接执行线程池。
         _lifecycle: OPEN/CLOSING/CLOSED 关闭状态。
-        _lock: 保护 Graph 注册表、延迟 Hook 与运行器创建；持有期间不调用任务后端。
+        _lock: 保护 Graph 注册表与运行器创建；持有期间不调用任务后端。
         _configure_lock: 串行化消费者绑定与注销，使后端调用不占用 _lock。
     """
 
@@ -105,10 +110,9 @@ class GraphWorker:
         executor: GraphExecutor | None = None,
         execution_factory: ExecutionFactory | None = None,
         emit: Emit | None = None,
-        emit_local: Callable[[Event, SlotLease], None] | None = None,
+        emit_local: Callable[[Event, SlotLease], object] | None = None,
         close_injected: bool = False,
-        observations: ObservationHub | None = None,
-        policies: PolicyRegistry | None = None,
+        hooks: HookBus | None = None,
         history_limit: int = 1000,
         direct_workers: int | None = None,
     ) -> None:
@@ -121,13 +125,12 @@ class GraphWorker:
             emit: 发布跨图事件的回调；None 时 Node 发出事件会失败。
             emit_local: 携带当前 Slot lease 发布跨图事件的回调；None 时使用 emit，不延续 Slot 链。
             close_injected: 关闭时是否同时关闭注入的 consumer 与 executor。
-            observations: 生命周期事件分发中心；None 时新建。
-            policies: 冻结 Graph 时使用的输入策略注册表；None 时新建。
+            hooks: 所属 Runtime 的钩子总线；None 时新建。默认 Engine 使用同一总线。
             history_limit: 保留 Execution 记录的数量上限，超出后淘汰最早的已结束记录；默认 1000。
             direct_workers: `start/iter/aiter` 直接执行线程池的线程数上限；None 使用标准库默认值。
 
         Raises:
-            TypeError: 参数类型不符合契约。
+            TypeError: 参数类型不符合契约，或 hooks 不是 HookBus。
             ValueError: history_limit 或 direct_workers 小于 1。
         """
 
@@ -141,13 +144,15 @@ class GraphWorker:
             raise TypeError("worker emitter must be callable")
         if emit_local is not None and not callable(emit_local):
             raise TypeError("worker local emitter must be callable or None")
+        if hooks is None:
+            hooks = HookBus()
+        elif not isinstance(hooks, HookBus):
+            raise TypeError("hooks must be a HookBus")
         self._history = _ExecutionHistory(history_limit)
         self._direct = _DirectRunner(direct_workers)
         owned: list[object] = []
-        if observations is None:
-            observations = ObservationHub()
         if executor is None:
-            executor = Engine(observations=observations)
+            executor = Engine(hooks=hooks)
             owned.append(executor)
         self._consumer = consumer
         self._executor = executor
@@ -159,11 +164,10 @@ class GraphWorker:
         self._emit_local = emit_local
         self._owned_components = owned
         self._close_injected = close_injected
-        self._observations = observations
-        self._policies = PolicyRegistry() if policies is None else policies
+        self._hooks = hooks
+        self._accepting = True
         self._graphs: dict[str, Graph] = {}
         self._queues: dict[str, _QueueBinding] = {}
-        self._hooks = _DeferredHooks(self._install_hook)
         self._lifecycle = _Lifecycle("GraphWorker")
         self._lock = RLock()
         self._configure_lock = Lock()
@@ -179,7 +183,7 @@ class GraphWorker:
         return self._history.idle and self._consumer.idle
 
     def register(self, name: str, graph: Graph) -> GraphWorker:
-        """以稳定名称注册 Graph，必要时用 Worker 的策略注册表冻结它，并安装延迟 Hook。
+        """以稳定名称注册 Graph，必要时以当前登记的输入选择器冻结它。
 
         Args:
             name: 非空注册名，同一 Worker 内唯一。
@@ -190,7 +194,7 @@ class GraphWorker:
 
         Raises:
             TypeError: graph 不是 Graph。
-            ValueError: 名称为空，或延迟 Hook 指向 Graph 中不存在的节点。
+            ValueError: 名称为空。
             InterlaceRuntimeError: 名称已经注册。
             RuntimeClosedError: Worker 已开始关闭。
         """
@@ -203,8 +207,7 @@ class GraphWorker:
             if name in self._graphs:
                 raise InterlaceRuntimeError(f"duplicate registered graph {name!r}")
             if not graph.frozen:
-                graph.freeze(self._policies)
-            self._hooks.bind(name, graph)
+                graph.freeze(self._hooks.provided())
             self._graphs[name] = graph
         return self
 
@@ -223,8 +226,8 @@ class GraphWorker:
         queue: str,
         *,
         concurrency: int = 1,
-        slots: SlotProvider | None = None,
-    ) -> Callable[[], None]:
+        slots: SlotProvider | int | None = None,
+    ) -> Registration:
         """绑定命名通道的本地消费者；concurrency 限制 Graph execution，slots 限制逻辑执行链。
 
         同一通道以相同配置重复消费时不再绑定。
@@ -232,14 +235,15 @@ class GraphWorker:
         Args:
             queue: 非空命名消费通道。
             concurrency: 该通道同时运行的完整 Graph execution 上限，至少为 1。
-            slots: 根 Work 申请 Slot 的资源池；None 时创建大小等于 concurrency 的自有 SlotPool。
+            slots: 根 Work 申请 Slot 的资源池；整数创建该大小的自有 SlotPool，None 时自有池大小等于
+                concurrency。多个通道共享同一个池时传入 SlotPool 实例。
 
         Returns:
-            幂等释放函数：撤销本次新建的消费者绑定及其自建 SlotPool；通道此前已由相同配置消费时为空操作。
+            撤销本次新建的消费者绑定及其自建 SlotPool 的句柄；通道此前已由相同配置消费时注销为空操作。
 
         Raises:
-            TypeError: concurrency 不是整数，或 slots 未实现 SlotProvider。
-            ValueError: queue 为空或 concurrency 小于 1。
+            TypeError: concurrency 不是整数，或 slots 既不是整数也未实现 SlotProvider。
+            ValueError: queue 为空、concurrency 或整数 slots 小于 1。
             InterlaceRuntimeError: 通道已使用不同的并发或 SlotPool 消费。
             RuntimeClosedError: Worker 已开始关闭。
         """
@@ -249,8 +253,13 @@ class GraphWorker:
             raise TypeError("queue concurrency must be an integer")
         if concurrency < 1:
             raise ValueError("queue concurrency must be at least 1")
-        if slots is not None and not isinstance(slots, SlotProvider):
-            raise TypeError("slots must implement SlotProvider or be None")
+        if type(slots) is int:
+            if slots < 1:
+                raise ValueError("slots must be at least 1")
+        elif slots is not None and not isinstance(slots, SlotProvider):
+            raise TypeError(
+                "slots must be an integer, implement SlotProvider or be None"
+            )
         with self._configure_lock:
             self._lifecycle.ensure_open()
             configured = self._queues.get(queue)
@@ -260,18 +269,25 @@ class GraphWorker:
                         f"queue {queue!r} already uses local concurrency "
                         f"{configured.concurrency}"
                     )
-                if slots is not None and slots is not configured.slots:
+                if isinstance(slots, SlotProvider) and slots is not configured.slots:
                     raise InterlaceRuntimeError(
                         f"queue {queue!r} already uses a different SlotPool"
                     )
-                return _noop
+                if type(slots) is int and (
+                    configured.owned_slots is None
+                    or configured.owned_slots.size != slots
+                ):
+                    raise InterlaceRuntimeError(
+                        f"queue {queue!r} already uses a different SlotPool"
+                    )
+                return Registration(_noop)
             owned_slots = None
-            if slots is None:
-                slots = owned_slots = SlotPool(concurrency)
+            if not isinstance(slots, SlotProvider):
+                slots = owned_slots = SlotPool(concurrency if slots is None else slots)
             try:
                 unbind = self._consumer.bind(
                     queue,
-                    self._execute_delivery,
+                    partial(self._execute_delivery, queue),
                     concurrency=concurrency,
                     slots=slots,
                 )
@@ -281,7 +297,7 @@ class GraphWorker:
                 raise
             binding = _QueueBinding(concurrency, slots, unbind, owned_slots)
             self._queues[queue] = binding
-        return partial(self._release_queue, queue, binding)
+        return Registration(partial(self._release_queue, queue, binding))
 
     def start(
         self,
@@ -441,120 +457,6 @@ class GraphWorker:
 
         return self._history.snapshot()
 
-    def attach(
-        self,
-        hook: NodeHook | Callable[..., object],
-        *,
-        phase: HookPhase | str | None = None,
-        graph: str | None = None,
-        node: str | None = None,
-    ) -> HookHandle:
-        """动态挂载 Node Hook；变更从下一次 Graph execution 生效。
-
-        Args:
-            hook: NodeHook 对象，或配合 phase 使用的单阶段回调。
-            phase: 单阶段回调对应的阶段，Hook 对象为 None。
-            graph: 目标 Graph 注册名，None 作用于全部 Graph；必须已经注册。
-            node: 目标节点 ID，None 作用于整张 Graph；指定时必须同时指定 graph。
-
-        Returns:
-            卸载本次注册的句柄。
-
-        Raises:
-            UnknownGraphError: graph 未注册。
-            ValueError: graph 中不存在 node。
-            TypeError: 当前 GraphExecutor 不支持 Hook。
-            RuntimeClosedError: Worker 已开始关闭。
-        """
-
-        self._lifecycle.ensure_open()
-        if graph is not None:
-            graph = require_non_empty_string(graph, "hook graph")
-            registered = self._get_graph(graph)
-            if node is not None:
-                node = require_non_empty_string(node, "hook node")
-                if node not in registered.nodes:
-                    raise ValueError(f"graph {graph!r} has no node {node!r}")
-        return self._attach_executor_hook(hook, phase=phase, graph=graph, node=node)
-
-    def contribute_hook(
-        self,
-        hook: NodeHook | Callable[..., object],
-        *,
-        phase: HookPhase | str | None = None,
-        graph: str | None = None,
-        node: str | None = None,
-    ) -> Callable[[], None]:
-        """安装插件 Hook；目标 Graph 尚未注册时延迟到注册时安装。
-
-        Args:
-            hook: NodeHook 对象，或配合 phase 使用的单阶段回调。
-            phase: 单阶段回调对应的阶段，Hook 对象为 None。
-            graph: 目标 Graph 注册名，None 作用于全部 Graph；可以尚未注册。
-            node: 目标节点 ID，None 作用于整张 Graph；指定时必须同时指定 graph。
-
-        Returns:
-            幂等注销函数，目标 Graph 注册前后均可撤销本次贡献。
-
-        Raises:
-            ValueError: 只指定 node 未指定 graph，或已注册 graph 中不存在 node。
-            TypeError: 当前 GraphExecutor 不支持 Hook。
-            RuntimeClosedError: Worker 已开始关闭。
-        """
-
-        self._lifecycle.ensure_open()
-        if graph is None and node is not None:
-            raise ValueError("node-scoped hook requires graph")
-        if graph is not None:
-            graph = require_non_empty_string(graph, "hook graph")
-        if node is not None:
-            node = require_non_empty_string(node, "hook node")
-        if not isinstance(self._executor, HookableGraphExecutor):
-            raise TypeError("the configured GraphExecutor does not support hooks")
-        contribution = _HookContribution(hook, phase, graph, node)
-        with self._lock:
-            registered = None if graph is None else self._graphs.get(graph)
-            if graph is not None and registered is None:
-                self._hooks.defer(contribution)
-            else:
-                if (
-                    registered is not None
-                    and node is not None
-                    and node not in registered.nodes
-                ):
-                    raise ValueError(f"graph {graph!r} has no node {node!r}")
-                self._hooks.install(contribution)
-        return partial(self._withdraw_hook, contribution)
-
-    def register_policy(self, name: str, selector: InputSelector) -> Callable[[], None]:
-        """注册 selector contribution；使用它的 Graph 必须尚未冻结。
-
-        Args:
-            name: 带命名空间的策略名。
-            selector: 只依据端口和 token 数量选择输入的实现。
-
-        Returns:
-            仅撤销本次策略注册的幂等函数，不影响已冻结的 Graph。
-
-        Raises:
-            RuntimeClosedError: Worker 已开始关闭。
-        """
-
-        self._lifecycle.ensure_open()
-        return self._policies.register(name, selector)
-
-    def observe_runtime(self, observer: RuntimeObserver) -> ObserverHandle:
-        """注册只读运行时生命周期观察者。
-
-        Args:
-            observer: 接收 Worker 发布的 RuntimeEvent 的观察者。
-
-        Returns:
-            卸载本次注册的句柄。
-        """
-
-        return self._observations.attach(observer)
-
     def wait_idle(self, timeout: float | None = None) -> None:
         """等待已接受的 Work 与直接执行全部收尾，并传播任务消费者记录的失败。
 
@@ -586,6 +488,17 @@ class GraphWorker:
                     raise failure
                 return
 
+    def begin_close(self) -> None:
+        """开始关闭前的预备：拒绝新的直接执行，解除未结束执行与此后登记执行的输出背压，不等待。
+
+        未读取的 iter/aiter 订阅不能阻止排空；剩余输出留在存储中，订阅方之后仍可完整读取。
+        队列 Work 及其延续照常接受。
+        """
+
+        with self._lock:
+            self._accepting = False
+        self._history.release_backpressure()
+
     def close(self) -> None:
         """进入 CLOSING 排空已接受工作，随后注销消费者并关闭自有组件。
 
@@ -597,8 +510,7 @@ class GraphWorker:
 
         if not self._lifecycle.begin_close():
             return
-        # 未读取的 iter/aiter 订阅不能阻止排空；剩余输出留在存储中，订阅方之后仍可完整读取。
-        self._history.release_backpressure()
+        self.begin_close()
         try:
             failure = self._drain_and_release()
         finally:
@@ -691,35 +603,58 @@ class GraphWorker:
                 if binding.owned_slots is not None:
                     binding.owned_slots.close()
 
-    def _execute_delivery(self, delivery: Delivery) -> DeliveryResult:
-        """执行一次交付并发布 work.finished；成功 ACK，任何异常 REJECT。"""
+    def _execute_delivery(self, queue: str, delivery: Delivery) -> DeliveryResult:
+        """经 WORK_DELIVER 中间件执行一次交付并发布 work.finished。
+
+        默认成功 ACK、任何异常 REJECT；中间件可以改写结果（含 RETRY）。中间件抛出异常或返回非
+        DeliveryResult 时同样 REJECT，不向任务消费者传播。
+        """
 
         work = delivery.work
         try:
-            self._execute_work(work, delivery.slot_lease)
-        except BaseException as exc:
-            self._observations.publish(
-                RuntimeEvent(
-                    RuntimeEventKind.WORK_FINISHED,
-                    graph=work.graph,
-                    execution_id=work.id,
-                    work_id=work.id,
-                    status="rejected",
-                    error_type=type(exc).__name__,
-                    attributes={"attempt": delivery.attempt},
-                )
+            result = self._hooks.wrap(
+                WORK_DELIVER,
+                delivery,
+                partial(self._deliver, delivery),
+                queue=queue,
+                graph=work.graph,
             )
-            return DeliveryResult.reject(exc)
-        self._observations.publish(
+            if not isinstance(result, DeliveryResult):
+                raise TypeError("WORK_DELIVER middleware must return DeliveryResult")
+        except BaseException as exc:
+            result = DeliveryResult.reject(exc)
+        self._notify(
             RuntimeEvent(
                 RuntimeEventKind.WORK_FINISHED,
                 graph=work.graph,
                 execution_id=work.id,
                 work_id=work.id,
-                status="acked",
-                attributes={"attempt": delivery.attempt},
+                status=_DELIVERY_STATUS[result.outcome],
+                error_type=None
+                if result.error is None
+                else type(result.error).__name__,
+                attributes={"attempt": delivery.attempt, "queue": queue},
             )
         )
+        return result
+
+    def _deliver(self, original: Delivery, delivery: Delivery) -> DeliveryResult:
+        """执行中间件传入的交付；成功 ACK，任何异常 REJECT。
+
+        Raises:
+            InterlaceRuntimeError: 中间件替换了交付携带的 Slot lease。
+        """
+
+        if not isinstance(delivery, Delivery):
+            raise TypeError("WORK_DELIVER call_next requires a Delivery")
+        if delivery.slot_lease is not original.slot_lease:
+            raise InterlaceRuntimeError(
+                "WORK_DELIVER middleware cannot replace the Slot lease"
+            )
+        try:
+            self._execute_work(delivery.work, delivery.slot_lease)
+        except BaseException as exc:
+            return DeliveryResult.reject(exc)
         return DeliveryResult.ack()
 
     def _execute_work(self, work: Work, lease: SlotLease | None) -> None:
@@ -747,6 +682,7 @@ class GraphWorker:
                     partial(self._emit_with_lease, lease),
                     slot=slot,
                     options=work.options,
+                    work=work,
                 )
         except BaseException as exc:
             execution.fail(exc)
@@ -773,6 +709,9 @@ class GraphWorker:
         """
 
         self._lifecycle.ensure_open()
+        with self._lock:
+            if not self._accepting:
+                raise RuntimeClosedError("GraphWorker is closed")
         self._get_graph(graph)
         execution = self._make_execution(
             graph,
@@ -870,10 +809,11 @@ class GraphWorker:
         plan: ExecutionPlan | None = None,
         slot: Slot | None = None,
         options: Mapping[str, Any] | None = None,
+        work: Work | None = None,
     ) -> None:
-        """作为执行宿主调用 GraphExecutor，发布生命周期事件并写入 Execution 终态。
+        """作为执行宿主经 EXECUTION_RUN 调用 GraphExecutor，发布生命周期事件并写入 Execution 终态。
 
-        execution.finished 在 `succeed()`/`fail()` 唤醒等待方之前发布，等待返回时观察者已收到终态事件。
+        execution.finished 在 `succeed()`/`fail()` 唤醒等待方之前发布，等待返回时处理函数已收到终态事件。
         执行开始前已取消的 Execution 直接返回，不发布事件。
 
         Args:
@@ -884,16 +824,17 @@ class GraphWorker:
             plan: 限定执行范围的计划，必须属于 graph；None 执行完整 Graph。
             slot: 当前逻辑执行链的 Slot；直接执行为 None。
             options: 本次执行配置的快照。
+            work: 触发本次执行的 Work；直接执行为 None。
 
         Raises:
-            TypeError: plan 不是 ExecutionPlan，或执行器返回了非 None 结果。
+            TypeError: plan 不是 ExecutionPlan，执行器或中间件返回了非 None 结果。
             ValueError: plan 属于其他 Graph。
             BaseException: 执行器、取消、超时或步数限制的失败，已写入 Execution。
         """
 
         if not execution.start(graph):
             return
-        self._observations.publish(
+        self._notify(
             RuntimeEvent(
                 RuntimeEventKind.EXECUTION_STARTED,
                 graph=execution.graph,
@@ -907,25 +848,28 @@ class GraphWorker:
                     raise TypeError("plan must be an ExecutionPlan")
                 if plan.graph is not graph:
                     raise ValueError("execution plan belongs to a different Graph")
-            result = self._executor.execute(
-                execution.graph,
+            call = ExecutionCall(
+                execution,
                 graph,
                 inputs,
-                emit,
-                plan=plan,
-                slot=slot,
-                options=options,
-                execution=execution,
+                {} if options is None else options,
+                plan,
+                slot,
+                work,
             )
-            if inspect.isawaitable(result):
-                result = self._async_runner().resolve(result, execution=execution)
+            result = self._hooks.wrap(
+                EXECUTION_RUN,
+                call,
+                partial(self._run_executor, call, emit),
+                graph=execution.graph,
+            )
             if result is not None:
-                raise TypeError("GraphExecutor must publish outputs and return None")
+                raise TypeError("EXECUTION_RUN middleware must return None")
             # 写入成功前先检查取消与超时，使终态事件与随后写入的状态一致。
             execution.checkpoint()
         except BaseException as exc:
             error = exc
-        self._observations.publish(
+        self._notify(
             RuntimeEvent(
                 RuntimeEventKind.EXECUTION_FINISHED,
                 graph=execution.graph,
@@ -947,6 +891,49 @@ class GraphWorker:
         if error is not None:
             raise error
 
+    def _run_executor(
+        self, original: ExecutionCall, emit: Emit, call: ExecutionCall
+    ) -> None:
+        """调用 GraphExecutor；中间件只能替换 inputs 与 options。
+
+        Raises:
+            InterlaceRuntimeError: 中间件替换了 execution、graph、plan、slot 或 work。
+            TypeError: call 不是 ExecutionCall，或执行器返回了非 None 结果。
+        """
+
+        if not isinstance(call, ExecutionCall):
+            raise TypeError("EXECUTION_RUN call_next requires an ExecutionCall")
+        if (
+            call.execution is not original.execution
+            or call.graph is not original.graph
+            or call.plan is not original.plan
+            or call.slot is not original.slot
+            or call.work is not original.work
+        ):
+            raise InterlaceRuntimeError(
+                "EXECUTION_RUN middleware may only replace inputs and options"
+            )
+        execution = call.execution
+        result = self._executor.execute(
+            execution.graph,
+            call.graph,
+            call.inputs,
+            emit,
+            plan=call.plan,
+            slot=call.slot,
+            options=call.options,
+            execution=execution,
+        )
+        if inspect.isawaitable(result):
+            result = self._async_runner().resolve(result, execution=execution)
+        if result is not None:
+            raise TypeError("GraphExecutor must publish outputs and return None")
+
+    def _notify(self, event: RuntimeEvent) -> None:
+        """经 RUNTIME_EVENT 发布生命周期事实。"""
+
+        self._hooks.notify(RUNTIME_EVENT, event, kind=event.kind, graph=event.graph)
+
     def _async_runner(self) -> LocalRunner:
         """返回等待异步执行器结果的运行器，首次调用时创建。"""
 
@@ -962,40 +949,6 @@ class GraphWorker:
             self._emit(event)
             return
         self._emit_local(event, lease)
-
-    def _install_hook(self, contribution: _HookContribution) -> HookHandle:
-        """把一项插件 Hook 贡献安装到执行器。"""
-
-        return self._attach_executor_hook(
-            contribution.hook,
-            phase=contribution.phase,
-            graph=contribution.graph,
-            node=contribution.node,
-        )
-
-    def _withdraw_hook(self, contribution: _HookContribution) -> None:
-        """撤销一项插件 Hook 贡献；重复调用无效果。"""
-
-        with self._lock:
-            self._hooks.withdraw(contribution)
-
-    def _attach_executor_hook(
-        self,
-        hook: NodeHook | Callable[..., object],
-        *,
-        phase: HookPhase | str | None,
-        graph: str | None,
-        node: str | None,
-    ) -> HookHandle:
-        """把 Hook 挂载到支持 Hook 的 GraphExecutor。
-
-        Raises:
-            TypeError: 当前 GraphExecutor 不支持 Hook。
-        """
-
-        if not isinstance(self._executor, HookableGraphExecutor):
-            raise TypeError("the configured GraphExecutor does not support hooks")
-        return self._executor.attach(hook, phase=phase, graph=graph, node=node)
 
     def _get_graph(self, name: str) -> Graph:
         """按注册名查找冻结 Graph。

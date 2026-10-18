@@ -1,37 +1,87 @@
-"""Graph 节点模型：Ports、InputPolicy、Node 和 Output。"""
+"""Graph 节点模型：Node、Output、输入策略与内部端口集合。"""
 
 from __future__ import annotations
 
-import enum
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Iterable, Iterator, Mapping
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, get_origin
+from typing import TYPE_CHECKING, Any, ClassVar, get_origin
 
-from .._validation import require_non_empty_string
+from .._validation import require_namespaced, require_non_empty_string
 
 if TYPE_CHECKING:
     from .events import Context
-    from .policies import PolicyRef
+
+ALL_POLICY = "interlace.core/all"  # 全部输入端口都有 token 时触发的内建 selector 名称。
+ANY_POLICY = "interlace.core/any"  # 首个非空端口优先的内建 selector 名称。
+LONGEST_POLICY = (
+    "interlace.core/longest"  # 可用 token 最多的端口优先的内建 selector 名称。
+)
 
 
-class InputPolicy(str, enum.Enum):
-    """Node 的固定输入触发策略。
+def _freeze_config(value: Any) -> Any:
+    """递归深复制策略配置，并把映射、列表/元组、集合分别转为只读映射、元组、frozenset。"""
+
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {deepcopy(key): _freeze_config(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_config(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_freeze_config(item) for item in value)
+    return deepcopy(value)
+
+
+@dataclass(frozen=True, slots=True)
+class InputPolicy:
+    """按名称引用的输入选择策略及其只读参数。
+
+    内建策略为 ``InputPolicy.ALL``（默认）、``InputPolicy.ANY`` 与 ``InputPolicy.LONGEST``；
+    自定义策略以命名空间名称引用 Runtime 中提供的同名 selector。没有输入端口的节点在入口处触发一次，
+    不需要也不读取输入策略。按值比较 name 与 config；config 冻结为只读映射，无法稳定哈希，因此实例不可哈希。
 
     Attributes:
-        ALL: 所有声明输入端口都有 token 时触发。
-        ANY: 任一输入端口有 token 时触发。
-        ON_START: Graph 开始时触发一次，不消费端口 token。
+        name: selector 的命名空间名称。
+        config: 构造时深复制并递归冻结的策略参数映射。
+        ALL: 全部输入端口都有 token 时各消费一个。
+        ANY: 每次只消费声明顺序中第一个非空端口。
+        LONGEST: 每次只消费可用 token 最多的端口，相同时按声明顺序。
     """
 
-    ALL = "all"
-    ANY = "any"
-    ON_START = "on_start"
+    name: str
+    config: Mapping[str, Any] = field(default_factory=dict)
+
+    ALL: ClassVar[InputPolicy]
+    ANY: ClassVar[InputPolicy]
+    LONGEST: ClassVar[InputPolicy]
+    __hash__: ClassVar[None] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        """校验名称并冻结配置副本。
+
+        Raises:
+            TypeError: name 不是字符串或 config 不是映射。
+            ValueError: name 未带命名空间。
+        """
+
+        require_namespaced(self.name, "input policy name")
+        if not isinstance(self.config, Mapping):
+            raise TypeError("input policy config must be a mapping")
+        object.__setattr__(self, "config", _freeze_config(self.config))
+
+
+InputPolicy.ALL = InputPolicy(ALL_POLICY)
+InputPolicy.ANY = InputPolicy(ANY_POLICY)
+InputPolicy.LONGEST = InputPolicy(LONGEST_POLICY)
 
 
 class Ports(Mapping[str, type[Any]]):
-    """保存不可变的端口名称与 Python 类型映射。
+    """Graph 冻结时由节点声明的端口映射生成的不可变端口集合。
+
+    节点以普通映射声明端口，例如 ``inputs = {"url": str}``；本类型只在冻结快照中使用。
 
     Attributes:
         __slots__: 实例允许保存的字段名称，限制动态增加属性。
@@ -159,15 +209,16 @@ class Node(ABC):
     将返回的 Awaitable 交给后台事件循环等待，再逐项处理最终输出。
 
     Attributes:
-        input_ports: 节点声明的输入端口及其类型。
-        output_ports: 节点声明的输出端口及其类型。
-        input_policy: 仅依据端口和 token 数量生效的输入策略。
+        inputs: 输入端口名称到普通 Python 类的映射，按声明顺序排列；默认一个 ``default`` 端口，
+            空映射表示没有输入的源节点，作为入口时在启动时触发一次。
+        outputs: 输出端口名称到普通 Python 类的映射；默认一个 ``default`` 端口。
+        input_policy: 仅依据端口和 token 数量生效的输入策略，默认 ``InputPolicy.ALL``。
         timeout: 超时秒数，None 表示不限制。
     """
 
-    input_ports = Ports(default=object)
-    output_ports = Ports(default=object)
-    input_policy: InputPolicy | PolicyRef = InputPolicy.ALL
+    inputs: Mapping[str, type[Any]] = MappingProxyType({"default": object})
+    outputs: Mapping[str, type[Any]] = MappingProxyType({"default": object})
+    input_policy: InputPolicy = InputPolicy.ALL
     timeout: float | None = None
 
     @abstractmethod

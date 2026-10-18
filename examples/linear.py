@@ -2,19 +2,19 @@
 
 from __future__ import annotations
 
-from interlace import Edge, Graph, Node, Output, Ports, Runtime
+from interlace import Graph, Node, Output, Runtime
 
 
 class Strip(Node):
     """移除输入文本首尾空白的示例节点。
 
     Attributes:
-        input_ports: 输入端口，text 为原始文本。
-        output_ports: 输出端口，text 为去除首尾空白后的文本。
+        inputs: 输入端口，text 为原始文本。
+        outputs: 输出端口，text 为去除首尾空白后的文本。
     """
 
-    input_ports = Ports(text=str)
-    output_ports = Ports(text=str)
+    inputs = {"text": str}
+    outputs = {"text": str}
 
     def execute(self, inputs, context):
         """去除 text 首尾空白后传给下游。
@@ -35,12 +35,12 @@ class Upper(Node):
     """将输入文本转换为大写的示例节点。
 
     Attributes:
-        input_ports: 输入端口，text 为待转换文本。
-        output_ports: 输出端口，result 为大写文本；该端口未连线，成为终端输出。
+        inputs: 输入端口，text 为待转换文本。
+        outputs: 输出端口，result 为大写文本；该端口未连线，成为终端输出。
     """
 
-    input_ports = Ports(text=str)
-    output_ports = Ports(result=str)
+    inputs = {"text": str}
+    outputs = {"result": str}
 
     def execute(self, inputs, context):
         """把 text 转为大写后从 result 输出。
@@ -67,10 +67,10 @@ def run(text: str = "  hello, interlace  ") -> str:
         去除首尾空白并转为大写后的文本。
     """
 
-    graph = Graph.compose(
-        nodes={"strip": Strip(), "upper": Upper()},
-        entrypoint="strip",
-        edges=[Edge("strip", "upper", "text", "text")],
+    graph = (
+        Graph(entrypoint="strip")
+        .add(strip=Strip(), upper=Upper())
+        .connect("strip", "upper", source_port="text", target_port="text")
     )
     with Runtime() as runtime:
         runtime.register("linear", graph)

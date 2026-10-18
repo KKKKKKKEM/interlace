@@ -5,18 +5,20 @@ import pickle
 import sqlite3
 import time
 from collections.abc import Awaitable
+from threading import Event as ThreadEvent
 from types import MappingProxyType
 from typing import Any, cast
-from threading import Event as ThreadEvent
 
 import pytest
 
-from interlace import Context, Execution, ExecutionLimits, Graph, Node, Output, Runtime
+from interlace import Context, Graph, Node, Output, Runtime
+from interlace.engine import Execution
+from interlace.spi import ExecutionLimits
 from interlace.engine.errors import ExecutionCancelledError, ExecutionTimeoutError
 from interlace.engine.events import bind_context
 from interlace.engine.execution_resources import LocalExecutionNotifier
 from interlace.plugins import CAP_EXECUTION_FACTORY, PluginDescriptor
-from interlace.runtime import LocalRuntimePlugin
+from interlace.runtime import LocalInfrastructurePlugin
 
 
 class Produce(Node):
@@ -165,7 +167,9 @@ def test_alternate_executor_uses_graph_context_factory(executor_type) -> None:
 
     executor = executor_type()
     try:
-        with Runtime(plugins=(LocalRuntimePlugin(executor=executor),)) as runtime:
+        with Runtime(
+            plugins=(LocalInfrastructurePlugin(executor=executor),)
+        ) as runtime:
             runtime.register(
                 "domain",
                 Graph(entrypoint="produce", context_factory=make).add(
@@ -195,7 +199,7 @@ def test_alternate_executor_publishes_before_completion_and_preserves_failure(
 
     gate = ThreadEvent()
     executor = executor_type(fail=fail, gate=gate)
-    with Runtime(plugins=(LocalRuntimePlugin(executor=executor),)) as runtime:
+    with Runtime(plugins=(LocalInfrastructurePlugin(executor=executor),)) as runtime:
         runtime.register("work", graph())
         execution = runtime.start("work", 3, output_buffer=1)
         stream = iter(execution)
@@ -227,7 +231,9 @@ def test_custom_executor_async_stream_has_the_same_backpressure_contract(executo
         executor_type: 当前用例使用的 executor_type 夹具或参数化输入。
     """
 
-    with Runtime(plugins=(LocalRuntimePlugin(executor=executor_type()),)) as runtime:
+    with Runtime(
+        plugins=(LocalInfrastructurePlugin(executor=executor_type()),)
+    ) as runtime:
         runtime.register("work", graph())
 
         async def consume():
@@ -280,7 +286,7 @@ def test_async_executor_cleanup_precedes_terminal_status(control):
                     while not release.is_set():
                         await asyncio.sleep(0.005)
 
-    with Runtime(plugins=(LocalRuntimePlugin(executor=Slow()),)) as runtime:
+    with Runtime(plugins=(LocalInfrastructurePlugin(executor=Slow()),)) as runtime:
         runtime.register("work", graph())
         execution = runtime.start(
             "work", 1, timeout=0.05 if control == "timeout" else None
@@ -348,7 +354,9 @@ def test_async_executor_apublish_output_yields_loop_under_backpressure(control):
             finally:
                 ticker.cancel()
 
-    with Runtime(plugins=(LocalRuntimePlugin(executor=Backpressured()),)) as runtime:
+    with Runtime(
+        plugins=(LocalInfrastructurePlugin(executor=Backpressured()),)
+    ) as runtime:
         runtime.register("work", graph())
         execution = runtime.start("work", 0, output_buffer=1)
         stream = iter(execution)
@@ -566,16 +574,6 @@ def test_plugin_execution_factory_replaces_storage_for_direct_and_queued_work(tm
 
             context.provide(CAP_EXECUTION_FACTORY, factory)
 
-        def start(self, context):
-            """启动已经装配的组件或提交一次新的执行。"""
-
-            pass
-
-        def stop(self, context):
-            """停止插件并释放其拥有的资源。"""
-
-            pass
-
     with Runtime(plugins=(Resources(),)) as runtime:
         runtime.register("work", graph())
         execution = runtime.start("work", 20)
@@ -681,7 +679,9 @@ def test_execution_factory_cannot_silently_change_limits():
 
         return Execution(graph, limits=ExecutionLimits(max_steps=999))
 
-    with Runtime(plugins=(LocalRuntimePlugin(execution_factory=broken),)) as runtime:
+    with Runtime(
+        plugins=(LocalInfrastructurePlugin(execution_factory=broken),)
+    ) as runtime:
         runtime.register("work", graph())
         with pytest.raises(ValueError, match="changed the execution contract"):
             runtime.start("work", 1, max_steps=1)
@@ -710,7 +710,7 @@ def test_executor_cannot_return_a_second_result_channel():
                 Any, (Output("not accepted"),)
             )  # 验证执行器拒绝第二条结果通道。
 
-    with Runtime(plugins=(LocalRuntimePlugin(executor=Invalid()),)) as runtime:
+    with Runtime(plugins=(LocalInfrastructurePlugin(executor=Invalid()),)) as runtime:
         runtime.register("work", graph())
         stream = runtime.iter("work", 1)
         assert next(stream) == Output("accepted")
@@ -728,7 +728,9 @@ def test_host_rejects_foreign_plan_before_calling_alternate_executor():
             raise AssertionError("foreign plan reached executor")
 
     foreign = graph().plan(include={"produce"})
-    with Runtime(plugins=(LocalRuntimePlugin(executor=NeverCalled()),)) as runtime:
+    with Runtime(
+        plugins=(LocalInfrastructurePlugin(executor=NeverCalled()),)
+    ) as runtime:
         runtime.register("work", graph())
         with pytest.raises(ValueError, match="different Graph"):
             runtime.run("work", 1, plan=foreign)
@@ -786,7 +788,9 @@ def test_output_store_failure_preserves_previously_accepted_outputs():
 
         return Execution(graph, **kwargs, output_store=FailingStore())
 
-    with Runtime(plugins=(LocalRuntimePlugin(execution_factory=factory),)) as runtime:
+    with Runtime(
+        plugins=(LocalInfrastructurePlugin(execution_factory=factory),)
+    ) as runtime:
         runtime.register("work", graph())
         stream = runtime.iter("work", 2)
         assert next(stream) == Output(0)

@@ -10,7 +10,8 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 import interlace
-from interlace import Event, Ports, adapters, engine, nodes, plugins, runtime, spi
+from interlace import Event
+from interlace import adapters, engine, nodes, plugins, runtime, spi
 from interlace.engine import errors
 from interlace.spi import Work
 
@@ -69,41 +70,45 @@ if TYPE_CHECKING:
 
 
 def test_top_level_api_contains_only_core_vocabulary() -> None:
-    """顶层只增加可控执行句柄，不暴露内部调度与 checkpoint DTO。"""
+    """顶层只保留写业务与编排所需的六个名字。"""
 
     assert interlace.__all__ == [
         "Context",
-        "Edge",
         "Event",
-        "Execution",
-        "ExecutionLimits",
-        "ExecutionPlan",
-        "ExecutionStatus",
         "Graph",
-        "InputPolicy",
         "Node",
         "Output",
-        "Ports",
         "Runtime",
-        "Slot",
-        "SlotPool",
     ]
 
 
 def test_advanced_packages_expose_explicit_architecture_boundaries() -> None:
-    """内核、编排、SPI、插件和默认适配器不再聚合到 engine。"""
+    """内核第二层、编排、SPI、插件和默认适配器各自位于独立包。"""
 
-    assert engine.__all__ == [name for name in interlace.__all__ if name != "Runtime"]
+    assert engine.__all__ == [
+        "Context",
+        "Edge",
+        "Event",
+        "Execution",
+        "ExecutionPlan",
+        "Graph",
+        "InputPolicy",
+        "Node",
+        "Output",
+        "Slot",
+        "SlotPool",
+    ]
     assert runtime.__all__ == [
         "EventRouter",
         "GraphWorker",
+        "LocalInfrastructurePlugin",
         "LocalRuntimePlugin",
         "Runtime",
     ]
     assert adapters.__all__ == ["memory"]
-    assert "EventBus" in spi.__all__
-    assert "PluginHost" in plugins.__all__
-    assert "ContributionPlugin" in plugins.__all__
+    assert {"EventBus", "ExecutionLimits", "InputSelector"} <= set(spi.__all__)
+    assert {"PluginHost", "ExtensionAPI", "HookBus", "plugin"} <= set(plugins.__all__)
+    assert not {"FilterPoint", "RegistryKind"} & set(plugins.__all__)
     assert nodes.__all__ == [
         "KeyedJoin",
         "KeyedJoinOverflowError",
@@ -111,21 +116,27 @@ def test_advanced_packages_expose_explicit_architecture_boundaries() -> None:
         "KeyedValue",
     ]
     assert not hasattr(engine, "Runtime")
+    assert not hasattr(engine, "Ports")
     assert not hasattr(engine, "PluginHost")
-    assert not hasattr(interlace, "AsyncNode")
-    assert not hasattr(engine, "AsyncNode")
-    assert not hasattr(engine.core, "AsyncNode")
     assert adapters.memory.EventBus.__name__ == "EventBus"
     assert adapters.memory.TaskBackend.__name__ == "TaskBackend"
-    assert not hasattr(adapters.memory, "MemoryEventBus")
-    assert not hasattr(adapters.memory, "MemoryTaskBackend")
-    assert not hasattr(plugins, "ExtensionPlugin")
 
 
-def test_ports_are_immutable_and_ordered() -> None:
-    """Ports 保存声明顺序并拒绝修改。"""
+def test_frozen_ports_are_ordered_snapshots_of_node_declarations() -> None:
+    """冻结快照保持端口声明顺序且只读；冻结后修改节点的声明字典不影响已冻结的 Graph。"""
 
-    ports = Ports(left=str, right=int)
+    class Pair(interlace.Node):
+        """声明两个输入端口的节点。"""
+
+        inputs = {"left": str, "right": int}
+
+        def execute(self, inputs: Any, context: Any) -> None:
+            """不产生输出。"""
+
+    node = Pair()
+    graph = interlace.Graph(entrypoint="pair").add(pair=node).freeze()
+    node.inputs["extra"] = object
+    ports = graph.spec_for("pair").input_ports
 
     assert tuple(ports) == ("left", "right")
     with pytest.raises(TypeError):

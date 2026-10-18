@@ -5,17 +5,8 @@ import json
 
 import pytest
 
-from interlace import (
-    Context,
-    Edge,
-    ExecutionPlan,
-    Graph,
-    InputPolicy,
-    Node,
-    Output,
-    Ports,
-    Runtime,
-)
+from interlace import Context, Graph, Node, Output, Runtime
+from interlace.engine import Edge, ExecutionPlan, InputPolicy
 from interlace.engine.errors import GraphValidationError, PortValueTypeError
 
 
@@ -23,12 +14,12 @@ class Origin(Node):
     """原始入口，用不同类型的输出验证计划入口独立绑定。
 
     Attributes:
-        input_ports: 原入口接收字符串。
-        output_ports: 向后续节点发送整数。
+        inputs: 原入口接收字符串。
+        outputs: 向后续节点发送整数。
     """
 
-    input_ports = Ports(text=str)
-    output_ports = Ports(value=int)
+    inputs = {"text": str}
+    outputs = {"value": int}
 
     def execute(self, inputs, context):
         """将字符串转换为整数。
@@ -47,12 +38,12 @@ class Step(Node):
     """递增后继续或沿重试端口回边。
 
     Attributes:
-        input_ports: 整数输入。
-        output_ports: 正常与重试输出。
+        inputs: 整数输入。
+        outputs: 正常与重试输出。
     """
 
-    input_ports = Ports(value=int)
-    output_ports = Ports(value=int, retry=int)
+    inputs = {"value": int}
+    outputs = {"value": int, "retry": int}
 
     async def execute(self, inputs, context):
         """等待后选择一个端口，覆盖异步执行与循环。
@@ -73,12 +64,12 @@ class End(Node):
     """回传输入作为原图终端输出。
 
     Attributes:
-        input_ports: 整数输入。
-        output_ports: 整数结果。
+        inputs: 整数输入。
+        outputs: 整数结果。
     """
 
-    input_ports = Ports(value=int)
-    output_ports = Ports(value=int)
+    inputs = {"value": int}
+    outputs = {"value": int}
 
     def execute(self, inputs, context):
         """原样输出整数。
@@ -186,13 +177,13 @@ def test_new_multiport_entry_requires_full_input_and_retains_all_validation():
         """合并两个整数。
 
         Attributes:
-            input_ports: 两个必需输入。
-            output_ports: 求和结果。
+            inputs: 两个必需输入。
+            outputs: 求和结果。
             input_policy: 等待所有输入。
         """
 
-        input_ports = Ports(left=int, right=int)
-        output_ports = Ports(value=int)
+        inputs = {"left": int, "right": int}
+        outputs = {"value": int}
         input_policy = InputPolicy.ALL
 
         def execute(self, inputs, context: Context):

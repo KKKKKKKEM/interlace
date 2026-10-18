@@ -16,6 +16,7 @@ from collections.abc import (
 )
 from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
+from functools import partial
 from types import MappingProxyType
 from typing import Any
 
@@ -33,38 +34,32 @@ from .errors import (
 )
 from .events import Context, Event, bind_context
 from .execution import Execution, ExecutionStatus
+from .extension import HookBus
 from .graph import Edge, ExecutionPlan, Graph, NodeSpec
-from .hooks import (
-    HookHandle,
-    HookPhase,
-    HookRegistry,
-    HookSignal,
-    NodeCall,
-    NodeHook,
-    ShortCircuit,
-    StopGraph,
-)
+from .hooks import HookPhase, NodeCall, NodeInspection, StopGraph
 from .observation import (
-    ObservationHub,
     RuntimeEvent,
     RuntimeEventKind,
     node_observation_scope,
 )
+from .points import NODE_CALL, NODE_INSPECT, RUNTIME_EVENT
 from .runner import LocalRunner
+from .policies import BoundPolicy
 from .slots import Slot
 
-Emit = Callable[[Event], None]
+Emit = Callable[[Event], object]  # 发布跨图事件的回调；返回值被忽略。
 
 # 诊断回调失败只写基础设施日志，不参与业务异常恢复。
 _LOGGER = logging.getLogger(__name__)
 
-# 不交给 NodeHook.error 的异常：执行控制与 Engine 自身的契约违规。
+# 中间件不能吞掉的异常：执行控制、Engine 自身的契约违规与 StopGraph。
 _UNRECOVERABLE_ERRORS = (
     ExecutionControlError,
     HookExecutionError,
     InvalidOutputError,
     PortValueTypeError,
     PolicySelectionError,
+    StopGraph,
 )
 
 # NODE_FINISHED 失败详情中 error 与 traceback 文本各自的最大字符数。
@@ -95,15 +90,16 @@ class _Run:
         outgoing_for: 原图或 ExecutionPlan 的下游连接查询。
         specs: 计划内节点的冻结元数据。
         input_names: 计划内节点按声明顺序排列的输入端口名称。
-        hooks: 计划内各节点在 Hook 快照中生效的 Hook，按注册顺序排列。
+        middleware: 计划内各节点在本次 execution 生效的 NODE_CALL 中间件快照，外层在前。
+        inspectors: 计划内各节点在本次 execution 生效的 NODE_INSPECT 处理函数快照。
         queues: 计划内各节点各输入端口的待消费 token。
         queued: queues 中全部待消费 token 的总数，用于执行 max_queued 限制。
-        ready: 待触发的 (节点 ID, 选中端口)；选中端口在入队时计算，ON_START 为空元组。
+        ready: 待触发的 (节点 ID, 选中端口)；选中端口在入队时计算，源节点为空元组。
         scheduled: 已在 ready 中的节点，同一节点最多排队一次。
-        started: 已触发过的 ON_START 节点。
+        started: 已触发过的无输入源节点。
         local_state: Context.state 的 execution 局部存储。
         finalizers: Context.on_quiescence 注册的回调，按注册顺序排列。
-        inspect_failures: inspect 失败的 Hook（按 id）到 (类型名称, 失败次数) 的映射。
+        inspect_failures: inspect 失败的处理函数（按 id）到 (名称, 失败次数) 的映射。
     """
 
     graph_name: str
@@ -116,7 +112,8 @@ class _Run:
     outgoing_for: Callable[[str, str], tuple[Edge, ...]]
     specs: dict[str, NodeSpec]
     input_names: dict[str, tuple[str, ...]]
-    hooks: dict[str, tuple[NodeHook, ...]]
+    middleware: dict[str, tuple[Callable[..., Any], ...]]
+    inspectors: dict[str, tuple[Callable[[NodeInspection], None], ...]]
     queues: dict[str, dict[str, deque[Any]]]
     ready: deque[tuple[str, tuple[str, ...]]] = field(default_factory=deque)
     scheduled: set[str] = field(default_factory=set)
@@ -141,11 +138,12 @@ class _Run:
 
         if node_id in self.scheduled:
             return
-        if self.specs[node_id].input_policy.on_start:
+        policy = self.specs[node_id].input_policy
+        if policy is None:
             first = node_id == self.entrypoint and node_id not in self.started
             selection: tuple[str, ...] | None = () if first else None
         else:
-            selection = self._select(node_id)
+            selection = self._select(node_id, policy)
         if selection is not None:
             self.ready.append((node_id, selection))
             self.scheduled.add(node_id)
@@ -185,15 +183,15 @@ class _Run:
         self.queued += 1
 
     def take(self, node_id: str, selection: tuple[str, ...]) -> dict[str, Any]:
-        """从选中端口各取出一个 token；ON_START 节点同时记为已触发。"""
+        """从选中端口各取出一个 token；源节点同时记为已触发。"""
 
-        if self.specs[node_id].input_policy.on_start:
+        if self.specs[node_id].input_policy is None:
             self.started.add(node_id)
         queues = self.queues[node_id]
         self.queued -= len(selection)
         return {port: queues[port].popleft() for port in selection}
 
-    def _select(self, node_id: str) -> tuple[str, ...] | None:
+    def _select(self, node_id: str, policy: BoundPolicy) -> tuple[str, ...] | None:
         """调用节点的输入策略，并为选择失败补齐 Graph 与节点归属。
 
         Raises:
@@ -201,9 +199,7 @@ class _Run:
         """
 
         try:
-            return self.specs[node_id].input_policy.select(
-                self.input_names[node_id], self.queues[node_id]
-            )
+            return policy.select(self.input_names[node_id], self.queues[node_id])
         except PolicySelectionError as exc:
             if exc.graph is None:
                 exc.graph = self.graph_name
@@ -220,51 +216,120 @@ class _Run:
 
 @dataclass(frozen=True, slots=True)
 class _Firing:
-    """一次 Node firing 在 Hook 管道内共享的参数。
+    """一次 Node firing 在中间件链内共享的参数。
 
     Attributes:
         run: 所属 execution 的调度状态。
         node_id: 被触发的节点 ID。
-        original: Context 工厂之后、全部 Hook enter 之前的调用，用于校验调用身份。
-        hooks: 对该节点生效的 Hook，按注册顺序排列。
+        original: Context 工厂之后、全部中间件之前的调用，用于校验调用身份。
+        middleware: 对该节点生效的 NODE_CALL 中间件，外层在前。
     """
 
     run: _Run
     node_id: str
     original: NodeCall
-    hooks: tuple[NodeHook, ...]
+    middleware: tuple[Callable[..., Any], ...]
+
+
+class _NextCall:
+    """传给 NODE_CALL 中间件的 call_next：校验调用并记录内层不可恢复的异常。
+
+    Attributes:
+        _engine: 驱动中间件链的 Engine。
+        _firing: 当前 firing 的共享参数。
+        _index: 内层中间件的位置；等于中间件数量时直接调用 Node。
+        failure: 内层最近一次抛出的不可恢复异常；未发生时为 None。
+    """
+
+    __slots__ = ("_engine", "_firing", "_index", "failure")
+
+    def __init__(self, engine: Engine, firing: _Firing, index: int) -> None:
+        """绑定内层位置。"""
+
+        self._engine = engine
+        self._firing = firing
+        self._index = index
+        self.failure: BaseException | None = None
+
+    def __call__(self, call: NodeCall) -> Iterator[Output]:
+        """校验 call 后返回内层输出的惰性迭代器，可多次调用。
+
+        Raises:
+            HookExecutionError: call 不是 NodeCall 或改变了调用身份与输入端口。
+            PortValueTypeError: 替换的输入值不符合端口类型。
+        """
+
+        firing = self._firing
+        try:
+            checked = self._engine._validate_hook_call(
+                firing.original,
+                call,
+                firing.run.specs[firing.node_id].input_ports,
+                firing.run.graph_name,
+                firing.node_id,
+            )
+        except _UNRECOVERABLE_ERRORS as error:
+            self.failure = error
+            raise
+        return self._guarded(checked)
+
+    def _guarded(self, call: NodeCall) -> Generator[Output, None, None]:
+        """迭代内层输出，记录不可恢复异常后原样传播。"""
+
+        try:
+            yield from self._engine._invoke(self._firing, self._index, call)
+        except GeneratorExit:
+            raise
+        except BaseException as error:
+            if isinstance(error, _UNRECOVERABLE_ERRORS) or not isinstance(
+                error, Exception
+            ):
+                self.failure = error
+            raise
+
+    def check(self, raised: BaseException | None = None) -> None:
+        """中间件吞掉或替换了内层不可恢复异常时重新抛出它。"""
+
+        failure = self.failure
+        if failure is not None and raised is not failure:
+            raise failure
 
 
 class Engine:
     """默认 GraphExecutor：在调用线程内执行 Graph 的 Node、InputPolicy、Output 和 Edge。
 
-    一次 execution 内的 Node firing 严格串行；异步 Node 与 Hook 由私有的 LocalRunner
-    loop 线程等待。
+    一次 execution 内的 Node firing 严格串行；异步 Node 由私有的 LocalRunner loop 线程等待。
+    每次 execution 开始时读取 NODE_CALL 与 NODE_INSPECT 的登记快照，运行期新登记从下一次 execution 生效。
 
     Attributes:
-        hooks: 动态 Hook 注册表；每次 execution 开始时取快照。
+        hooks: 所属 Runtime 的钩子总线；节点中间件、采集与生命周期通知都经由它。
+        _caller: 交给 Context 的只触发视图。
         _runner: 等待 awaitable 的后台 Runner，由 Engine 关闭。
-        _observations: 发布 Node 与输出观测事件的分发中心。
     """
 
     def __init__(
         self,
         *,
-        hooks: HookRegistry | None = None,
+        hooks: HookBus | None = None,
         runner: LocalRunner | None = None,
-        observations: ObservationHub | None = None,
     ) -> None:
-        """组装 Hook 注册表、异步 Runner 和观测分发中心。
+        """组装钩子总线与异步 Runner。
 
         Args:
-            hooks: Hook 注册表；None 时新建。
+            hooks: 所属 Runtime 的钩子总线；None 时新建独立总线。
             runner: 等待 awaitable 的 Runner；None 时新建，close 时一并关闭。
-            observations: 观测分发中心；None 时新建独立实例。
+
+        Raises:
+            TypeError: hooks 不是 HookBus。
         """
 
-        self.hooks = HookRegistry() if hooks is None else hooks
+        if hooks is None:
+            hooks = HookBus()
+        elif not isinstance(hooks, HookBus):
+            raise TypeError("hooks must be a HookBus")
+        self.hooks = hooks
+        self._caller = hooks.caller()
         self._runner = LocalRunner() if runner is None else runner
-        self._observations = ObservationHub() if observations is None else observations
 
     def execute(
         self,
@@ -332,7 +397,6 @@ class Engine:
             graph,
             prepared,
             emit,
-            self.hooks.snapshot(name),
             plan,
             slot,
             execution,
@@ -341,26 +405,9 @@ class Engine:
         self._run(run)
 
     def close(self) -> None:
-        """关闭 Hook 注册表和后台异步 Runner。"""
+        """关闭后台异步 Runner；钩子总线归 Runtime 所有。"""
 
-        self.hooks.close()
         self._runner.close()
-
-    def attach(
-        self,
-        hook: NodeHook | Callable[..., object],
-        *,
-        phase: HookPhase | str | None = None,
-        graph: str | None = None,
-        node: str | None = None,
-    ) -> HookHandle:
-        """注册动态 Hook，实现 HookableGraphExecutor 能力；参数见 `HookRegistry.attach`。
-
-        Returns:
-            卸载本次注册的句柄。
-        """
-
-        return self.hooks.attach(hook, phase=phase, graph=graph, node=node)
 
     def _prepare(
         self,
@@ -368,13 +415,12 @@ class Engine:
         graph: Graph,
         initial_inputs: Mapping[str, Any],
         emit: Emit,
-        hook_snapshot: tuple[Any, ...],
         plan: ExecutionPlan | None,
         slot: Slot | None,
         execution: Execution,
         options: Mapping[str, Any] | None,
     ) -> _Run:
-        """建立计划内节点的队列与 Hook，注入入口输入并调度入口节点。
+        """建立计划内节点的队列与中间件快照，注入入口输入并调度入口节点。
 
         Raises:
             PolicySelectionError: 入口节点的输入策略失败。
@@ -400,8 +446,14 @@ class Engine:
             input_names={
                 node_id: tuple(spec.input_ports) for node_id, spec in specs.items()
             },
-            hooks={
-                node_id: self.hooks.for_node(hook_snapshot, node_id)
+            middleware={
+                node_id: self.hooks.handlers(NODE_CALL, graph=graph_name, node=node_id)
+                for node_id in specs
+            },
+            inspectors={
+                node_id: self.hooks.handlers(
+                    NODE_INSPECT, graph=graph_name, node=node_id
+                )
                 for node_id in specs
             },
             queues={
@@ -460,7 +512,7 @@ class Engine:
         try:
             with execution.step(node_id), node_observation_scope(started_event):
                 started = True
-                self._observations.publish(started_event)
+                self._notify(started_event)
                 context = self._make_context(run, node_id, inputs)
                 execution.checkpoint()
                 self._drain_node(run, node_id, inputs, context)
@@ -476,7 +528,7 @@ class Engine:
             raise
         finally:
             if started:
-                self._observations.publish(self._node_finished(run, node_id, error))
+                self._notify(self._node_finished(run, node_id, error))
         return True
 
     def _make_context(
@@ -487,7 +539,7 @@ class Engine:
         Raises:
             ExecutionControlError: 工厂内检测到取消或超时，原样传播。
             ExecutionError: 绑定或工厂失败、工厂未返回 Context；原异常为 __cause__。
-            HookExecutionError: 工厂抛出只允许 Hook 使用的 StopGraph 或 ShortCircuit。
+            HookExecutionError: 工厂抛出只允许中间件使用的 StopGraph。
         """
 
         try:
@@ -500,6 +552,7 @@ class Engine:
                 finalizers=run.finalizers,
                 scope=node_id,
                 options=run.options,
+                hooks=self._caller,
             )
             context = run.graph.context_factory(base, inputs)
             if not isinstance(context, Context):
@@ -508,7 +561,7 @@ class Engine:
                 raise TypeError("context_factory must return a Context")
         except ExecutionControlError:
             raise
-        except HookSignal as signal:
+        except StopGraph as signal:
             raise HookExecutionError(
                 f"{type(signal).__name__} can only be raised by a hook",
                 graph=run.graph_name,
@@ -529,22 +582,11 @@ class Engine:
         inputs: Mapping[str, Any],
         context: Context,
     ) -> None:
-        """逐项读取 Hook 管道输出并路由，结束或失败时关闭管道。
+        """逐项读取中间件链输出并路由，结束或失败时关闭链。"""
 
-        Raises:
-            HookExecutionError: Hook 在 enter 以外的阶段抛出 ShortCircuit。
-        """
-
-        try:
-            with closing(self._call_node(run, node_id, inputs, context)) as outputs:
-                for output in outputs:
-                    self._route_output(run, node_id, output)
-        except ShortCircuit as exc:
-            raise HookExecutionError(
-                "ShortCircuit is only valid during hook enter",
-                graph=run.graph_name,
-                node=node_id,
-            ) from exc
+        with closing(self._call_node(run, node_id, inputs, context)) as outputs:
+            for output in outputs:
+                self._route_output(run, node_id, output)
 
     def _route_output(self, run: _Run, node_id: str, output: Output) -> None:
         """校验一项输出，沿下游 Edge 入队并调度目标；没有下游时发布为 terminal Output。
@@ -571,7 +613,7 @@ class Engine:
                 )
             run.enqueue(edge.target, edge.target_port, output.value, node_id)
             run.schedule_if_ready(edge.target)
-        self._observations.publish(
+        self._notify(
             RuntimeEvent(
                 RuntimeEventKind.OUTPUT_ROUTED,
                 graph=run.graph_name,
@@ -584,6 +626,11 @@ class Engine:
                 },
             )
         )
+
+    def _notify(self, event: RuntimeEvent) -> None:
+        """经 RUNTIME_EVENT 发布生命周期事实；处理函数失败被总线隔离。"""
+
+        self.hooks.notify(RUNTIME_EVENT, event, kind=event.kind, graph=event.graph)
 
     @staticmethod
     def _check_output(run: _Run, node_id: str, output: Output) -> None:
@@ -683,7 +730,7 @@ class Engine:
         Raises:
             ExecutionControlError: 回调前或回调内检测到取消或超时。
             ExecutionError: 回调失败；普通异常被包装并以原异常为 __cause__。
-            HookExecutionError: 回调抛出只允许 Hook 使用的 StopGraph 或 ShortCircuit。
+            HookExecutionError: 回调抛出只允许中间件使用的 StopGraph。
         """
 
         index = 0
@@ -695,7 +742,7 @@ class Engine:
                 callback()
             except ExecutionControlError:
                 raise
-            except HookSignal as signal:
+            except StopGraph as signal:
                 raise HookExecutionError(
                     f"{type(signal).__name__} can only be raised by a hook",
                     graph=run.graph_name,
@@ -717,29 +764,32 @@ class Engine:
         inputs: Mapping[str, Any],
         context: Context,
     ) -> Generator[Output, None, None]:
-        """惰性产出经过全部 Hook 转换的节点输出，并统一失败归属。
+        """惰性产出经过全部 NODE_CALL 中间件的节点输出，并统一失败归属。
 
         Yields:
-            经过 Hook exit 转换的 Output，尚未按端口契约校验。
+            经过中间件改写的 Output，尚未按端口契约校验。
 
         Raises:
-            ExecutionError: 节点或 Hook 抛出普通异常时包装为带节点归属的错误；
+            ExecutionError: 节点或中间件抛出普通异常时包装为带节点归属的错误；
                 ExecutionError 子类原样传播，缺少归属时补充当前 graph 与 node。
-            HookSignal: Hook 抛出的 ShortCircuit 或 StopGraph，由调用方解释。
+            StopGraph: 中间件停止 Graph，由调用方解释。
         """
 
         firing = _Firing(
             run,
             node_id,
             NodeCall(
-                run.graph_name, node_id, run.graph.nodes[node_id], inputs, context
+                run.graph_name,
+                node_id,
+                run.graph.nodes[node_id],
+                inputs,
+                context,
+                partial(self._resolve, execution=run.execution),
             ),
-            run.hooks[node_id],
+            run.middleware[node_id],
         )
         try:
             yield from self._invoke(firing, 0, firing.original)
-        except HookSignal:
-            raise
         except ExecutionError as exc:
             _attribute(exc, run.graph_name, node_id)
             raise
@@ -753,49 +803,47 @@ class Engine:
     def _invoke(
         self, firing: _Firing, index: int, call: NodeCall
     ) -> Generator[Output, None, None]:
-        """运行第 index 个 Hook 包裹的内层调用；越过最后一个 Hook 时调用 Node。
+        """运行第 index 个中间件包裹的内层调用；越过最后一个中间件时调用 Node。
 
-        enter 抛出 ShortCircuit 时用信号输出代替内层调用；每项内层输出都经过本 Hook exit。
+        中间件吞掉或替换了内层不可恢复异常（执行控制、Engine 契约错误、StopGraph）时重新抛出它。
 
         Raises:
-            HookExecutionError: enter 返回值不是 NodeCall 或改变了调用身份与输入端口。
-            PortValueTypeError: enter 替换的输入值不符合端口类型。
+            HookExecutionError: 中间件返回 awaitable。
         """
 
-        if index == len(firing.hooks):
+        if index == len(firing.middleware):
             yield from self._invoke_node(firing, call)
             return
-        execution = firing.run.execution
-        hook = firing.hooks[index]
+        call_next = _NextCall(self, firing, index + 1)
         try:
-            entered = self._resolve(hook.enter(call), execution)
-        except ShortCircuit as signal:
-            entered = call
-            inner = self._produce(firing, signal.outputs, "ShortCircuit")
-        else:
-            entered = self._validate_hook_call(
-                firing.original,
-                entered,
-                firing.run.specs[firing.node_id].input_ports,
-                firing.run.graph_name,
-                firing.node_id,
-            )
-            inner = self._recover(
-                firing, self._invoke(firing, index + 1, entered), hook, entered
-            )
-        with closing(inner):
-            for output in inner:
-                yield from self._produce(
-                    firing, self._resolve(hook.exit(entered, output), execution), "Hook"
+            result = firing.middleware[index](call, call_next)
+            if inspect.isawaitable(result):
+                close = getattr(result, "close", None)
+                if callable(close):
+                    close()
+                raise HookExecutionError(
+                    "NODE_CALL middleware must be synchronous; use call.wait()",
+                    graph=firing.run.graph_name,
+                    node=firing.node_id,
                 )
+            with closing(self._produce(firing, result, "middleware")) as outputs:
+                for output in outputs:
+                    call_next.check()
+                    yield output
+        except GeneratorExit:
+            raise
+        except BaseException as error:
+            call_next.check(error)
+            raise
+        call_next.check()
 
     def _invoke_node(
         self, firing: _Firing, call: NodeCall
     ) -> Generator[Output, None, None]:
-        """调用 Node 并逐项产出原始输出，在实际调用边界通知 inspect。
+        """调用 Node 并逐项产出原始输出，在实际调用边界通知 NODE_INSPECT。
 
         Raises:
-            HookExecutionError: Node 自身抛出 ShortCircuit 或 StopGraph。
+            HookExecutionError: Node 自身抛出 StopGraph。
         """
 
         try:
@@ -807,7 +855,7 @@ class Engine:
                 for output in outputs:
                     self._inspect(firing, call, HookPhase.EXIT, output)
                     yield output
-        except HookSignal as signal:
+        except StopGraph as signal:
             raise HookExecutionError(
                 f"{type(signal).__name__} can only be raised by a hook",
                 graph=firing.run.graph_name,
@@ -818,30 +866,6 @@ class Engine:
         except BaseException as exc:
             self._inspect(firing, call, HookPhase.ERROR, exc)
             raise
-
-    def _recover(
-        self,
-        firing: _Firing,
-        outputs: Generator[Output, None, None],
-        hook: NodeHook,
-        call: NodeCall,
-    ) -> Generator[Output, None, None]:
-        """把内层输出流的业务异常交给 hook.error；已交付的输出前缀不重放。
-
-        执行控制异常与 Engine 契约错误（见 `_UNRECOVERABLE_ERRORS`）原样传播。
-        """
-
-        with closing(outputs):
-            try:
-                yield from outputs
-            except _UNRECOVERABLE_ERRORS:
-                raise
-            except Exception as error:
-                yield from self._produce(
-                    firing,
-                    self._resolve(hook.error(call, error), firing.run.execution),
-                    "Hook",
-                )
 
     def _produce(
         self, firing: _Firing, value: object, source: str
@@ -856,33 +880,36 @@ class Engine:
     def _inspect(
         self, firing: _Firing, call: NodeCall, phase: HookPhase, value: Any
     ) -> None:
-        """同步通知全部 Hook 的 inspect；失败被隔离，不改变调用或输出。"""
+        """同步通知本节点的 NODE_INSPECT 处理函数；失败被隔离，不改变调用或输出。"""
 
-        for hook in firing.hooks:
+        inspection = NodeInspection(call, phase, value)
+        for handler in firing.run.inspectors[firing.node_id]:
             try:
-                callback: Callable[[NodeCall, HookPhase, Any], object] = hook.inspect
-                result = callback(call, phase, value)
+                result = handler(inspection)
                 if result is not None:
                     if inspect.iscoroutine(result):
                         result.close()
-                    raise TypeError("NodeHook.inspect must return None synchronously")
-            # HookSignal 继承 BaseException，inspect 发出的控制信号同样属于采集失败。
-            except (Exception, HookSignal):
-                self._record_inspect_failure(firing.run, hook)
+                    raise TypeError(
+                        "NODE_INSPECT handlers must return None synchronously"
+                    )
+            # StopGraph 等 BaseException 信号同样属于采集失败，不改变执行流程。
+            except (Exception, StopGraph):
+                self._record_inspect_failure(firing.run, handler)
 
     @staticmethod
-    def _record_inspect_failure(run: _Run, hook: NodeHook) -> None:
-        """计数 inspect 失败；每个 Hook 在一次 execution 内只记录首次失败的 traceback。
+    def _record_inspect_failure(run: _Run, handler: Callable[..., Any]) -> None:
+        """计数采集失败；每个处理函数在一次 execution 内只记录首次失败的 traceback。
 
         必须在 except 块内调用，以便日志携带当前异常。
         """
 
-        key = id(hook)
-        name, count = run.inspect_failures.get(key, (type(hook).__qualname__, 0))
+        key = id(handler)
+        label = getattr(handler, "__qualname__", type(handler).__qualname__)
+        name, count = run.inspect_failures.get(key, (label, 0))
         run.inspect_failures[key] = (name, count + 1)
         if count == 0:
             _LOGGER.exception(
-                "NodeHook.inspect of %s failed in execution %s; "
+                "NODE_INSPECT handler %s failed in execution %s; "
                 "later failures in this execution are only counted",
                 name,
                 run.execution.id,
@@ -890,12 +917,12 @@ class Engine:
 
     @staticmethod
     def _report_inspect_failures(run: _Run) -> None:
-        """execution 结束时汇总失败多于一次的 inspect Hook。"""
+        """execution 结束时汇总失败多于一次的采集处理函数。"""
 
         for name, count in run.inspect_failures.values():
             if count > 1:
                 _LOGGER.warning(
-                    "NodeHook.inspect of %s failed %d times in execution %s",
+                    "NODE_INSPECT handler %s failed %d times in execution %s",
                     name,
                     count,
                     run.execution.id,
@@ -921,7 +948,7 @@ class Engine:
             result: Node 或 Hook 的返回值：Output、Iterable[Output] 或 None。
             graph_name: 错误归属的 Graph 注册名称。
             node_id: 错误归属的节点 ID。
-            source: 错误消息中的来源名称，如 "Node"、"Hook"、"StopGraph"。
+            source: 错误消息中的来源名称，如 "Node"、"middleware"、"StopGraph"。
             execution: 每次推进源前后检查控制条件的执行句柄。
 
         Yields:
@@ -977,7 +1004,7 @@ class Engine:
         graph_name: str,
         node_id: str,
     ) -> NodeCall:
-        """确认 Hook enter 只替换了输入值，且新值符合输入端口类型。
+        """确认传给 call_next 的调用只替换了输入值，且新值符合输入端口类型。
 
         Returns:
             通过校验的 modified。
@@ -990,7 +1017,7 @@ class Engine:
 
         if not isinstance(modified, NodeCall):
             raise HookExecutionError(
-                "hook enter must return NodeCall",
+                "call_next requires a NodeCall",
                 graph=graph_name,
                 node=node_id,
             )
@@ -1001,13 +1028,13 @@ class Engine:
             or modified.context is not original.context
         ):
             raise HookExecutionError(
-                "hook cannot replace graph, node, or context",
+                "middleware cannot replace graph, node, or context",
                 graph=graph_name,
                 node=node_id,
             )
         if set(modified.inputs) != set(original.inputs):
             raise HookExecutionError(
-                "hook cannot add or remove node input ports",
+                "middleware cannot add or remove node input ports",
                 graph=graph_name,
                 node=node_id,
             )
@@ -1015,7 +1042,7 @@ class Engine:
             expected = input_ports[port]
             if not isinstance(value, expected):
                 raise PortValueTypeError(
-                    f"hook input {port!r} expected {expected.__name__}, "
+                    f"middleware input {port!r} expected {expected.__name__}, "
                     f"got {type(value).__name__}",
                     graph=graph_name,
                     node=node_id,

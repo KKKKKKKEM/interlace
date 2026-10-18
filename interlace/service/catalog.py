@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from threading import RLock
 from typing import Any, TypeVar
@@ -10,7 +10,7 @@ from typing import Any, TypeVar
 from pydantic import BaseModel
 
 from interlace import Graph, Node
-from interlace.engine.policies import PolicyRegistry
+from interlace.engine.policies import InputSelector
 
 from .errors import InvalidRequestError
 from .models import GraphDefinition, Model
@@ -39,19 +39,13 @@ class NodeCatalog:
     Attributes:
         _types: 名称到工厂登记的映射。
         _lock: 保护登记和目录快照。
-        policies: 编译图时使用的输入策略注册表，由调用方管理。
     """
 
-    def __init__(self, *, policies: PolicyRegistry | None = None) -> None:
-        """创建目录，可注入与应用一致的 selector 注册表。
-
-        Args:
-            policies: 自定义输入策略；None 使用标准策略。
-        """
+    def __init__(self) -> None:
+        """创建空目录。"""
 
         self._types: dict[str, _NodeType] = {}
         self._lock = RLock()
-        self.policies = policies
 
     def register(
         self,
@@ -147,11 +141,18 @@ class NodeCatalog:
             raise TypeError("node factory must return a Node")
         return node
 
-    def compile(self, definition: GraphDefinition) -> Graph:
+    def compile(
+        self,
+        definition: GraphDefinition,
+        *,
+        selectors: Mapping[str, InputSelector] | None = None,
+    ) -> Graph:
         """通过标准 Graph 构建和冻结流程编译文档。
 
         Args:
             definition: 待验证的图文档。
+            selectors: 冻结时按名称查找 selector 的快照，None 只使用内建策略；GraphService 传入
+                Runtime 钩子总线上当前提供的具名值。
 
         Returns:
             已通过核心校验的冻结 Graph。
@@ -167,7 +168,7 @@ class NodeCatalog:
             graph.add(item.id, self.create(item.type, item.config))
         for edge in definition.edges:
             graph.connect(**edge.model_dump())
-        return graph.freeze(self.policies)
+        return graph.freeze(selectors)
 
 
 def describe_graph(name: str, graph: Graph) -> dict[str, Any]:
@@ -196,7 +197,11 @@ def describe_graph(name: str, graph: Graph) -> dict[str, Any]:
                     port: typ.__name__
                     for port, typ in graph.spec_for(node_id).output_ports.items()
                 },
-                "policy": graph.spec_for(node_id).input_policy.ref.name,
+                "policy": (
+                    None
+                    if (bound := graph.spec_for(node_id).input_policy) is None
+                    else bound.policy.name
+                ),
             }
             for node_id, node in graph.nodes.items()
         ],

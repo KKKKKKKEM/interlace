@@ -49,8 +49,8 @@ line-length = 88
 
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F", "B", "C4", "C90", "PLW2901", "RUF", "SIM", "UP"]
-# 中文文档与注释使用全角标点。
-ignore = ["RUF001", "RUF002", "RUF003"]
+# 中文文档与注释使用全角标点；Node 以类级普通字典声明端口，冻结时复制为不可变快照。
+ignore = ["RUF001", "RUF002", "RUF003", "RUF012"]
 
 [tool.ruff.lint.mccabe]
 max-complexity = 15

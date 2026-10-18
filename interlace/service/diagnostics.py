@@ -16,8 +16,13 @@ from typing import Any
 from pydantic_core import to_jsonable_python
 
 from interlace import Runtime
-from interlace.engine.hooks import HookPhase, NodeCall, NodeHook
-from interlace.engine.observation import RuntimeEvent, current_node_event
+from interlace.plugins.points import (
+    NODE_INSPECT,
+    HookPhase,
+    NodeInspection,
+    RuntimeEvent,
+)
+from interlace.engine.observation import current_node_event
 
 from .store import ServiceStore
 
@@ -203,14 +208,14 @@ def redact_value(value: Any, depth: int = 0) -> Any:
     return value
 
 
-class NodeDiagnostics(NodeHook):
-    """共享 Hook 贡献通道的节点诊断采集器，不转换输入输出。
+class NodeDiagnostics:
+    """经 NODE_INSPECT 钩子点采集节点调用数据的诊断器，不转换输入输出。
 
     Attributes:
         store: 调用方管理的服务历史存储。
         _active: 当前正在运行的执行标识、节点和 firing 序号。
         _lock: 保护并发 firing 的采集范围。
-        _hook: 本次诊断独立拥有的 Hook 注册。
+        _hook: 本次诊断独立拥有的 NODE_INSPECT 登记。
         _handler: 本次诊断独立拥有的标准日志处理器。
         _pending: 按 firing 暂存、等待批量写入的诊断事件。
         _batch_size: 单次事务最多积累的诊断事件数量。
@@ -218,10 +223,10 @@ class NodeDiagnostics(NodeHook):
     """
 
     def __init__(self, runtime: Runtime, store: ServiceStore) -> None:
-        """为指定 Runtime 安装诊断 Hook 和带作用域的日志处理器。
+        """为指定 Runtime 登记诊断采集并安装带作用域的日志处理器。
 
         Args:
-            runtime: 提供 Node Hook 扩展的运行时。
+            runtime: 提供钩子总线的运行时。
             store: 保存采集结果的服务存储。
         """
 
@@ -235,7 +240,7 @@ class NodeDiagnostics(NodeHook):
         self._lock = RLock()
         self._closed = False
         self._handler = _NodeLogHandler(self)
-        self._hook = runtime.attach(self)
+        self._hook = runtime.hooks.on(NODE_INSPECT, self.inspect)
         try:
             logging.getLogger().addHandler(self._handler)
         except BaseException:
@@ -259,18 +264,17 @@ class NodeDiagnostics(NodeHook):
                 pending = tuple(self._pending.pop(key, ()))
                 self._flush(pending)
 
-    def inspect(self, call: NodeCall, phase: HookPhase, value: Any) -> None:
-        """在所有输入 Hook 后、原始输出变换前采集实际调用数据。
+    def inspect(self, inspection: NodeInspection) -> None:
+        """在全部中间件转换输入后、原始输出被改写前采集实际调用数据。
 
         Args:
-            call: 真正传给 Node.execute 的调用。
-            phase: 输入、原始输出或异常阶段。
-            value: 输出或异常，输入阶段为 None。
+            inspection: 实际调用、采集阶段与输出或异常。
         """
 
         event = current_node_event()
         if event is None:
             return
+        call, phase, value = inspection.call, inspection.phase, inspection.value
         if phase is HookPhase.ENTER:
             self.record(
                 event,
@@ -347,7 +351,7 @@ class NodeDiagnostics(NodeHook):
             self.store.append_events(entries)
 
     def close(self) -> None:
-        """注销本次 Hook 和日志处理器，不改变其他日志配置。"""
+        """注销本次采集登记和日志处理器，不改变其他日志配置。"""
 
         with self._lock:
             if self._closed:

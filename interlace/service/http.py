@@ -21,7 +21,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import Headers, MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from interlace import Execution
+from interlace.engine import Execution
 from interlace.engine.errors import GraphError, RuntimeClosedError
 
 from .diagnostics import redact_text

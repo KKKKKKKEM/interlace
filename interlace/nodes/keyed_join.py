@@ -7,9 +7,8 @@ from collections.abc import Hashable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from ..engine import Context, Node, Output, Ports
+from ..engine import Context, InputPolicy, Node, Output
 from ..engine.errors import ExecutionError, IncompleteInputsError
-from ..engine.policies import LONGEST_POLICY, PolicyRef
 
 
 class KeyedJoinOverflowError(ExecutionError):
@@ -56,16 +55,16 @@ class KeyedJoin(Node):
     仍有未配对值则以 IncompleteInputsError 使 execution 失败。
 
     Attributes:
-        input_ports: left 与 right 两个 KeyedValue 输入端口。
-        output_ports: 输出 KeyedPair 的 joined 端口。
+        inputs: left 与 right 两个 KeyedValue 输入端口。
+        outputs: 输出 KeyedPair 的 joined 端口。
         input_policy: 内建 longest 策略，每次 firing 只消费一个值，并优先消费积压较多的一侧，
             使交错到达的左右输入及时配对。
         max_pending: 单次 execution 内允许暂存的未配对值总数上限。
     """
 
-    input_ports = Ports(left=KeyedValue, right=KeyedValue)
-    output_ports = Ports(joined=KeyedPair)
-    input_policy = PolicyRef(LONGEST_POLICY)
+    inputs = {"left": KeyedValue, "right": KeyedValue}
+    outputs = {"joined": KeyedPair}
+    input_policy = InputPolicy.LONGEST
 
     def __init__(self, *, max_pending: int = 10_000) -> None:
         """校验未配对值上限。

@@ -5,12 +5,12 @@
 下面的例子把一个字符串转换为大写。它展示 Interlace 的最小闭环：声明 Node、构建并注册 Graph、再执行它。
 
 ```python
-from interlace import Graph, Node, Output, Ports, Runtime
+from interlace import Graph, Node, Output, Runtime
 
 
 class Upper(Node):
-    input_ports = Ports(text=str)
-    output_ports = Ports(result=str)
+    inputs = {"text": str}
+    outputs = {"result": str}
     timeout = 5  # None 表示该 Node 的单次执行不限时
 
     def execute(self, inputs, context):

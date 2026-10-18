@@ -16,7 +16,7 @@ pytest.importorskip("jsonrpcserver")
 from fastapi.testclient import TestClient
 from pydantic import BaseModel, ConfigDict
 
-from interlace import Graph, Node, Output, Ports, Runtime
+from interlace import Graph, Node, Output, Runtime
 from interlace.service import GraphService, NodeCatalog, RunRequest
 from interlace.service.models import DraftRequest, GraphDefinition
 
@@ -40,13 +40,13 @@ class Upper(Node):
     """可由编辑器构建的转换节点。
 
     Attributes:
-        input_ports: 文本输入。
-        output_ports: 文本输出。
+        inputs: 文本输入。
+        outputs: 文本输出。
         prefix: 不随执行变化的前缀。
     """
 
-    input_ports = Ports(text=str)
-    output_ports = Ports(text=str)
+    inputs = {"text": str}
+    outputs = {"text": str}
 
     def __init__(self, config: Config) -> None:
         """保存构造参数。

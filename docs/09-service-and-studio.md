@@ -130,7 +130,7 @@ service = GraphService(runtime, nodes=catalog)
 
 工作台支持节点添加、删除、标识修改、拖拽、端口连线、入口选择、配置表单、撤销重做、定义导入导出和校验。
 复杂配置字段使用 JSON 编辑。端口预览通过真实工厂读取，因此允许端口随配置变化；服务端冻结校验始终为最终依据。
-自定义 selector 可通过 `NodeCatalog(policies=...)` 显式注入对应的 PolicyRegistry。
+编译图文档时使用 Runtime 钩子总线上当前提供的具名值查找 selector，自定义 selector 应在发布或恢复图定义之前提供。
 
 ## 草稿与发布版本
 
@@ -256,10 +256,10 @@ curl http://127.0.0.1:8000/rpc \
 - 异常：调用或迭代失败的类型、消息和堆栈；取消与超时仍沿用现有执行语义。
 
 诊断默认启用，可用 `GraphService(runtime, diagnostics=False)` 关闭参数、原始输出和日志采集，保留生命周期与终端结果。
-参数通过同一 Hook 贡献通道的同步 `NodeHook.inspect()` 采集：输入在全部 enter 转换之后，原始输出在 exit 转换之前。
+参数通过 `NODE_INSPECT` 钩子点同步采集：输入在全部节点中间件改写之后，原始输出在中间件改写之前。
 同一 firing 的诊断记录最多积累 64 条后批量提交，并在节点结束前冲刷剩余记录，减少文件 SQLite 的逐条事务开销。
 采集立即生成独立快照，不修改原对象，失败不改变业务结果；生成器等一次性迭代器以 `$unavailable` 标记代替，不被读取。
-终端输出含一次性迭代器时编码明确失败，不消耗应用仍持有的对象。生命周期仍使用公开 Runtime Observer，
+终端输出含一次性迭代器时编码明确失败，不消耗应用仍持有的对象。生命周期事实经 `RUNTIME_EVENT` 钩子点记录，
 `output.routed` 只记录 step、port 和目标端口集合，不携带业务对象。
 
 日志通过当前观测作用域的 execution、node 与 step 关联，不能按线程 ID 猜测归属。采集遵守应用已有日志级别与

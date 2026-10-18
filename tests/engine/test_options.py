@@ -5,7 +5,7 @@ from threading import Event as ThreadEvent
 
 import pytest
 
-from interlace import Graph, Node, Output, Ports, Runtime
+from interlace import Graph, Node, Output, Runtime
 from interlace.engine.events import bind_context
 from interlace.spi import Work
 from interlace.adapters import memory
@@ -15,8 +15,8 @@ from interlace.runtime import GraphWorker
 class ReadOptions(Node):
     """返回当前执行的配置供调用方校验。"""
 
-    input_ports = Ports(default=int)  # 用于触发当前调用的整数。
-    output_ports = Ports(default=dict)  # 当前调用配置的字典快照。
+    inputs = {"default": int}  # 用于触发当前调用的整数。
+    outputs = {"default": dict}  # 当前调用配置的字典快照。
 
     def execute(self, inputs, context):
         """输出当前配置。
@@ -116,8 +116,8 @@ def test_start_snapshots_before_background_execution():
     class Wait(Node):
         """阻塞首节点以检查后续节点的配置快照。"""
 
-        input_ports = Ports(default=int)  # 原样传递的触发值。
-        output_ports = Ports(default=int)  # 后续节点的触发值。
+        inputs = {"default": int}  # 原样传递的触发值。
+        outputs = {"default": int}  # 后续节点的触发值。
 
         def execute(self, inputs, context):
             """等待外部修改原始配置后再输出。
@@ -158,7 +158,7 @@ def test_event_execution_does_not_inherit_options():
     class Emit(Node):
         """发出独立的目标图事件。"""
 
-        input_ports = Ports(default=int)  # 发出的事件数据。
+        inputs = {"default": int}  # 发出的事件数据。
 
         def execute(self, inputs, context):
             """显式发布目标事件。

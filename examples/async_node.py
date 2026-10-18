@@ -4,19 +4,19 @@ from __future__ import annotations
 
 import asyncio
 
-from interlace import Graph, Node, Output, Ports, Runtime
+from interlace import Graph, Node, Output, Runtime
 
 
 class DelayedUpper(Node):
     """异步等待后将输入文本转为大写的示例节点。
 
     Attributes:
-        input_ports: 输入端口，text 为待转换的字符串。
-        output_ports: 输出端口，result 为转换后的大写字符串。
+        inputs: 输入端口，text 为待转换的字符串。
+        outputs: 输出端口，result 为转换后的大写字符串。
     """
 
-    input_ports = Ports(text=str)
-    output_ports = Ports(result=str)
+    inputs = {"text": str}
+    outputs = {"result": str}
 
     async def execute(self, inputs, context):
         """模拟一次异步 I/O 等待，再把 text 转为大写。

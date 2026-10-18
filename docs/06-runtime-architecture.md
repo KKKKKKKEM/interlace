@@ -7,11 +7,11 @@
 
 | 层次 | 源码边界 | 对象 | 责任 |
 | --- | --- | --- | --- |
-| 用户模型 | `interlace.engine`，由 `interlace` 导出 | Ports、Node、Output、Edge、Graph、Event、Context、Execution、Slot | 描述业务计算与可观察执行状态 |
-| 用户门面 | `interlace.runtime`，由 `interlace` 导出 | Runtime | 注册 Graph，代理执行、事件、观察和控制入口 |
-| 装配宿主 | `interlace.plugins`、`interlace.runtime.plugin` | PluginHost、LocalRuntimePlugin | 解析插件依赖，注册 capability，安装标准贡献并管理生命周期 |
+| 用户模型 | `interlace`（Graph、Node、Output、Context、Event）与 `interlace.engine` | Node、Output、Edge、Graph、Event、Context、InputPolicy、ExecutionPlan、Execution、Slot、SlotPool | 描述业务计算与可观察执行状态 |
+| 用户门面 | `interlace.runtime`，由 `interlace` 导出 | Runtime | 注册 Graph，代理执行、事件、观察和控制入口，公开钩子总线 `hooks` |
+| 装配宿主 | `interlace.plugins`、`interlace.runtime.plugin` | PluginHost、ExtensionAPI、LocalInfrastructurePlugin、LocalRuntimePlugin | 解析插件依赖，提供与装饰具名值，管理钩子总线与插件清理 |
 | 运行角色 | `interlace.runtime` | EventRouter、GraphWorker | 分别处理 Event -> Work 与 Work -> Graph execution |
-| 能力端口 | `interlace.spi` | RouterRole、WorkerRole（由 ExecutionHost、HookHost、PolicyHost、ObservationHost 组合）、EventBus、任务传输、GraphExecutor、SlotProvider、执行资源协议 | 隔离编排、传输、执行和资源实现 |
+| 能力端口 | `interlace.spi` | RouterRole、WorkerRole（即 ExecutionHost）、EventBus、任务传输、GraphExecutor、SlotProvider、执行资源协议 | 隔离编排、传输、执行和资源实现 |
 | 默认适配器 | `interlace.adapters.memory`、`interlace.engine.executor` | EventBus、TaskBackend、Engine | 提供单进程内存运行时 |
 | 可选官方服务 | `interlace.service` | GraphService、NodeCatalog、Studio | 提供 RPC、图编辑发布与观测历史，按 extra 安装 |
 
@@ -23,18 +23,20 @@ Runtime 是面向应用的稳定门面，PluginHost 是系统装配根。普通�
 
 ```text
 interlace/
-├── __init__.py              # 宪法规定的顶层公共 API
+├── __init__.py              # 宪法规定的顶层公共 API（六个名字）
 ├── engine/                  # Graph 执行微内核及受控内核扩展点
-│   ├── core.py              # Ports、Node、Output、InputPolicy
+│   ├── core.py              # Node、Output、InputPolicy 与冻结端口快照
 │   ├── graph.py             # Edge、Graph、ExecutionPlan 与冻结校验
 │   ├── execution.py         # Execution 句柄、限制与状态
 │   ├── execution_resources.py # 输出存储与等待通知协议及默认实现
 │   ├── executor.py          # 单张冻结 Graph 的默认执行器 Engine
 │   ├── events.py            # Event 与 Context
 │   ├── slots.py             # Slot 与 SlotPool
-│   ├── hooks.py             # Node Hook 契约和快照注册
-│   ├── policies.py          # selector 契约、引用与冻结绑定
-│   ├── observation.py       # 只读 Runtime 观察模型
+│   ├── extension.py         # 两种钩子点、HookBus、具名值与 Registration
+│   ├── points.py            # 节点调用、采集与生命周期事实的核心钩子点
+│   ├── hooks.py             # NodeCall、NodeInspection 与 StopGraph
+│   ├── policies.py          # selector 契约、内建 selector 与冻结绑定
+│   ├── observation.py       # 只读 Runtime 生命周期事实
 │   ├── errors.py            # 内核和运行控制错误
 │   └── runner.py            # 同步/异步 Node 调用桥接
 ├── runtime/                 # Runtime 门面和运行角色
@@ -43,10 +45,10 @@ interlace/
 │   ├── worker.py            # GraphWorker：注册、消费与执行宿主编排
 │   ├── history.py           # Execution 记录保留与活跃计数
 │   ├── direct.py            # 直接执行线程池
-│   ├── contributions.py     # 目标 Graph 注册前的延迟 Hook 贡献
-│   ├── plugin.py            # LocalRuntimePlugin
+│   ├── points.py            # Router、Worker 与 Runtime 生命周期的核心钩子点
+│   ├── plugin.py            # LocalInfrastructurePlugin、LocalRuntimePlugin
 │   └── _utils.py            # 私有生命周期状态机与关闭辅助函数
-├── plugins/                 # PluginHost、descriptor、capability 与 contribution
+├── plugins/                 # PluginHost、ExtensionAPI、descriptor、capability 与 points 重导出
 ├── spi/                     # EventBus、任务传输、GraphExecutor 等窄协议
 ├── adapters/                # 随包提供的具体部署适配器
 │   └── memory.py            # memory.EventBus、memory.TaskBackend
@@ -88,9 +90,9 @@ flowchart LR
 这里的关键约束是：
 
 - `engine` 不依赖 `runtime`、`plugins`、`spi`、`adapters` 或可复用 `nodes`；
-- `spi` 只引用协议签名所需的 Graph、Event、Execution、Hook 和 Slot 模型；
+- `spi` 只引用协议签名所需的 Graph、Event、Execution 和 Slot 模型；
 - `adapters` 实现 SPI，可以引用搬运 Event/Work 所需的最小内核类型；
-- `plugins` 管理装配元数据与生命周期，通过 SPI 的公开角色安装标准贡献，不读取 Runtime 私有状态；
+- `plugins` 管理装配元数据、钩子总线与生命周期，只依赖公开 capability，不读取 Runtime 私有状态；
 - `runtime` 可以依赖前述各层并完成组合，但不得把部署算法重新实现到门面中；
 - `nodes` 只放可复用的非内核 Node，只依赖内核公共语义，不能成为 Runtime 的隐式前置条件。
 - `service` 依赖公开 Runtime、Graph、Execution 及观察模型；核心不导入服务或 Web 依赖。`web/` 保存工作台源代码。
@@ -103,35 +105,33 @@ flowchart LR
 ```mermaid
 flowchart TB
     Runtime --> Host[PluginHost]
+    Host --> Bus[(HookBus)]
+    Host --> Infra[LocalInfrastructurePlugin]
     Host --> Local[LocalRuntimePlugin]
-    Host --> Contributions[Contribution plugins]
+    Host --> Features[应用插件]
 
+    Infra --> EventBus
+    Infra --> Tasks[TaskBackend]
+    Infra --> Engine
     Local --> Router[EventRouter]
     Local --> Worker[GraphWorker]
-    Router --> Bus[EventBus]
-    Router --> Publisher[TaskPublisher]
-    Worker --> Consumer[TaskConsumer]
-    Worker --> Executor[GraphExecutor]
+    Router --> EventBus
+    Router --> Tasks
+    Worker --> Tasks
+    Worker --> Engine
 
-    Contributions --> Selectors[InputSelector contributions]
-    Contributions --> Hooks[NodeHook contributions]
-    Contributions --> Observers[RuntimeObserver contributions]
-    Selectors --> Host
-    Hooks --> Host
-    Observers --> Host
-    Host -->|PolicyHost / HookHost / ObservationHost| Worker
-    Host -->|ObservationHost| Router
+    Features -->|on / provide| Bus
+    Router -->|EVENT_EMIT / WORK_ROUTE / RUNTIME_EVENT| Bus
+    Worker -->|WORK_DELIVER / EXECUTION_RUN / 查找 selector| Bus
+    Engine -->|NODE_CALL / NODE_INSPECT| Bus
 ```
 
-`Runtime()` 根据已声明 capability 让 LocalRuntimePlugin 逐项补齐缺失的 EventBus、TaskBackend、GraphExecutor 和 ExecutionFactory，
-再组装 Router 与 Worker。补齐范围通过公开构造参数 `LocalRuntimePlugin(infrastructure=...)` 表达：所列底层能力由插件自行提供，
-其余声明为依赖，descriptor 随实例选择生成。内建实现和应用插件使用相同的依赖解析、capability 注册、启动和停止流程。显式
-`Runtime(router=..., worker=...)` 用于 Router/Worker 独立部署，此模式不创建 PluginHost。
+`Runtime()` 汇总插件声明：未被提供的角色由 `LocalRuntimePlugin(roles=...)` 补齐；补齐角色需要、或任一插件依赖或装饰
+却无人提供的基础设施由 `LocalInfrastructurePlugin(provides=...)` 补齐。内建实现和应用插件使用相同的依赖解析、
+capability 提供、装饰与清理流程，Runtime 只有这一种装配路径。
 
-全部插件完成 `setup()` 后，PluginHost 先通过公开角色安装 selector、Hook 和 Observer：selector 只要求 Worker 实现
-`PolicyHost`，Hook 只要求 `HookHost`，Observer 要求 Router 与 Worker 实现 `ObservationHost`；然后按依赖顺序调用
-`start()`。因此插件在启动阶段注册 Graph 时，标准贡献已经可用。提供完整替代角色的插件同样经过
-这条安装路径；缺少贡献所需的角色或窄协议会在启动前失败。LocalRuntimePlugin 只负责提供默认能力与角色，不单独安装贡献。
+PluginHost 拥有 Runtime 唯一的 HookBus。角色与 Engine 在构造时取得同一总线，并在固定边界触发核心钩子点；插件在
+setup 或运行期登记处理函数。扩展行为因此不属于角色协议：替代角色只要以 `api.hooks` 构造，就自动支持全部插件。
 
 ## 直接执行路径
 
@@ -198,7 +198,7 @@ EventRouter 不需要目标 Graph 定义，只负责把匹配 Event 转成 Work�
 
 ## Graph 冻结边界
 
-Runtime 注册 Graph 时，GraphWorker 使用当前 PolicyRegistry 绑定输入选择器并冻结 Graph：
+Runtime 注册 Graph 时，GraphWorker 以钩子总线上当前提供的具名值快照绑定输入 selector 并冻结 Graph：
 
 ```mermaid
 flowchart LR
@@ -218,7 +218,7 @@ flowchart LR
 
 1. 把入口输入放入 entrypoint 队列；
 2. InputSelector 只根据端口和可用 token 数选择本次消费组合；
-3. 在 `execution.step(node_id)` 内执行 Hook 和 Node；
+3. 在 `execution.step(node_id)` 内执行 NODE_CALL 中间件链与 Node；
 4. 校验 Output 端口与类型；
 5. 沿 Edge 投递下游，或发布为 terminal Output；
 6. ready queue 清空后检查残留输入并运行 quiescence callback。
@@ -227,16 +227,17 @@ flowchart LR
 
 ## 快照与动态扩展
 
-不同扩展点在不同边界固定快照：
+不同扩展点在不同边界读取登记快照：
 
-| 扩展 | 固定时机 | 目的 |
+| 扩展 | 读取时机 | 目的 |
 | --- | --- | --- |
-| InputSelector | Graph freeze | 同一张 Graph 的触发语义稳定 |
-| Node Hook | execution start | 在途 execution 不受 attach/detach 影响 |
-| Runtime Observer | 发布每个 RuntimeEvent 时读取 | 支持动态观察且不干预业务结果 |
+| 输入 selector（具名值） | Graph freeze | 同一张 Graph 的触发语义稳定 |
+| NODE_CALL / NODE_INSPECT | execution start | 在途 execution 不受登记或注销影响 |
+| 其他钩子点 | 每次触发 | 支持运行期动态扩展 |
 
-Runtime Observer 与 `observe()` 注册的 Event 观察者的异常都会被记录并隔离；只有 route 的 Work 提交失败以
-`EventDispatchError` 传回 `emit()`。Hook 可以转换输入、输出或流程，但最终结果仍受 Graph 端口和执行控制契约约束。
+Notice 处理函数与 `observe()` 注册的 Event 观察者的异常都会被记录并隔离；Wrap 中间件的失败按所在
+操作的错误契约传播，例如 `EVENT_EMIT` 与 `WORK_ROUTE` 的失败以 `EventDispatchError` 传回 `emit()`。中间件可以转换输入、
+输出或流程，但最终结果仍受 Graph 端口和执行控制契约约束。
 
 ## Slot 租约与分支
 
@@ -248,14 +249,11 @@ emit 开始新的 Slot 链。同一个 Slot 使用 execution lock 保证 Graph �
 
 ## 生命周期与所有权
 
-插件模式下，Runtime 排空工作后关闭 PluginHost。宿主先逆序注销已安装的 selector、Hook 和 Observer，再逆序停止已进入
-`setup()` 的插件；贡献安装或 `start()` 中途失败也按同一清理流程回滚，单项清理失败不跳过后续步骤并写入日志，回滚
-最终重新抛出原始失败。延迟 Hook 在目标 Graph 注册前后均可注销，
-注入执行器不会因宿主退出而留下本次贡献。LocalRuntimePlugin 关闭它提供的角色和自己创建的底层组件。
-注入组件默认由调用方管理，`close_injected=True` 才转移所有权。
-selector 注销只影响后续 Graph 冻结，已经绑定的 Graph 保留原选择器快照；共享 PolicyRegistry 可供后续装配继续使用。
-
-显式 Router/Worker 模式下，Runtime 直接关闭两个角色，各角色再按自己的所有权配置处理底层组件。
+Runtime 关闭时先发布 `runtime.closing`，调用 Worker 的 `begin_close()` 解除未读订阅的背压并排空工作，关闭角色后发布
+`runtime.closed`，最后关闭 PluginHost。宿主先逆序注销各插件经 `api.on`/`api.provide` 的登记，再按登记的逆序执行
+`api.defer` 清理函数；`setup()` 中途失败也按同一清理流程回滚，单项清理失败不跳过后续步骤并写入日志，回滚
+最终重新抛出原始失败。内建插件关闭它们创建的角色与底层组件；注入组件默认由调用方管理，`close_injected=True`
+才转移所有权。selector 撤销只影响后续 Graph 冻结，已经绑定的 Graph 保留原 selector 快照。
 
 组件所有权与注册所有权分别管理。`EventBus.subscribe()`、`TaskConsumer.bind()` 返回仅撤销本次注册的幂等函数；
 Router 保存并注销自己的 Event 订阅，Worker 保存并注销自己的消费绑定。共享传输可以继续供其他角色使用。

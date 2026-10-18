@@ -13,13 +13,21 @@ from uuid import UUID
 
 import pytest
 
-from interlace import Event, Graph, InputPolicy, Node, Ports, Runtime
+from interlace import Event, Graph, Node, Runtime
 from interlace.adapters import memory
 from interlace.engine.errors import EventDispatchError
-from interlace.engine.hooks import HookRegistry
 from interlace.engine.observation import RuntimeEvent, RuntimeEventKind
 from interlace.engine.slots import SlotPool
-from interlace.runtime import EventRouter, GraphWorker
+from interlace.plugins import (
+    CAP_EVENT_ROUTER,
+    CAP_GRAPH_EXECUTOR,
+    CAP_GRAPH_WORKER,
+    CAP_TASK_BACKEND,
+    HookBus,
+    plugin,
+)
+from interlace.plugins.points import RUNTIME_EVENT
+from interlace.runtime import EventRouter, GraphWorker, LocalInfrastructurePlugin
 from interlace.spi import (
     Delivery,
     DeliveryOutcome,
@@ -27,9 +35,9 @@ from interlace.spi import (
     EventHandler,
     LocalTaskPublisher,
     SlotLease,
+    SlotProvider,
     Work,
     WorkHandler,
-    SlotProvider,
 )
 
 
@@ -37,14 +45,12 @@ class EmptyNode(Node):
     """无端口、启动即执行且不做任何事的节点，用于构造单节点测试 Graph。
 
     Attributes:
-        input_ports: 空端口声明，节点不接收输入。
-        output_ports: 空端口声明，节点不产生输出。
-        input_policy: ON_START，使节点在 Graph 启动时直接执行一次。
+        inputs: 空端口声明，节点不接收输入。
+        outputs: 空端口声明，节点不产生输出。
     """
 
-    input_ports = Ports()
-    output_ports = Ports()
-    input_policy = InputPolicy.ON_START
+    inputs = {}
+    outputs = {}
 
     def execute(self, inputs, context) -> None:
         """丢弃输入与上下文，不产生任何输出。"""
@@ -263,40 +269,6 @@ class RecordingExecutor:
         self.closed = True
 
 
-class HookableRecordingExecutor(RecordingExecutor):
-    """在 RecordingExecutor 上组合 HookRegistry，不继承 Engine 也能提供 attach。
-
-    Attributes:
-        hooks: 保存 attach 登记的 Hook，测试通过其 snapshot 检查登记与卸载。
-    """
-
-    def __init__(self) -> None:
-        """初始化调用记录并创建独立的 HookRegistry。"""
-
-        super().__init__()
-        self.hooks = HookRegistry()
-
-    def attach(self, hook, *, phase=None, graph=None, node=None):
-        """把 Hook 及其 phase、graph、node 作用域原样转交 HookRegistry 登记。
-
-        Returns:
-            HookRegistry.attach 返回的句柄，可 detach 卸载本次登记。
-        """
-
-        return self.hooks.attach(
-            hook,
-            phase=phase,
-            graph=graph,
-            node=node,
-        )
-
-    def close(self) -> None:
-        """先关闭 HookRegistry，再标记执行器已关闭。"""
-
-        self.hooks.close()
-        super().close()
-
-
 def test_runtime_composes_replaceable_capabilities() -> None:
     """替换传输、任务和执行器不改变 Runtime/Graph 使用 API。"""
 
@@ -305,9 +277,10 @@ def test_runtime_composes_replaceable_capabilities() -> None:
     executor = RecordingExecutor()
     graph = Graph(entrypoint="empty").add("empty", EmptyNode())
 
-    router = EventRouter(events=bus, publisher=tasks)
-    worker = GraphWorker(consumer=tasks, executor=executor, emit=router.publish)
-    with Runtime(router=router, worker=worker) as runtime:
+    infrastructure = LocalInfrastructurePlugin(
+        events=bus, tasks=tasks, executor=executor
+    )
+    with Runtime(plugins=(infrastructure,)) as runtime:
         runtime.register("work.graph", graph)
         runtime.route(
             "work.created",
@@ -330,37 +303,12 @@ def test_runtime_composes_replaceable_capabilities() -> None:
     assert not bus.closed and not tasks.closed and not executor.closed
 
 
-def test_custom_executor_can_explicitly_support_runtime_hooks() -> None:
-    """Hook 是结构化可选能力，不要求自定义执行器继承 Engine。"""
+def test_runtime_explicitly_exposes_composed_roles(roles_plugin) -> None:
+    """Runtime 保存并代理插件提供的 Router 与 Worker。
 
-    tasks = RecordingTasks()
-    executor = HookableRecordingExecutor()
-    worker = GraphWorker(consumer=tasks, executor=executor)
-    worker.register("work.graph", Graph(entrypoint="empty").add(empty=EmptyNode()))
-
-    handle = worker.attach(lambda call: call, graph="work.graph", node="empty")
-
-    assert executor.hooks.snapshot("work.graph")
-    handle.detach()
-    assert executor.hooks.snapshot("work.graph") == ()
-    worker.close()
-
-
-def test_custom_executor_without_hook_capability_is_rejected() -> None:
-    """普通 GraphExecutor 仍可执行，只在请求可选 Hook 能力时失败。"""
-
-    tasks = RecordingTasks()
-    worker = GraphWorker(consumer=tasks, executor=RecordingExecutor())
-    worker.register("work.graph", Graph(entrypoint="empty").add(empty=EmptyNode()))
-
-    with pytest.raises(TypeError, match="does not support hooks"):
-        worker.attach(lambda call: call, graph="work.graph")
-
-    worker.close()
-
-
-def test_runtime_explicitly_exposes_composed_roles() -> None:
-    """Runtime 保存并代理调用方显式传入的 Router 与 Worker。"""
+    Args:
+        roles_plugin: 把现成角色作为插件提供的工厂。
+    """
 
     bus = RecordingBus()
     tasks = RecordingTasks()
@@ -368,27 +316,72 @@ def test_runtime_explicitly_exposes_composed_roles() -> None:
     router = EventRouter(events=bus, publisher=tasks)
     worker = GraphWorker(consumer=tasks, executor=executor, emit=router.publish)
 
-    runtime = Runtime(router=router, worker=worker)
+    runtime = Runtime(plugins=(roles_plugin(router, worker),))
 
     assert runtime.router is router
     assert runtime.worker is worker
     runtime.close()
 
 
-def test_runtime_rejects_partial_role_composition() -> None:
-    """组合根不接受缺少 Router 或 Worker 的残缺配置。"""
+def test_plugin_can_replace_only_the_worker() -> None:
+    """插件只提供 Worker 时，默认 Router 与基础设施补齐其余部分，替代 Worker 照常执行与消费。"""
 
-    tasks = memory.TaskBackend()
-    router = EventRouter(publisher=tasks)
-    with pytest.raises(TypeError, match="both router and worker"):
-        Runtime(router=router)
-    router.close()
-    tasks.close()
+    class CountingWorker(GraphWorker):
+        """统计直接执行次数的替代 Worker。
+
+        Attributes:
+            starts: 直接执行的次数。
+        """
+
+        starts = 0
+
+        def start(self, *args: Any, **kwargs: Any) -> Any:
+            """计数后委托默认实现。"""
+
+            type(self).starts += 1
+            return super().start(*args, **kwargs)
+
+    @plugin(
+        "test/worker",
+        provides=(CAP_GRAPH_WORKER,),
+        requires_capabilities=(CAP_EVENT_ROUTER, CAP_TASK_BACKEND, CAP_GRAPH_EXECUTOR),
+    )
+    def worker_plugin(api: Any) -> None:
+        """用宿主中的 Router 与基础设施组装替代 Worker。
+
+        Args:
+            api: 绑定插件身份的扩展接口。
+        """
+
+        router = api.require(CAP_EVENT_ROUTER)
+        api.provide(
+            CAP_GRAPH_WORKER,
+            CountingWorker(
+                consumer=api.require(CAP_TASK_BACKEND),
+                executor=api.require(CAP_GRAPH_EXECUTOR),
+                emit=router.publish,
+                emit_local=router.publish_local,
+                hooks=api.hooks,
+            ),
+        )
+
+    with Runtime(plugins=(worker_plugin,)) as runtime:
+        assert type(runtime.router) is EventRouter
+        assert isinstance(runtime.worker, CountingWorker)
+        runtime.register("work.graph", Graph(entrypoint="empty").add(empty=EmptyNode()))
+        runtime.on("work.created", graph="work.graph", queue="work")
+        runtime.emit("work.created")
+        runtime.wait_idle(5)
+        assert runtime.run("work.graph") == ()
+    assert CountingWorker.starts == 1
 
 
-def test_roles_can_close_injected_components() -> None:
-    """角色可以显式接管注入组件的生命周期。"""
+def test_roles_can_close_injected_components(roles_plugin) -> None:
+    """角色可以显式接管注入组件的生命周期。
 
+    Args:
+        roles_plugin: 把现成角色作为插件提供的工厂。
+    """
     bus = RecordingBus()
     publisher = RecordingTasks()
     consumer = RecordingTasks()
@@ -404,7 +397,7 @@ def test_roles_can_close_injected_components() -> None:
         emit=router.publish,
         close_injected=True,
     )
-    runtime = Runtime(router=router, worker=worker)
+    runtime = Runtime(plugins=(roles_plugin(router, worker),))
 
     runtime.close()
 
@@ -825,9 +818,10 @@ def test_plain_publisher_never_touches_the_source_lease() -> None:
 def test_event_published_precedes_the_work_it_causes() -> None:
     """EVENT_PUBLISHED 先于同一 Event 引起的 WORK_SUBMITTED 被观察到。"""
 
-    router = EventRouter(publisher=RecordingLocalPublisher())
+    hooks = HookBus()
+    router = EventRouter(publisher=RecordingLocalPublisher(), hooks=hooks)
     observed: list[RuntimeEvent] = []
-    router.observe_runtime(observed.append)
+    hooks.on(RUNTIME_EVENT, observed.append)
     router.route("value", graph="graph", queue="queue")
 
     router.emit("value")

@@ -1,20 +1,20 @@
-"""分支与汇聚：一个值产生两个输出，再由 ALL Node 合并。"""
+"""分支与汇聚：一个值产生两个输出，再由默认 ALL 策略的 Node 合并。"""
 
 from __future__ import annotations
 
-from interlace import Edge, Graph, InputPolicy, Node, Output, Ports, Runtime
+from interlace import Graph, Node, Output, Runtime
 
 
 class Split(Node):
     """将同一输入分发到两条计算分支的示例节点。
 
     Attributes:
-        input_ports: 输入端口，value 为待分发的整数。
-        output_ports: 输出端口，left 发送原值，right 发送原值加一。
+        inputs: 输入端口，value 为待分发的整数。
+        outputs: 输出端口，left 发送原值，right 发送原值加一。
     """
 
-    input_ports = Ports(value=int)
-    output_ports = Ports(left=int, right=int)
+    inputs = {"value": int}
+    outputs = {"left": int, "right": int}
 
     def execute(self, inputs, context):
         """把 value 分发到 left，把 value + 1 分发到 right。
@@ -33,17 +33,15 @@ class Split(Node):
 
 
 class Add(Node):
-    """等待两路输入并输出相加结果的示例节点。
+    """等待两路输入并输出相加结果的示例节点；默认 ALL 策略在 left 与 right 都有值时才触发。
 
     Attributes:
-        input_ports: 输入端口，left 与 right 分别接收两条分支的整数。
-        output_ports: 输出端口，total 为两路输入之和。
-        input_policy: ALL 策略，left 与 right 都有 token 时才触发执行。
+        inputs: 输入端口，left 与 right 分别接收两条分支的整数。
+        outputs: 输出端口，total 为两路输入之和。
     """
 
-    input_ports = Ports(left=int, right=int)
-    output_ports = Ports(total=int)
-    input_policy = InputPolicy.ALL
+    inputs = {"left": int, "right": int}
+    outputs = {"total": int}
 
     def execute(self, inputs, context):
         """把 left 与 right 相加后从 total 输出。
@@ -70,13 +68,11 @@ def run(value: int = 2) -> int:
         total 端口输出的和，即 value * 2 + 1。
     """
 
-    graph = Graph.compose(
-        nodes={"split": Split(), "add": Add()},
-        entrypoint="split",
-        edges=[
-            Edge("split", "add", "left", "left"),
-            Edge("split", "add", "right", "right"),
-        ],
+    graph = (
+        Graph(entrypoint="split")
+        .add(split=Split(), add=Add())
+        .connect("split", "add", source_port="left", target_port="left")
+        .connect("split", "add", source_port="right", target_port="right")
     )
     with Runtime() as runtime:
         runtime.register("fan-in", graph)

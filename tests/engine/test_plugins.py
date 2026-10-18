@@ -1,212 +1,47 @@
-"""统一插件宿主和 Runtime 插件装配的契约测试。"""
+"""插件宿主、扩展接口、单例装饰链与默认装配的契约测试。"""
 
 from __future__ import annotations
 
 import logging
 from threading import enumerate as enumerate_threads
+from typing import Any
 
 import pytest
 
-from interlace import Event, Graph, Node, Output, Ports, Runtime
+from interlace import Event, Graph, Node, Output, Runtime
 from interlace.adapters import memory
 from interlace.engine.executor import Engine
-from interlace.engine.hooks import NodeCall
-from interlace.engine.observation import ObservationHub, RuntimeEvent, RuntimeEventKind
-from interlace.engine.policies import PolicyRef, PolicyRegistry
+from interlace.engine import InputPolicy
 from interlace.plugins import (
     CAP_EVENT_BUS,
     CAP_EVENT_ROUTER,
     CAP_GRAPH_EXECUTOR,
     CAP_GRAPH_WORKER,
-    CAP_INPUT_SELECTOR,
-    CAP_NODE_HOOK,
-    CAP_RUNTIME_OBSERVER,
     CAP_TASK_BACKEND,
-    ContributionPlugin,
-    NodeHookContribution,
+    HookBus,
+    NoticePoint,
     PluginDescriptor,
     PluginHost,
+    plugin,
 )
-from interlace.runtime import EventRouter, GraphWorker, LocalRuntimePlugin
+from interlace.plugins.points import (
+    NODE_CALL,
+    RUNTIME_EVENT,
+    NodeCall,
+    RuntimeEvent,
+    RuntimeEventKind,
+)
+from interlace.runtime import LocalInfrastructurePlugin, LocalRuntimePlugin
 from interlace.spi import DeliveryResult, Work
 
-
-def test_multiple_plugins_can_contribute_each_extension_kind() -> None:
-    """验证多个插件能分别贡献各类聚合扩展。"""
-
-    observed: list[list[RuntimeEvent]] = [[], []]
-    calls: list[str] = []
-
-    def record_call(call: NodeCall) -> NodeCall:
-        """记录 Hook 经过的节点 ID，并原样返回调用记录。"""
-
-        calls.append(call.node_id)
-        return call
-
-    plugins = tuple(
-        ContributionPlugin(
-            f"example/{index}",
-            selectors={f"example/{index}": AnySelector()},
-            hooks={f"example/{index}": record_call},
-            observers={
-                f"example/{index}": lambda event, index=index: observed[index].append(
-                    event
-                )
-            },
-        )
-        for index in range(2)
-    )
-    with Runtime(plugins=plugins) as runtime:
-        runtime.register("work", Graph(entrypoint="node").add(node=Source()))
-        assert runtime.run("work", "hello") == (Output("hello", "value"),)
-        for capability in (CAP_INPUT_SELECTOR, CAP_NODE_HOOK, CAP_RUNTIME_OBSERVER):
-            assert runtime.plugin_host is not None
-            assert len(runtime.plugin_host.contributions(capability)) == 2
-    assert calls == ["node", "node"]
-    assert observed[0] == observed[1]
-    assert observed[0]
-
-
-def test_duplicate_contribution_names_across_plugins_are_rejected() -> None:
-    """验证跨插件重复的贡献名称被拒绝。"""
-
-    plugins = tuple(
-        ContributionPlugin(
-            f"example/{index}", observers={"example/shared": lambda event: None}
-        )
-        for index in range(2)
-    )
-    with pytest.raises(ValueError, match="already exists"):
-        PluginHost(plugins).start()
-
-
-def test_aggregate_declarations_cannot_be_fulfilled_by_singletons() -> None:
-    """验证单例能力不能代替聚合贡献声明。"""
-
-    class WrongKind(RecordingPlugin):
-        def setup(self, context):
-            """把声明为聚合贡献的 example/items 错误地作为单例能力提供。"""
-
-            context.provide("example/items", object())
-
-    plugin = WrongKind("example/wrong", [])
-    plugin.descriptor = PluginDescriptor(
-        "example/wrong", "1", contributes=("example/items",)
-    )
-    with pytest.raises(ValueError, match="did not declare"):
-        PluginHost((plugin,)).start()
-
-
-def test_host_rejects_missing_contribution_and_mixed_capability_kinds() -> None:
-    """验证宿主拒绝缺失贡献和混用能力种类。"""
-
-    plugin = RecordingPlugin("example/aggregate", [])
-    plugin.descriptor = PluginDescriptor(
-        "example/aggregate", "1", contributes=("example/items",)
-    )
-    with pytest.raises(RuntimeError, match="did not provide declared"):
-        PluginHost((plugin,)).start()
-    singleton = RecordingPlugin("example/singleton", [], capability="example/items")
-    with pytest.raises(ValueError, match="both singleton and aggregate"):
-        PluginHost((plugin, singleton))
-
-
-@pytest.mark.parametrize("stage", ["validation", "setup", "start"])
-def test_failed_runtime_construction_does_not_leave_runner_threads(stage) -> None:
-    """验证 Runtime 构造失败后不遗留运行器线程。
-
-    Args:
-        stage: 构造失败的阶段：依赖校验、插件 setup 或插件 start。
-    """
-
-    class Broken(RecordingPlugin):
-        def setup(self, context):
-            """stage 为 setup 时抛出 RuntimeError，否则按 RecordingPlugin 记录装配。"""
-
-            if stage == "setup":
-                raise RuntimeError("setup failed")
-            super().setup(context)
-
-        def start(self, context):
-            """stage 为 start 时抛出 RuntimeError，否则不做任何事。"""
-
-            if stage == "start":
-                raise RuntimeError("start failed")
-
-    plugin = Broken(
-        "example/broken",
-        [],
-        requires=("example/missing",) if stage == "validation" else (),
-    )
-    before = {
-        thread.ident
-        for thread in enumerate_threads()
-        if thread.name == "interlace-async-runner"
-    }
-    for _ in range(3):
-        with pytest.raises(
-            (ValueError, RuntimeError),
-            match=r"missing required plugin|setup failed|start failed",
-        ):
-            Runtime(plugins=(plugin,))
-    after = {
-        thread.ident
-        for thread in enumerate_threads()
-        if thread.name == "interlace-async-runner"
-    }
-    assert after == before
-
-
-def test_builtin_setup_rolls_back_partially_created_components(monkeypatch) -> None:
-    """验证默认插件在任务后端构造失败时关闭已创建的事件总线。"""
-
-    bus = memory.EventBus()
-    closed = []
-    original_close = bus.close
-
-    def close():
-        """记录事件总线被关闭，再调用原始 close。"""
-
-        closed.append(True)
-        original_close()
-
-    def broken_tasks():
-        """替代 TaskBackend 构造函数，总是抛出 RuntimeError 模拟构造失败。"""
-
-        raise RuntimeError("task construction failed")
-
-    monkeypatch.setattr(bus, "close", close)
-    monkeypatch.setattr("interlace.runtime.plugin.memory.EventBus", lambda: bus)
-    monkeypatch.setattr("interlace.runtime.plugin.memory.TaskBackend", broken_tasks)
-    with pytest.raises(RuntimeError, match="task construction failed"):
-        Runtime()
-    assert closed == [True]
-
-
-@pytest.mark.parametrize(
-    ("hook", "phase", "error"),
-    [(object(), None, TypeError), (lambda call: call, "invalid", ValueError)],
-)
-def test_hook_contribution_validates_hook_and_phase_before_registration(
-    hook, phase, error
-) -> None:
-    """验证 Hook 贡献注册前检查对象和阶段。
-
-    Args:
-        hook: 非 Hook 对象，或合法的单阶段回调。
-        phase: 函数 Hook 的执行阶段；非法值应触发 ValueError。
-        error: 构造 NodeHookContribution 时期望抛出的异常类型。
-    """
-
-    with pytest.raises(error):
-        NodeHookContribution(hook, phase=phase, graph="not-yet-registered")
+TRACE: NoticePoint[str] = NoticePoint("example/trace")
 
 
 class RecordingPlugin:
-    """把 setup/start/stop 按 ``阶段:插件标识`` 记录到共享列表的测试插件。
+    """把 setup 与 defer 清理按 ``阶段:插件标识`` 记录到共享列表的测试插件。
 
     Attributes:
-        descriptor: 由构造参数生成的插件描述，版本固定为 1.0.0。
+        descriptor: 由构造参数生成的插件描述。
         events: 多个插件共享的生命周期记录列表，用于断言调用顺序。
         capability: setup 时以插件标识为值提供的能力；None 表示不提供。
     """
@@ -223,43 +58,387 @@ class RecordingPlugin:
         """按插件标识和依赖声明构造描述符，并保存共享记录列表。
 
         Args:
+            plugin_id: 插件标识。
             events: 追加生命周期记录的共享列表。
+            requires: 依赖的插件标识。
+            requires_capabilities: 依赖的单例能力。
             capability: 需要在 setup 中提供的能力；None 表示不提供。
         """
 
-        provides = () if capability is None else (capability,)
         self.descriptor = PluginDescriptor(
             plugin_id,
-            "1.0.0",
             requires=requires,
             requires_capabilities=requires_capabilities,
-            provides=provides,
+            provides=() if capability is None else (capability,),
         )
         self.events = events
         self.capability = capability
 
-    def setup(self, context) -> None:
-        """记录 setup，并在声明了能力时以插件标识作为能力值提供。"""
+    def setup(self, api: Any) -> None:
+        """记录 setup、登记清理，并在声明了能力时以插件标识作为能力值提供。"""
 
         self.events.append(f"setup:{self.descriptor.id}")
+        api.defer(self.cleanup)
         if self.capability is not None:
-            context.provide(self.capability, self.descriptor.id)
+            api.provide(self.capability, self.descriptor.id)
 
-    def start(self, context) -> None:
-        """记录 start。"""
+    def cleanup(self) -> None:
+        """记录清理。"""
+
+        self.events.append(f"cleanup:{self.descriptor.id}")
+
+
+class FailingCleanup(RecordingPlugin):
+    """清理时抛出带插件标识消息的 RuntimeError。"""
+
+    def cleanup(self) -> None:
+        """记录清理后总是抛出 RuntimeError。"""
+
+        super().cleanup()
+        raise RuntimeError(f"cleanup {self.descriptor.id} failed")
+
+
+class AnySelector:
+    """选择首个有可用 token 的端口的输入选择器。"""
+
+    def select(self, ports, available, config):
+        """按声明顺序返回首个有可用 token 的端口单元组；全部为空时返回 None。"""
+
+        del config
+        return next(((port,) for port in ports if available[port]), None)
+
+
+class Source(Node):
+    """把 value 输入原样输出到 value 端口的入口节点。
+
+    Attributes:
+        inputs: 唯一的 str 类型输入端口 value。
+        outputs: 唯一的 str 类型输出端口 value。
+    """
+
+    inputs = {"value": str}
+    outputs = {"value": str}
+
+    def execute(self, inputs, context):
+        """把 value 输入原样输出到 value 端口。"""
 
         del context
-        self.events.append(f"start:{self.descriptor.id}")
-
-    def stop(self, context) -> None:
-        """记录 stop。"""
-
-        del context
-        self.events.append(f"stop:{self.descriptor.id}")
+        return Output(inputs["value"], "value")
 
 
-def test_host_orders_dependencies_and_stops_in_reverse() -> None:
-    """验证插件按依赖启动并按逆序关闭。"""
+class Target(Source):
+    """使用插件登记的 example.plugin/any 选择器的节点。
+
+    Attributes:
+        input_policy: 引用插件登记的选择器，Graph 冻结时该名称必须已登记。
+    """
+
+    input_policy = InputPolicy("example.plugin/any")
+
+
+def uppercase(call: NodeCall, call_next: Any) -> tuple[Output, ...]:
+    """把内层输出转为大写的节点中间件。"""
+
+    return tuple(Output(item.value.upper(), item.port) for item in call_next(call))
+
+
+def _logged_errors(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """返回宿主日志中携带异常的消息文本。"""
+
+    return [
+        str(record.exc_info[1])
+        for record in caplog.records
+        if record.name == "interlace.plugins.host" and record.exc_info
+    ]
+
+
+def test_function_and_class_plugins_extend_the_same_runtime() -> None:
+    """函数插件与类插件经同一宿主提供 selector、登记节点中间件与观察者，Graph 冻结时可用。"""
+
+    observed: list[Any] = []
+
+    @plugin("example/selectors")
+    def selectors(api: Any) -> None:
+        """提供输入选择器。"""
+
+        api.provide("example.plugin/any", AnySelector())
+
+    class Features:
+        """以类形式登记中间件与观察者的插件。
+
+        Attributes:
+            descriptor: 插件声明。
+        """
+
+        descriptor = PluginDescriptor(
+            "example/features", requires=("example/selectors",)
+        )
+
+        def setup(self, api: Any) -> None:
+            """登记节点中间件与生命周期观察者。"""
+
+            api.on(NODE_CALL, uppercase, graph="work.graph", node="target")
+            api.on(RUNTIME_EVENT, observed.append, kind="execution.finished")
+
+    graph = (
+        Graph(entrypoint="source")
+        .add(source=Source(), target=Target())
+        .connect("source", "target", source_port="value", target_port="value")
+    )
+    with Runtime(plugins=(Features(), selectors)) as runtime:
+        runtime.register("work.graph", graph)
+        assert runtime.run("work.graph", "hello") == (Output("HELLO", "value"),)
+        assert [descriptor.id for descriptor in runtime.plugin_host.descriptors] == [
+            "interlace.core/local-infrastructure",
+            "interlace.core/local-runtime",
+            "example/selectors",
+            "example/features",
+        ]
+    assert [event.status for event in observed] == ["succeeded"]
+
+
+def test_provided_names_conflict_across_plugins() -> None:
+    """不同插件提供同一具名值时，宿主启动失败并回滚。"""
+
+    plugins = tuple(
+        plugin(f"example/{index}")(
+            lambda api: api.provide("example/shared", AnySelector())
+        )
+        for index in range(2)
+    )
+    with pytest.raises(ValueError, match="already provided"):
+        PluginHost(plugins).start()
+
+
+def test_plugin_registrations_are_removed_on_close_and_rollback() -> None:
+    """插件登记的钩子与具名值在关闭或启动回滚时注销，直接登记的不受影响。"""
+
+    bus = HookBus()
+    seen: list[str] = []
+    direct = bus.on(TRACE, lambda value: seen.append(f"direct:{value}"))
+
+    @plugin("example/trace")
+    def trace(api: Any) -> None:
+        """登记观察者与 selector。"""
+
+        api.on(TRACE, lambda value: seen.append(f"plugin:{value}"))
+        api.provide("example.plugin/any", AnySelector())
+
+    @plugin("example/broken", requires=("example/trace",))
+    def broken(api: Any) -> None:
+        """在 setup 中失败。"""
+
+        raise RuntimeError("setup failed")
+
+    with pytest.raises(RuntimeError, match="setup failed"):
+        PluginHost((trace, broken), hooks=bus).start()
+    bus.notify(TRACE, "rollback")
+    assert seen == ["direct:rollback"]
+    assert dict(bus.provided()) == {}
+
+    host = PluginHost((trace,), hooks=bus).start()
+    bus.notify(TRACE, "running")
+    host.close()
+    bus.notify(TRACE, "closed")
+    assert seen == [
+        "direct:rollback",
+        "direct:running",
+        "plugin:running",
+        "direct:closed",
+    ]
+    assert dict(bus.provided()) == {}
+    direct.detach()
+
+
+def test_hooks_and_names_register_anytime_but_capabilities_freeze_after_setup() -> None:
+    """钩子与未声明的具名值在 setup 之后仍可登记并随宿主关闭注销；capability 只在 setup 期可提供，
+    其他插件声明的 capability 不能被抢先提供。"""
+
+    bus = HookBus()
+    seen: list[str] = []
+    apis: list[Any] = []
+
+    class Late:
+        """保存扩展接口供 setup 之后继续登记的插件。
+
+        Attributes:
+            descriptor: 声明提供 example/value 的插件描述。
+        """
+
+        descriptor = PluginDescriptor("example/late", provides=("example/value",))
+
+        def setup(self, api: Any) -> None:
+            """提供能力并保存扩展接口。"""
+
+            api.provide("example/value", 1)
+            apis.append(api)
+
+    @plugin("example/thief")
+    def thief(api: Any) -> None:
+        """尝试提供其他插件声明的 capability。"""
+
+        with pytest.raises(ValueError, match="declared by"):
+            api.provide("example/value", 0)
+
+    host = PluginHost((Late(), thief), hooks=bus).start()
+    api = apis[0]
+    api.on(TRACE, seen.append)
+    api.provide("example/extra", 3)
+    with pytest.raises(RuntimeError, match="frozen"):
+        api.provide("example/value", 2)
+    bus.notify(TRACE, "late")
+    assert host.require("example/extra") == 3 and host.require("example/value") == 1
+    host.close()
+    bus.notify(TRACE, "after")
+    assert seen == ["late"]
+    assert dict(bus.provided()) == {}
+
+
+def test_wrappers_are_ordered_after_provider_and_before_consumers() -> None:
+    """装饰者在提供者之后、依赖方之前装配；后装配的装饰者位于外层。"""
+
+    events: list[str] = []
+    provider = RecordingPlugin("example/provider", events, capability="example/value")
+
+    def wrapper(name: str) -> Any:
+        """创建装饰 example/value 的函数插件。"""
+
+        @plugin(f"example/{name}", wraps=("example/value",))
+        def wrap(api: Any) -> None:
+            """记录并包裹当前实现。"""
+
+            events.append(f"setup:example/{name}")
+            api.wrap("example/value", lambda inner: f"{name}({inner})")
+
+        return wrap
+
+    seen: list[Any] = []
+
+    @plugin("example/consumer", requires_capabilities=("example/value",))
+    def consumer(api: Any) -> None:
+        """记录取得的最终实现。"""
+
+        seen.append(api.require("example/value"))
+
+    host = PluginHost((consumer, wrapper("outer"), provider, wrapper("inner"))).start()
+    assert events == [
+        "setup:example/provider",
+        "setup:example/outer",
+        "setup:example/inner",
+    ]
+    assert seen == ["inner(outer(example/provider))"]
+    assert host.require("example/value") == "inner(outer(example/provider))"
+    host.close()
+
+
+def test_wrapper_declarations_are_validated() -> None:
+    """装饰无人提供的能力在装配前失败；声明了 wraps 却未装饰在 setup 后失败。"""
+
+    @plugin("example/orphan", wraps=("example/missing",))
+    def orphan(api: Any) -> None:
+        """装饰不存在的能力。"""
+
+    with pytest.raises(ValueError, match="missing wrapped capability"):
+        PluginHost((orphan,))
+
+    provider = RecordingPlugin("example/provider", [], capability="example/value")
+
+    @plugin("example/lazy", wraps=("example/value",))
+    def lazy(api: Any) -> None:
+        """声明装饰但没有执行。"""
+
+    with pytest.raises(RuntimeError, match="did not fulfil"):
+        PluginHost((provider, lazy)).start()
+
+    @plugin("example/undeclared")
+    def undeclared(api: Any) -> None:
+        """装饰未声明的能力。"""
+
+        api.wrap("example/value", lambda inner: inner)
+
+    with pytest.raises(ValueError, match="did not declare wrapping"):
+        PluginHost((provider, undeclared)).start()
+
+
+@pytest.mark.parametrize("stage", ["validation", "setup"])
+def test_failed_runtime_construction_does_not_leave_runner_threads(stage) -> None:
+    """Runtime 构造失败后不遗留运行器线程。
+
+    Args:
+        stage: 构造失败的阶段：依赖校验或插件 setup。
+    """
+
+    class Broken(RecordingPlugin):
+        """按阶段失败的插件。"""
+
+        def setup(self, api: Any) -> None:
+            """stage 为 setup 时在登记清理后抛出 RuntimeError。"""
+
+            super().setup(api)
+            if stage == "setup":
+                raise RuntimeError("setup failed")
+
+    broken = Broken(
+        "example/broken",
+        [],
+        requires=("example/missing",) if stage == "validation" else (),
+    )
+
+    def runner_threads() -> set[int | None]:
+        """返回当前异步运行器线程标识。"""
+
+        return {
+            thread.ident
+            for thread in enumerate_threads()
+            if thread.name == "interlace-async-runner"
+        }
+
+    before = runner_threads()
+    for _ in range(3):
+        with pytest.raises(
+            (ValueError, RuntimeError),
+            match=r"missing required plugin|setup failed",
+        ):
+            Runtime(plugins=(broken,))
+    assert runner_threads() == before
+
+
+def test_builtin_setup_rolls_back_partially_created_components(monkeypatch) -> None:
+    """默认基础设施插件在任务后端构造失败时关闭已创建的事件总线。
+
+    Args:
+        monkeypatch: 替换默认组件构造函数的夹具。
+    """
+
+    bus = memory.EventBus()
+    closed = []
+    original_close = bus.close
+
+    def close() -> None:
+        """记录事件总线被关闭，再调用原始 close。"""
+
+        closed.append(True)
+        original_close()
+
+    def broken_tasks() -> None:
+        """模拟任务后端构造失败。
+
+        Raises:
+            RuntimeError: 总是抛出。
+        """
+
+        raise RuntimeError("task construction failed")
+
+    monkeypatch.setattr(bus, "close", close)
+    monkeypatch.setattr("interlace.runtime.plugin.memory.EventBus", lambda: bus)
+    monkeypatch.setattr("interlace.runtime.plugin.memory.TaskBackend", broken_tasks)
+    with pytest.raises(RuntimeError, match="task construction failed"):
+        Runtime()
+    assert closed == [True]
+
+
+def test_host_orders_dependencies_and_cleans_up_in_reverse() -> None:
+    """插件按依赖 setup，defer 登记的清理按逆序执行。"""
 
     events: list[str] = []
     base = RecordingPlugin("example/base", events, capability="example/base-value")
@@ -268,18 +447,13 @@ def test_host_orders_dependencies_and_stops_in_reverse() -> None:
     host = PluginHost((feature, base)).start()
 
     assert host.require("example/base-value") == "example/base"
-    assert events == [
-        "setup:example/base",
-        "setup:example/feature",
-        "start:example/base",
-        "start:example/feature",
-    ]
+    assert events == ["setup:example/base", "setup:example/feature"]
     host.close()
-    assert events[-2:] == ["stop:example/feature", "stop:example/base"]
+    assert events[-2:] == ["cleanup:example/feature", "cleanup:example/base"]
 
 
 def test_host_orders_capability_dependencies_and_rejects_missing_provider() -> None:
-    """验证按能力依赖装配且拒绝缺失的提供者。"""
+    """按能力依赖装配，并拒绝缺失的提供者。"""
 
     events: list[str] = []
     provider = RecordingPlugin("example/provider", events, capability="example/value")
@@ -298,7 +472,7 @@ def test_host_orders_capability_dependencies_and_rejects_missing_provider() -> N
 
 
 def test_host_rejects_missing_cycle_and_capability_conflict() -> None:
-    """验证宿主拒绝缺失依赖、循环依赖和能力冲突。"""
+    """宿主拒绝缺失依赖、循环依赖和能力冲突。"""
 
     events: list[str] = []
     with pytest.raises(ValueError, match="missing required plugin"):
@@ -314,501 +488,180 @@ def test_host_rejects_missing_cycle_and_capability_conflict() -> None:
     first = RecordingPlugin("example/first", events, capability="example/value")
     second = RecordingPlugin("example/second", events, capability="example/value")
     with pytest.raises(ValueError, match="already provided"):
-        PluginHost((first, second)).start()
+        PluginHost((first, second))
 
 
-@pytest.mark.parametrize("api_version", ["1", "3"])
+@pytest.mark.parametrize("api_version", ["3", "5"])
 def test_host_rejects_incompatible_plugin_api(api_version: str) -> None:
-    """验证宿主同时拒绝旧版和未来的插件 SPI。
+    """宿主同时拒绝旧版和未来的扩展 SPI。
 
     Args:
         api_version: 当前宿主不支持的 SPI 主版本。
     """
 
-    class FuturePlugin:
-        """声明不兼容 SPI 版本的最小插件，宿主构造时即应拒绝。
+    @plugin("example/incompatible")
+    def incompatible(api: Any) -> None:
+        """版本校验失败后不会被调用。"""
 
-        Attributes:
-            descriptor: 携带参数化 api_version 的插件描述。
-        """
-
-        descriptor = PluginDescriptor(
-            "example/incompatible", "1.0.0", api_version=api_version
-        )
-
-        def setup(self, context):
-            """满足插件协议的空 setup；版本校验失败后不会被调用。"""
-
-            del context
-
-        def start(self, context):
-            """满足插件协议的空 start。"""
-
-            del context
-
-        def stop(self, context):
-            """满足插件协议的空 stop。"""
-
-            del context
-
+    incompatible.descriptor = PluginDescriptor(
+        "example/incompatible", api_version=api_version
+    )
     with pytest.raises(ValueError, match=f"requires API {api_version}"):
-        PluginHost((FuturePlugin(),))
+        PluginHost((incompatible,))
 
 
-def test_setup_failure_rolls_back_configured_plugins() -> None:
-    """验证 setup 失败时回滚已接管的插件。"""
+def test_setup_failure_runs_cleanups_registered_before_the_failure() -> None:
+    """setup 中途失败时，失败插件已登记的清理与先前插件的清理一起逆序执行。"""
 
     events: list[str] = []
     base = RecordingPlugin("example/base", events)
 
     class Broken(RecordingPlugin):
-        def setup(self, context) -> None:
-            """记录 setup 后抛出 RuntimeError，模拟装配中途失败。"""
+        """登记清理后失败。"""
 
-            super().setup(context)
+        def setup(self, api: Any) -> None:
+            """登记清理后抛出 RuntimeError，模拟装配中途失败。"""
+
+            super().setup(api)
             raise RuntimeError("setup failed")
 
     with pytest.raises(RuntimeError, match="setup failed"):
         PluginHost((base, Broken("example/broken", events))).start()
 
-    assert events[-2:] == ["stop:example/broken", "stop:example/base"]
+    assert events[-2:] == ["cleanup:example/broken", "cleanup:example/base"]
 
 
-def test_start_failure_rolls_back_plugins_in_reverse_order() -> None:
-    """验证 start 失败时按逆序回滚插件。"""
+def test_host_rejects_declared_but_missing_capability_and_rolls_back() -> None:
+    """宿主拒绝未兑现的能力声明，并执行已登记的清理。"""
 
     events: list[str] = []
-
-    class Broken(RecordingPlugin):
-        def start(self, context) -> None:
-            """记录 start 后抛出 RuntimeError，模拟启动中途失败。"""
-
-            super().start(context)
-            raise RuntimeError("start failed")
-
-    with pytest.raises(RuntimeError, match="start failed"):
-        PluginHost(
-            (
-                RecordingPlugin("example/base", events),
-                Broken("example/broken", events),
-            )
-        ).start()
-
-    assert events[-2:] == ["stop:example/broken", "stop:example/base"]
-
-
-def test_host_rejects_declared_but_missing_capability() -> None:
-    """验证宿主拒绝未兑现的能力声明。"""
 
     class Missing(RecordingPlugin):
-        def setup(self, context) -> None:
-            """不提供任何能力，使声明的 example/value 落空。"""
+        """登记清理但不提供声明的能力。"""
 
-            del context
+        def setup(self, api: Any) -> None:
+            """只登记清理，使声明的 example/value 落空。"""
 
-    plugin = Missing("example/missing", [], capability="example/value")
+            api.defer(self.cleanup)
 
-    with pytest.raises(RuntimeError, match="did not provide declared capabilities"):
-        PluginHost((plugin,)).start()
-
-
-def test_stop_failure_does_not_skip_remaining_plugins() -> None:
-    """验证单个插件关闭失败后仍关闭其余插件。"""
-
-    events: list[str] = []
-
-    class BrokenStop(RecordingPlugin):
-        def stop(self, context) -> None:
-            """记录 stop 后抛出消息含插件标识的 RuntimeError。"""
-
-            super().stop(context)
-            raise RuntimeError(f"stop failed: {self.descriptor.id}")
-
-    host = PluginHost(
-        (
-            BrokenStop("example/first", events),
-            BrokenStop("example/second", events),
-        )
-    ).start()
-
-    with pytest.raises(RuntimeError, match="example/second"):
-        host.close()
-
-    assert events[-2:] == ["stop:example/second", "stop:example/first"]
-
-
-def test_contributions_reject_duplicate_names_and_freeze_after_start() -> None:
-    """验证贡献名称唯一且宿主启动后冻结注册。"""
-
-    class Contributions:
-        """在 setup 与 start 中直接断言贡献注册规则的插件。
-
-        Attributes:
-            descriptor: 声明聚合贡献 example/items 的插件描述。
-        """
-
-        descriptor = PluginDescriptor(
-            "example/contributions",
-            "1.0.0",
-            contributes=("example/items",),
-        )
-
-        def setup(self, context) -> None:
-            """贡献 example/item，并断言同名再次贡献抛出 ValueError。"""
-
-            context.contribute("example/items", "example/item", object())
-            with pytest.raises(ValueError, match="already exists"):
-                context.contribute("example/items", "example/item", object())
-
-        def start(self, context) -> None:
-            """断言宿主启动阶段追加贡献因注册已冻结而抛出 RuntimeError。"""
-
-            with pytest.raises(RuntimeError, match="frozen"):
-                context.contribute("example/items", "example/late", object())
-
-        def stop(self, context) -> None:
-            """空 stop，本插件没有需要释放的资源。"""
-
-            del context
-
-    PluginHost((Contributions(),)).start().close()
+    with pytest.raises(RuntimeError, match="did not fulfil declared capabilities"):
+        PluginHost(
+            (Missing("example/missing", events, capability="example/value"),)
+        ).start()
+    assert events == ["cleanup:example/missing"]
 
 
 def test_runtime_role_validation_failure_closes_started_plugin_host() -> None:
-    """验证角色校验失败时关闭已经启动的插件宿主。"""
+    """角色校验失败时关闭已经启动的插件宿主。"""
 
     class InvalidRoles:
-        """以普通 object 冒充路由与执行角色的插件，触发 Runtime 角色校验失败。
+        """以普通 object 冒充路由与执行角色的插件。
 
         Attributes:
             descriptor: 声明提供事件路由与 Graph Worker 能力的插件描述。
-            stopped: 宿主是否已调用 stop，用于断言校验失败后宿主被关闭。
+            stopped: 宿主是否已执行本插件的清理。
         """
 
         descriptor = PluginDescriptor(
-            "example/invalid-roles",
-            "1.0.0",
-            provides=(CAP_EVENT_ROUTER, CAP_GRAPH_WORKER),
+            "example/invalid-roles", provides=(CAP_EVENT_ROUTER, CAP_GRAPH_WORKER)
         )
 
         def __init__(self) -> None:
-            """初始化为尚未停止。"""
+            """初始化为尚未清理。"""
 
             self.stopped = False
 
-        def setup(self, context) -> None:
-            """用普通 object 提供路由与执行角色，使后续角色类型校验失败。"""
+        def setup(self, api: Any) -> None:
+            """用普通 object 提供路由与执行角色，并登记清理。"""
 
-            context.provide(CAP_EVENT_ROUTER, object())
-            context.provide(CAP_GRAPH_WORKER, object())
+            api.defer(self.stop)
+            api.provide(CAP_EVENT_ROUTER, object())
+            api.provide(CAP_GRAPH_WORKER, object())
 
-        def start(self, context) -> None:
-            """空 start；失败发生在宿主启动之后的角色校验。"""
+        def stop(self) -> None:
+            """标记插件已被宿主清理。"""
 
-            del context
-
-        def stop(self, context) -> None:
-            """标记插件已被宿主停止。"""
-
-            del context
             self.stopped = True
 
-    plugin = InvalidRoles()
+    roles = InvalidRoles()
     with pytest.raises(TypeError, match="router must implement RouterRole"):
-        Runtime(plugins=(plugin,))
+        Runtime(plugins=(roles,))
 
-    assert plugin.stopped
-
-
-class AnySelector:
-    """选择首个有可用 token 的端口的输入选择器。"""
-
-    def select(self, ports, available, config):
-        """按声明顺序返回首个有可用 token 的端口单元组；全部为空时返回 None。"""
-
-        del config
-        return next(((port,) for port in ports if available[port]), None)
+    assert roles.stopped
 
 
-class Source(Node):
-    """把 value 输入原样输出到 value 端口的入口节点。
-
-    Attributes:
-        input_ports: 唯一的 str 类型输入端口 value。
-        output_ports: 唯一的 str 类型输出端口 value。
-    """
-
-    input_ports = Ports(value=str)
-    output_ports = Ports(value=str)
-
-    def execute(self, inputs, context):
-        """把 value 输入原样输出到 value 端口。"""
-
-        del context
-        return Output(inputs["value"], "value")
-
-
-class Target(Node):
-    """使用插件贡献的 example.plugin/any 选择器、原样转发 value 的节点。
-
-    Attributes:
-        input_ports: 唯一的 str 类型输入端口 value。
-        output_ports: 唯一的 str 类型输出端口 value。
-        input_policy: 引用插件贡献的选择器，Graph 冻结时该名称必须已注册。
-    """
-
-    input_ports = Ports(value=str)
-    output_ports = Ports(value=str)
-    input_policy = PolicyRef("example.plugin/any")
-
-    def execute(self, inputs, context):
-        """把 value 输入转发到 value 端口；大写转换（如有）由贡献的 exit Hook 完成。"""
-
-        del context
-        return Output(inputs["value"], "value")
-
-
-def test_runtime_installs_extension_contributions_before_graph_freeze() -> None:
-    """验证 Runtime 在 Graph 冻结前安装扩展贡献。"""
-
-    plugin = ContributionPlugin(
-        "example/plugin",
-        selectors={"example.plugin/any": AnySelector()},
-        hooks={
-            "example.plugin/uppercase": NodeHookContribution(
-                lambda call, output: Output(output.value.upper(), output.port),
-                phase="exit",
-                graph="work.graph",
-                node="target",
-            )
-        },
-    )
-    graph = (
-        Graph(entrypoint="source")
-        .add(source=Source(), target=Target())
-        .connect("source", "target", source_port="value", target_port="value")
-    )
-
-    with Runtime(plugins=(plugin,)) as runtime:
-        runtime.register("work.graph", graph)
-        assert runtime.run("work.graph", "hello") == (Output("HELLO", "value"),)
-        assert runtime.plugin_host is not None
-        assert {item.id for item in runtime.plugin_host.descriptors} == {
-            "interlace.core/local-runtime",
-            "example/plugin",
-        }
-
-
-def test_default_runtime_is_composed_by_the_builtin_plugin() -> None:
-    """验证默认 Runtime 经由默认插件装配。"""
+def test_default_runtime_is_composed_by_the_builtin_plugins() -> None:
+    """默认 Runtime 只由两个内建插件装配。"""
 
     with Runtime() as runtime:
-        assert runtime.plugin_host is not None
-        assert runtime.plugin_host.descriptors == (LocalRuntimePlugin().descriptor,)
+        assert runtime.plugin_host.descriptors == (
+            LocalInfrastructurePlugin().descriptor,
+            LocalRuntimePlugin().descriptor,
+        )
 
 
-@pytest.mark.parametrize("scoped", [False, True])
-@pytest.mark.parametrize("fail_start", [False, True])
-def test_host_releases_contributed_hooks_from_injected_executor(
-    scoped: bool, fail_start: bool
-) -> None:
-    """验证关闭与启动回滚都会卸载注入执行器上的即时及延迟 Hook。
+def test_runtime_lifecycle_facts_precede_plugin_cleanup() -> None:
+    """runtime.started、runtime.closing、runtime.closed 依次发布，插件清理在 closed 之后执行。"""
 
-    Args:
-        scoped: 是否在 Graph 注册前贡献指定节点的延迟 Hook。
-        fail_start: 是否在绑定 Hook 后模拟插件启动失败。
-    """
+    seen: list[str] = []
 
-    executor = Engine()
-    contributions = ContributionPlugin(
-        "example/hooks",
-        hooks={
-            "example/uppercase": NodeHookContribution(
-                lambda call, output: Output(output.value.upper(), output.port),
-                phase="exit",
-                graph="work" if scoped else None,
-                node="node" if scoped else None,
-            )
-        },
-    )
+    def record(event: RuntimeEvent) -> None:
+        """记录 Runtime 自身的生命周期事实。"""
 
-    class RegisterGraph(RecordingPlugin):
-        """在启动期间触发延迟 Hook 绑定的测试插件。"""
+        if event.kind.value.startswith("runtime."):
+            seen.append(event.kind.value)
 
-        def start(self, context) -> None:
-            """经 Graph Worker 注册 work，触发延迟 Hook 绑定。
+    @plugin("example/lifecycle")
+    def lifecycle(api: Any) -> None:
+        """订阅生命周期事实并登记清理。"""
 
-            Raises:
-                RuntimeError: fail_start 为真时在注册之后抛出。
-            """
+        api.on(RUNTIME_EVENT, record)
+        api.defer(lambda: seen.append("cleanup"))
 
-            worker = context.require(CAP_GRAPH_WORKER)
-            worker.register("work", Graph(entrypoint="node").add(node=Source()))
-            if fail_start:
-                raise RuntimeError("after hook binding")
+    runtime = Runtime(plugins=(lifecycle,))
+    runtime.close()
+    assert seen == [
+        RuntimeEventKind.RUNTIME_STARTED.value,
+        RuntimeEventKind.RUNTIME_CLOSING.value,
+        RuntimeEventKind.RUNTIME_CLOSED.value,
+        "cleanup",
+    ]
 
-    plugins = (
-        LocalRuntimePlugin(executor=executor),
-        contributions,
-        RegisterGraph("example/register", []),
-    )
+
+def test_injected_engine_must_share_the_runtime_hook_bus() -> None:
+    """注入的 Engine 使用其他钩子总线时装配失败；共享总线时中间件生效。"""
+
+    foreign = Engine()
     try:
-        if fail_start:
-            with pytest.raises(RuntimeError, match="after hook binding"):
-                Runtime(plugins=plugins)
-        else:
-            with Runtime(plugins=plugins) as runtime:
-                assert runtime.run("work", "hello") == (Output("HELLO", "value"),)
-        with Runtime(plugins=(LocalRuntimePlugin(executor=executor),)) as runtime:
+        with pytest.raises(TypeError, match="share the Runtime hook bus"):
+            Runtime(plugins=(LocalInfrastructurePlugin(executor=foreign),))
+    finally:
+        foreign.close()
+
+    bus = HookBus()
+    bus.on(NODE_CALL, uppercase)
+    executor = Engine(hooks=bus)
+    try:
+        with Runtime(
+            plugins=(LocalInfrastructurePlugin(executor=executor),), hooks=bus
+        ) as runtime:
             runtime.register("work", Graph(entrypoint="node").add(node=Source()))
-            assert runtime.run("work", "hello") == (Output("hello", "value"),)
+            assert runtime.run("work", "hello") == (Output("HELLO", "value"),)
     finally:
         executor.close()
 
 
-def test_standard_contributions_require_runtime_roles() -> None:
-    """验证独立宿主不会静默接受缺少消费角色的标准贡献。"""
-
-    plugin = ContributionPlugin(
-        "example/observer", observers={"example/trace": lambda event: None}
-    )
-    with pytest.raises(LookupError, match=r"event-router.*unavailable"):
-        PluginHost((plugin,)).start()
-
-
-def test_host_releases_selectors_from_shared_policy_registry() -> None:
-    """验证启动回滚和正常关闭均移除共享注册表中的本次 selector 贡献。"""
-
-    policies = PolicyRegistry()
-    tasks = memory.TaskBackend()
-
-    class Roles(RecordingPlugin):
-        """通过闭包提供每轮独立角色和共享 selector 注册表。"""
-
-        def setup(self, context) -> None:
-            """提供本轮角色，selector 由宿主随后统一安装。"""
-
-            context.provide(CAP_EVENT_ROUTER, router)
-            context.provide(CAP_GRAPH_WORKER, worker)
-
-        def start(self, context) -> None:
-            """注册依赖贡献选择器的 Graph，使其在本轮冻结。
-
-            Raises:
-                RuntimeError: fail_start 为真时在注册之后抛出。
-            """
-
-            del context
-            worker.register("work", Graph(entrypoint="node").add(node=Target()))
-            if fail_start:
-                raise RuntimeError("selector consumer failed")
-
-        def stop(self, context) -> None:
-            """关闭本轮创建的角色，保留调用方共享的任务后端与注册表。"""
-
-            del context
-            worker.close()
-            router.close()
-
-    try:
-        for fail_start in (True, False):
-            router = EventRouter(publisher=tasks)
-            worker = GraphWorker(consumer=tasks, policies=policies)
-            roles = Roles("example/roles", [])
-            roles.descriptor = PluginDescriptor(
-                "example/roles", "1", provides=(CAP_EVENT_ROUTER, CAP_GRAPH_WORKER)
-            )
-            plugin = ContributionPlugin(
-                "example/policy", selectors={"example.plugin/any": AnySelector()}
-            )
-            if fail_start:
-                with pytest.raises(RuntimeError, match="selector consumer failed"):
-                    Runtime(plugins=(roles, plugin))
-            else:
-                with Runtime(plugins=(roles, plugin)) as runtime:
-                    assert runtime.run("work", "hello") == (Output("hello", "value"),)
-            with pytest.raises(ValueError, match="not registered"):
-                policies.bind(PolicyRef("example.plugin/any"))
-    finally:
-        tasks.close()
-
-
-def test_selector_detach_preserves_frozen_graph_and_later_registration() -> None:
-    """验证旧注销函数不删除后续同名注册，已冻结 Graph 保留选择器快照。"""
-
-    policies = PolicyRegistry()
-    selector = AnySelector()
-    detach = policies.register("example.plugin/any", selector)
-    graph = Graph(entrypoint="node").add(node=Target()).freeze(policies)
-    detach()
-    with pytest.raises(ValueError, match="not registered"):
-        policies.bind(PolicyRef("example.plugin/any"))
-    replacement = policies.register("example.plugin/any", selector)
-    detach()
-    assert policies.bind(PolicyRef("example.plugin/any")).selector is selector
-    replacement()
-    replacement()
-    with Runtime() as runtime:
-        runtime.register("work", graph)
-        assert runtime.run("work", "hello") == (Output("hello", "value"),)
-
-
-def test_contribution_installation_failure_removes_observer_registrations() -> None:
-    """验证中途安装贡献失败时撤销已经安装到调用方观察中心的注册。"""
-
-    observed: list[RuntimeEvent] = []
-    router_hub, worker_hub = ObservationHub(), ObservationHub()
-    tasks = memory.TaskBackend()
-    router = EventRouter(publisher=tasks, observations=router_hub)
-    worker = GraphWorker(consumer=tasks, observations=worker_hub)
-
-    class Roles(RecordingPlugin):
-        """向宿主提供调用方创建的两个角色。"""
-
-        def setup(self, context) -> None:
-            """提供调用方创建、各自挂接独立观察中心的路由与执行角色。"""
-
-            context.provide(CAP_EVENT_ROUTER, router)
-            context.provide(CAP_GRAPH_WORKER, worker)
-
-    roles = Roles("example/roles", [])
-    roles.descriptor = PluginDescriptor(
-        "example/roles", "1", provides=(CAP_EVENT_ROUTER, CAP_GRAPH_WORKER)
-    )
-    contributions = ContributionPlugin(
-        "example/observers",
-        observers={"example/first": observed.append, "example/invalid": object()},
-    )
-    try:
-        with pytest.raises(TypeError, match="runtime observer must be callable"):
-            Runtime(plugins=(roles, contributions))
-        event = RuntimeEvent(RuntimeEventKind.EVENT_PUBLISHED, event_type="example")
-        router_hub.publish(event)
-        worker_hub.publish(event)
-        assert observed == []
-    finally:
-        worker.close()
-        router.close()
-        tasks.close()
-
-
 def test_custom_infrastructure_uses_the_same_local_plugin_path() -> None:
-    """验证自定义底层能力使用相同的默认插件装配路径。"""
+    """自定义底层组件经默认基础设施插件装配，Runtime 关闭后仍由调用方持有。"""
 
     events = memory.EventBus()
     tasks = memory.TaskBackend()
-    executor = Engine()
-    local = LocalRuntimePlugin(events=events, tasks=tasks, executor=executor)
+    local = LocalInfrastructurePlugin(events=events, tasks=tasks)
 
     with Runtime(plugins=(local,)) as runtime:
-        assert runtime.plugin_host is not None
-        assert runtime.plugin_host.require("interlace.runtime/event-bus") is events
-        assert runtime.plugin_host.require("interlace.runtime/task-backend") is tasks
-        assert (
-            runtime.plugin_host.require("interlace.runtime/graph-executor") is executor
-        )
+        assert runtime.plugin_host.require(CAP_EVENT_BUS) is events
+        assert runtime.plugin_host.require(CAP_TASK_BACKEND) is tasks
 
-    # 注入资源仍由调用方持有：Runtime 关闭后仍可订阅、发布、绑定与提交。
     received: list[str] = []
     events.subscribe("still.open", lambda event: received.append(event.type))
     events.publish(Event("still.open"))
@@ -821,198 +674,144 @@ def test_custom_infrastructure_uses_the_same_local_plugin_path() -> None:
     unbind()
     events.close()
     tasks.close()
-    executor.close()
-
-
-def test_runtime_fills_defaults_around_custom_event_bus_capability() -> None:
-    """验证替换事件总线后其余能力仍由默认插件补齐。"""
-
-    events: list[str] = []
-    bus = memory.EventBus()
-
-    class EventBusPlugin(RecordingPlugin):
-        """用调用方创建的内存事件总线替换默认事件总线的插件。"""
-
-        def __init__(self) -> None:
-            """以 example/events 标识声明提供 CAP_EVENT_BUS 并共享外层记录列表。"""
-
-            super().__init__(
-                "example/events",
-                events,
-                capability=CAP_EVENT_BUS,
-            )
-
-        def setup(self, context) -> None:
-            """记录 setup 并提供调用方创建的事件总线。"""
-
-            self.events.append(f"setup:{self.descriptor.id}")
-            context.provide(CAP_EVENT_BUS, bus)
-
-        def stop(self, context) -> None:
-            """记录 stop 并关闭提供的事件总线。"""
-
-            super().stop(context)
-            bus.close()
-
-    with Runtime(plugins=(EventBusPlugin(),)) as runtime:
-        assert runtime.plugin_host is not None
-        assert runtime.plugin_host.require(CAP_EVENT_BUS) is bus
 
 
 @pytest.mark.parametrize(
-    ("capability", "component"),
+    ("capability", "factory"),
     [
-        (CAP_TASK_BACKEND, memory.TaskBackend()),
-        (CAP_GRAPH_EXECUTOR, Engine()),
+        (CAP_EVENT_BUS, lambda api: memory.EventBus()),
+        (CAP_TASK_BACKEND, lambda api: memory.TaskBackend()),
+        (CAP_GRAPH_EXECUTOR, lambda api: Engine(hooks=api.hooks)),
     ],
 )
 def test_runtime_fills_defaults_around_each_infrastructure_capability(
-    capability: str,
-    component: memory.EventBus | memory.TaskBackend | Engine,
+    capability: str, factory: Any
 ) -> None:
-    """验证独立替换各底层能力时仍能补齐默认装配。
+    """独立替换任一底层能力时，其余能力仍由默认插件补齐并可执行 Graph。
 
     Args:
         capability: 被替换的底层能力名称。
-        component: 替换该能力的组件实例，插件停止时将其关闭。
+        factory: 以扩展接口创建替换组件的函数。
     """
 
-    class InfrastructurePlugin:
-        """只提供被替换能力的插件，其余能力交由默认插件补齐。
+    created: list[Any] = []
+
+    class Infrastructure:
+        """只提供被替换能力的插件。
 
         Attributes:
-            descriptor: 以能力名末段命名、声明提供该能力的插件描述。
+            descriptor: 声明提供该能力的插件描述。
         """
 
-        descriptor = PluginDescriptor(
-            f"example/{capability.rsplit('/', 1)[-1]}",
-            "1.0.0",
-            provides=(capability,),
-        )
+        descriptor = PluginDescriptor("example/infrastructure", provides=(capability,))
 
-        def setup(self, context) -> None:
-            """提供参数化的替换组件。"""
+        def setup(self, api: Any) -> None:
+            """提供替换组件并登记关闭。"""
 
-            context.provide(capability, component)
+            created.append(factory(api))
+            api.defer(created[0].close)
+            api.provide(capability, created[0])
 
-        def start(self, context) -> None:
-            """无启动动作。"""
-
-            del context
-
-        def stop(self, context) -> None:
-            """关闭替换组件。"""
-
-            del context
-            component.close()
-
-    with Runtime(plugins=(InfrastructurePlugin(),)) as runtime:
-        assert runtime.plugin_host is not None
-        assert runtime.plugin_host.require(capability) is component
+    with Runtime(plugins=(Infrastructure(),)) as runtime:
+        assert runtime.plugin_host.require(capability) is created[0]
+        runtime.register("work", Graph(entrypoint="node").add(node=Source()))
+        assert runtime.run("work", "hello") == (Output("hello", "value"),)
 
 
-class FailingStop(RecordingPlugin):
-    """stop 时抛出带插件标识消息的 RuntimeError。"""
-
-    def stop(self, context) -> None:
-        """记录 stop 后总是抛出 RuntimeError。"""
-
-        super().stop(context)
-        raise RuntimeError(f"stop {self.descriptor.id} failed")
-
-
-def _logged_errors(caplog: pytest.LogCaptureFixture) -> list[str]:
-    """返回宿主日志中携带异常的消息文本。"""
-
-    return [
-        str(record.exc_info[1])
-        for record in caplog.records
-        if record.name == "interlace.plugins.host" and record.exc_info
-    ]
-
-
-def test_start_rollback_logs_cleanup_failures_and_raises_original(
+def test_setup_rollback_logs_cleanup_failures_and_raises_original(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """启动失败回滚时逆序停止全部插件，清理失败写入日志，重新抛出原始启动失败。"""
+    """setup 失败回滚时逆序执行全部清理，清理失败写入日志，重新抛出原始 setup 失败。
+
+    Args:
+        caplog: 日志捕获夹具。
+    """
 
     events: list[str] = []
 
-    class FailingStart(RecordingPlugin):
-        """start 时失败的插件。"""
+    class FailingSetup(RecordingPlugin):
+        """登记清理后 setup 失败的插件。"""
 
-        def start(self, context) -> None:
-            """记录 start 后总是抛出 RuntimeError。"""
+        def setup(self, api: Any) -> None:
+            """登记清理后总是抛出 RuntimeError。"""
 
-            super().start(context)
-            raise RuntimeError("start failed")
+            super().setup(api)
+            raise RuntimeError("setup failed")
 
     host = PluginHost(
         (
-            FailingStop("example/a", events),
-            FailingStop("example/b", events),
-            FailingStart("example/c", events),
+            FailingCleanup("example/a", events),
+            FailingCleanup("example/b", events),
+            FailingSetup("example/c", events),
         )
     )
     with (
         caplog.at_level(logging.ERROR, logger="interlace.plugins.host"),
-        pytest.raises(RuntimeError, match="start failed"),
+        pytest.raises(RuntimeError, match="setup failed"),
     ):
         host.start()
 
-    assert events[-3:] == ["stop:example/c", "stop:example/b", "stop:example/a"]
+    assert events[-3:] == [
+        "cleanup:example/c",
+        "cleanup:example/b",
+        "cleanup:example/a",
+    ]
     assert sorted(_logged_errors(caplog)) == [
-        "stop example/a failed",
-        "stop example/b failed",
+        "cleanup example/a failed",
+        "cleanup example/b failed",
     ]
 
 
 def test_close_raises_first_cleanup_failure_and_logs_the_rest(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """关闭时单个插件失败不跳过后续插件，抛出首个失败并记录其余失败。"""
+    """关闭时单个清理失败不跳过后续清理，抛出首个失败并记录其余失败。
+
+    Args:
+        caplog: 日志捕获夹具。
+    """
 
     events: list[str] = []
     host = PluginHost(
-        (FailingStop("example/a", events), FailingStop("example/b", events))
+        (FailingCleanup("example/a", events), FailingCleanup("example/b", events))
     ).start()
     with (
         caplog.at_level(logging.ERROR, logger="interlace.plugins.host"),
-        pytest.raises(RuntimeError, match="stop example/b failed"),
+        pytest.raises(RuntimeError, match="cleanup example/b failed"),
     ):
         host.close()
 
-    assert events[-2:] == ["stop:example/b", "stop:example/a"]
-    assert _logged_errors(caplog) == ["stop example/a failed"]
+    assert events[-2:] == ["cleanup:example/b", "cleanup:example/a"]
+    assert _logged_errors(caplog) == ["cleanup example/a failed"]
     host.close()
 
 
-def test_registration_handle_detach_follows_host_phase() -> None:
-    """注册句柄在 setup 与关闭阶段可撤销，宿主运行期间撤销失败且注册保持不变。"""
+def test_provide_registration_detach_follows_host_phase() -> None:
+    """提供句柄在 setup 与关闭阶段可撤销，宿主运行期间撤销失败且提供保持不变。"""
 
-    handles: list = []
+    handles: list[Any] = []
     stopped: list[str] = []
 
     class Registering(RecordingPlugin):
-        """setup 中撤销后重新提供，stop 中撤销最终注册。"""
+        """setup 中撤销后重新提供，清理时撤销最终提供。"""
 
-        def setup(self, context) -> None:
-            """先提供再重复撤销首个注册，然后提供最终值并保存其句柄。"""
+        def setup(self, api: Any) -> None:
+            """先提供再重复撤销首个提供，然后提供最终值并登记清理。"""
 
-            first = context.provide("example/value", "first")
+            first = api.provide("example/value", "first")
             first.detach()
             first.detach()
-            handles.append(context.provide("example/value", "final"))
+            handles.append(api.provide("example/value", "final"))
+            api.defer(self.cleanup)
 
-        def stop(self, context) -> None:
-            """在关闭期间撤销最终注册，并记录本插件已停止。"""
+        def cleanup(self) -> None:
+            """在关闭期间撤销最终提供，并记录本插件已清理。"""
 
-            del context
             handles[0].detach()
             stopped.append(self.descriptor.id)
 
-    plugin = Registering("example/registering", [], capability="example/value")
-    host = PluginHost((plugin,)).start()
+    registering = Registering("example/registering", [], capability="example/value")
+    host = PluginHost((registering,)).start()
     assert host.require("example/value") == "final"
     with pytest.raises(RuntimeError, match="while the host runs"):
         handles[0].detach()
@@ -1026,94 +825,6 @@ def test_registration_handle_detach_follows_host_phase() -> None:
 
 
 @pytest.mark.parametrize(
-    ("contribution", "message"),
-    [
-        (
-            {"selectors": {"example/any": AnySelector()}},
-            "worker must implement PolicyHost",
-        ),
-        (
-            {"hooks": {"example/hook": lambda call: call}},
-            "worker must implement HookHost",
-        ),
-        (
-            {"observers": {"example/trace": lambda event: None}},
-            "router must implement ObservationHost",
-        ),
-    ],
-)
-def test_contribution_installation_checks_the_narrow_role_protocol(
-    contribution: dict, message: str
-) -> None:
-    """每类标准贡献只要求角色实现对应的窄协议，缺失时在启动前失败。
-
-    Args:
-        contribution: 传给 ContributionPlugin 的单类贡献。
-        message: 期望的协议缺失错误。
-    """
-
-    events: list[str] = []
-
-    class Roles(RecordingPlugin):
-        """提供不实现任何角色协议的占位角色。"""
-
-        def setup(self, context) -> None:
-            """以未实现任何角色协议的 object 提供路由与执行角色。"""
-
-            context.provide(CAP_EVENT_ROUTER, object())
-            context.provide(CAP_GRAPH_WORKER, object())
-
-    roles = Roles("example/roles", events)
-    roles.descriptor = PluginDescriptor(
-        "example/roles", "1", provides=(CAP_EVENT_ROUTER, CAP_GRAPH_WORKER)
-    )
-    with pytest.raises(TypeError, match=message):
-        PluginHost((roles, ContributionPlugin("example/c", **contribution))).start()
-    assert events[-1] == "stop:example/roles"
-
-
-def test_observer_contributions_need_only_the_observation_protocol() -> None:
-    """只实现 observe_runtime 的角色即可接收 Observer 贡献，关闭时贡献被注销。"""
-
-    hub = ObservationHub()
-    observed: list[RuntimeEvent] = []
-
-    class ObservingRole:
-        """只实现 ObservationHost 的角色替身。"""
-
-        def observe_runtime(self, observer):
-            """把观察者挂到共享观察中心，并返回其卸载句柄。"""
-
-            return hub.attach(observer)
-
-    class Roles(RecordingPlugin):
-        """提供两个只支持观察的角色。"""
-
-        def setup(self, context) -> None:
-            """以两个 ObservingRole 分别提供路由与执行角色。"""
-
-            context.provide(CAP_EVENT_ROUTER, ObservingRole())
-            context.provide(CAP_GRAPH_WORKER, ObservingRole())
-
-    roles = Roles("example/roles", [])
-    roles.descriptor = PluginDescriptor(
-        "example/roles", "1", provides=(CAP_EVENT_ROUTER, CAP_GRAPH_WORKER)
-    )
-    host = PluginHost(
-        (
-            roles,
-            ContributionPlugin("example/c", observers={"example/o": observed.append}),
-        )
-    ).start()
-    event = RuntimeEvent(RuntimeEventKind.EVENT_PUBLISHED, event_type="example")
-    hub.publish(event)
-    assert observed == [event, event]
-    host.close()
-    hub.publish(event)
-    assert observed == [event, event]
-
-
-@pytest.mark.parametrize(
     ("kwargs", "error"),
     [
         ({"id": "plain"}, ValueError),
@@ -1123,9 +834,11 @@ def test_observer_contributions_need_only_the_observation_protocol() -> None:
         ({"version": "1.0.0\n"}, ValueError),
         ({"requires": ("test/self",)}, ValueError),
         ({"requires": ["test/other"]}, TypeError),
-        ({"provides": ("cap", "cap")}, ValueError),
-        ({"provides": ("cap",), "contributes": ("cap",)}, ValueError),
-        ({"provides": ("cap",), "requires_capabilities": ("cap",)}, ValueError),
+        ({"provides": ("plain",)}, ValueError),
+        ({"provides": ("a/cap", "a/cap")}, ValueError),
+        ({"provides": ("a/cap",), "wraps": ("a/cap",)}, ValueError),
+        ({"provides": ("a/cap",), "requires_capabilities": ("a/cap",)}, ValueError),
+        ({"wraps": ("a/cap",), "requires_capabilities": ("a/cap",)}, ValueError),
         ({"api_version": "0"}, ValueError),
     ],
 )
@@ -1137,7 +850,7 @@ def test_plugin_descriptor_rejects_invalid_declarations(kwargs, error) -> None:
         error: 期望的异常类型。
     """
 
-    values = {"id": "test/self", "version": "1.0.0", **kwargs}
+    values = {"id": "test/self", **kwargs}
     with pytest.raises(error):
         PluginDescriptor(**values)
 
@@ -1147,8 +860,10 @@ def test_runtime_and_host_reject_non_plugins_and_duplicate_ids() -> None:
 
     with pytest.raises(TypeError, match="PluginDescriptor"):
         Runtime(plugins=[object()])
-    duplicate = ContributionPlugin(
-        "test/duplicate", observers={"observer": lambda event: None}
-    )
+
+    @plugin("test/duplicate")
+    def duplicate(api: Any) -> None:
+        """空插件。"""
+
     with pytest.raises(ValueError, match="duplicate plugin"):
         PluginHost([duplicate, duplicate])

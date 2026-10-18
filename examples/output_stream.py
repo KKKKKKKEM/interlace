@@ -4,19 +4,19 @@ from __future__ import annotations
 
 import asyncio
 
-from interlace import Graph, Node, Output, Ports, Runtime
+from interlace import Graph, Node, Output, Runtime
 
 
 class ProduceMany(Node):
     """逐项产生终端输出以展示流式交付的示例节点。
 
     Attributes:
-        input_ports: 输入端口，count 为要产生的输出数量。
-        output_ports: 输出端口，item 未连线，每项都作为终端输出交付。
+        inputs: 输入端口，count 为要产生的输出数量。
+        outputs: 输出端口，item 未连线，每项都作为终端输出交付。
     """
 
-    input_ports = Ports(count=int)
-    output_ports = Ports(item=int)
+    inputs = {"count": int}
+    outputs = {"item": int}
 
     def execute(self, inputs, context):
         """一次返回 count 项 item 输出，供调用方逐项流式消费。

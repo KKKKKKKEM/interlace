@@ -41,22 +41,27 @@ flowchart LR
 
 这个边界让单张 Graph 保持可推理，也让跨 Graph 工作流可以独立扩展和部署。
 
-## 四层心智模型
+## 按层暴露的概念
 
-| 层次 | 核心对象 | 回答的问题 |
-| --- | --- | --- |
-| 业务计算 | `Ports`、`Node`、`Output`、`Edge`、`Graph` | 数据怎样经过一组确定的步骤？ |
-| 跨图协作 | `Event`、`Context.emit()`、`Runtime.on()` | 一个领域事实应启动哪些独立工作？ |
-| 执行控制 | `Execution`、`Slot`、`SlotPool` | 工作如何等待、取消、限时和共享链路状态？ |
-| 系统装配 | `PluginHost`、capability、contribution | 基础设施和非本质策略如何替换？ |
+概念是“必须知道才能用”的东西：能做成方法、参数或返回值的，就不要求用户导入一个类名。能力靠组合少数原语获得，
+不为每个场景新增机制。每一层只比上一层多一两个概念：
 
-普通应用通常只使用前三层。插件和能力协议属于高级扩展接口，不进入顶层 `interlace` 词汇。
+| 层次 | 读者 | 需要理解的概念 | 其余能力从哪里来 |
+| --- | --- | --- | --- |
+| 写业务 | 所有人 | `Graph`、`Node`、`Output`、`Runtime` | `Context` 作为参数传入，跨图事实经 `context.emit()` 发出 |
+| 编排 | 所有人 | 不新增 | `connect`、`on`、`emit`、`plan()`、`iter()` 与 `options=`、`slots=`、`timeout=` 等参数 |
+| 扩展 | 插件作者 | 钩子点、插件 | 插件是 `setup(api)`，只有 `on`、`provide`、`wrap`、`require`、`defer` 五个动作 |
+| 换基础设施 | 适配器作者 | SPI 协议 | `interlace.spi` 中的窄协议，普通用户看不到 |
+
+顶层 `interlace` 因此只有 `Graph`、`Node`、`Output`、`Runtime`、`Context`、`Event` 六个名字。汇聚策略
+`InputPolicy`、显式连接 `Edge`、执行计划 `ExecutionPlan`、执行句柄 `Execution` 与跨队列共享的 `SlotPool` 位于
+`interlace.engine`，只在需要时导入。
 
 ## 微内核：哪些东西不能被插件改变
 
 以下语义共同定义了“什么是 Interlace Graph”，因此属于微内核：
 
-- Ports 的类型约束；
+- 端口的类型约束；
 - Graph 的冻结、可达性和 Edge 校验；
 - InputPolicy 的 token 消费规则；
 - Output 的局部传播；
@@ -69,31 +74,32 @@ flowchart LR
 
 ## 可插拔能力：哪些东西允许变化
 
-部署环境和横切能力变化频繁，适合通过窄协议或受控 contribution 扩展：
+部署环境和横切能力变化频繁，适合通过窄协议或统一的扩展机制变化：
 
 - EventBus 与任务传输；
 - GraphExecutor；
 - RouterRole、WorkerRole 和 SlotProvider；
 - ExecutionFactory、OutputStore 和 ExecutionNotifier；
-- InputSelector；
-- Node Hook；
-- Runtime Observer；
-- 领域 Node 和状态适配器。
+- 按名称提供的输入 selector 等具名值；
+- 核心钩子点上的处理函数：事件改写、Work 路由、交付与执行中间件、节点中间件、只读生命周期事实；
+- 插件为领域定义的钩子点，以及领域 Node 和状态适配器。
 
-默认内存实现也由 `LocalRuntimePlugin` 通过 `PluginHost` 安装，与应用插件走同一套依赖、能力注册和生命周期路径。
-插件只能贡献明确能力，不能访问 Runtime 私有状态或改写微内核规则。
+扩展只有一套机制：两种钩子点（只读 Notice 与中间件 Wrap）加按名称提供、可装饰的具名值，核心与插件以同一方式
+定义和使用。默认内存实现也由 `LocalInfrastructurePlugin` 与 `LocalRuntimePlugin` 通过 `PluginHost` 安装，与应用插件
+走同一套依赖、具名值和清理路径。插件只能通过钩子点与具名值扩展，不能访问 Runtime 私有状态或改写微内核规则；
+钩子点也不能吞掉执行控制异常或产生违反端口契约的结果。
 
 ```mermaid
 flowchart TB
     App[应用 Graph 与 Node]
-    Contributions[受控插件贡献]
+    Contributions[插件：钩子点 / 具名值]
     Kernel[微内核语义]
 
     App --> Kernel
     Contributions -->|只能通过 capability| Kernel
 
     subgraph Fixed[稳定契约]
-        Kernel --> Types[Ports / Edge 类型]
+        Kernel --> Types[端口 / Edge 类型]
         Kernel --> Freeze[Graph freeze]
         Kernel --> Exec[Execution 状态机]
         Kernel --> Boundary[Output / Event 边界]

@@ -4,21 +4,23 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from functools import partial
-from threading import Barrier, Event as ThreadEvent
+from threading import Barrier
+from threading import Event as ThreadEvent
 from typing import Any
 
 import pytest
 
-from interlace import Context, Graph, Node, Output, Ports, Runtime, Slot, SlotPool
+from interlace import Context, Graph, Node, Output, Runtime
+from interlace.engine import Slot, SlotPool
 from interlace.engine.errors import (
     ExecutionCancelledError,
     ExecutionError,
     NodeTimeoutError,
 )
 from interlace.engine.events import bind_context
-from interlace.engine.hooks import NodeCall, NodeHook
+from interlace.plugins.points import NODE_CALL, NodeCall
 from interlace.spi import ContextFactory
 
 
@@ -58,8 +60,8 @@ class AirContext(Context):
 class ReadSeed(Node):
     """输出工厂初始化的领域种子。"""
 
-    input_ports = Ports(value=int)  # 当前调用的整数触发值。
-    output_ports = Ports(value=int)  # 工厂转换后的领域种子。
+    inputs = {"value": int}  # 当前调用的整数触发值。
+    outputs = {"value": int}  # 工厂转换后的领域种子。
 
     def execute(self, inputs, context: Context) -> Output:
         """读取当前领域上下文。
@@ -80,8 +82,8 @@ class ReadSeed(Node):
 class AsyncReadSeed(Node):
     """在异步节点中使用相同的领域上下文。"""
 
-    input_ports = Ports(value=int)  # 当前调用的整数触发值。
-    output_ports = Ports(value=int)  # 工厂转换后的领域种子。
+    inputs = {"value": int}  # 当前调用的整数触发值。
+    outputs = {"value": int}  # 工厂转换后的领域种子。
 
     async def execute(self, inputs, context: Context) -> Output:
         """在协程切换后读取领域种子。
@@ -181,8 +183,8 @@ def test_context_factory_preserves_node_state_and_firing_isolation() -> None:
     class Loop(Node):
         """用回边触发同一节点的三次调用。"""
 
-        input_ports = Ports(value=int)  # 当前循环值。
-        output_ports = Ports(value=int, done=int)  # 回边值与终端值。
+        inputs = {"value": int}  # 当前循环值。
+        outputs = {"value": int, "done": int}  # 回边值与终端值。
 
         def execute(self, inputs, context):
             """验证隔离后继续循环或交付结果。
@@ -223,44 +225,32 @@ def test_context_factory_preserves_node_state_and_firing_isolation() -> None:
     assert finalized == [0, 1, 2, 0, 1, 2]
 
 
-def test_context_factory_and_hooks_share_instance_and_isolate_node_scopes() -> None:
-    """验证工厂读取 enter 前输入，Hook 与节点共享实例且不同节点状态隔离。"""
+def test_context_factory_and_middleware_share_instance_and_isolate_node_scopes() -> (
+    None
+):
+    """验证工厂读取中间件改写前的输入，中间件与节点共享实例且不同节点状态隔离。"""
 
     calls = []
 
-    class Inspect(NodeHook):
-        """记录上下文并替换实际节点输入。"""
+    def inspect(call: NodeCall, call_next: Any) -> Iterator[Output]:
+        """验证领域上下文已经创建，替换输入并检查输出仍使用同一上下文。
 
-        def enter(self, call: NodeCall) -> NodeCall:
-            """验证领域上下文已经创建。
+        Args:
+            call: 当前节点的调用信息。
+            call_next: 调用内层的函数。
 
-            Args:
-                call: 当前节点的调用信息。
+        Yields:
+            内层原输出。
+        """
 
-            Returns:
-                替换输入后的调用信息。
-            """
-
-            assert isinstance(call.context, AirContext)
-            assert call.context.state("air") == {}
-            call.context.state("air")["entered"] = True
-            calls.append(call.context)
-            return call.with_inputs({"value": 999})
-
-        def exit(self, call: NodeCall, output: Output) -> Output:
-            """验证出口仍然使用同一个上下文。
-
-            Args:
-                call: 当前节点调用信息。
-                output: 原始节点输出。
-
-            Returns:
-                原输出。
-            """
-
+        assert isinstance(call.context, AirContext)
+        assert call.context.state("air") == {}
+        call.context.state("air")["entered"] = True
+        calls.append(call.context)
+        for output in call_next(call.with_inputs({"value": 999})):
             assert call.context is calls[-1]
             assert output.value == call.context.seed
-            return output
+            yield output
 
     graph = (
         Graph(entrypoint="first", context_factory=AirContext.make)
@@ -269,7 +259,7 @@ def test_context_factory_and_hooks_share_instance_and_isolate_node_scopes() -> N
     )
     with Runtime() as runtime:
         runtime.register("air", graph)
-        runtime.attach(Inspect(), graph="air")
+        runtime.hooks.on(NODE_CALL, inspect, graph="air")
         assert runtime.run("air", 3) == (Output(203, "value"),)
     assert len(calls) == 2
     assert calls[0] is not calls[1]
@@ -284,7 +274,7 @@ def test_event_target_uses_own_factory_and_preserves_slot() -> None:
     class Publish(Node):
         """将领域种子显式发布给另一个 Graph。"""
 
-        input_ports = Ports(value=int)  # 当前种子。
+        inputs = {"value": int}  # 当前种子。
 
         def execute(self, inputs, context):
             """保存源上下文并提交后续种子。
@@ -302,7 +292,7 @@ def test_event_target_uses_own_factory_and_preserves_slot() -> None:
     class Collect(Node):
         """检查目标图使用自己的工厂。"""
 
-        input_ports = Ports(value=int)  # 源图发布的种子。
+        inputs = {"value": int}  # 源图发布的种子。
 
         def execute(self, inputs, context):
             """记录目标上下文并检查隔离。

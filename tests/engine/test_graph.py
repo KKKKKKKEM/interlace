@@ -5,43 +5,33 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Mapping
 from dataclasses import replace
-from threading import Event as ThreadEvent, Thread
+from threading import Event as ThreadEvent
+from threading import Thread
 from typing import Any, cast
 
 import pytest
 
-from interlace import (
-    Context,
-    Edge,
-    ExecutionPlan,
-    Graph,
-    InputPolicy,
-    Node,
-    Output,
-    Ports,
-    Runtime,
-)
+from interlace import Context, Graph, Node, Output, Runtime
+from interlace.engine import Edge, ExecutionPlan, InputPolicy
 from interlace.engine.errors import (
     GraphError,
     GraphFrozenError,
     GraphValidationError,
     InvalidOutputError,
 )
-from interlace.engine.policies import PolicyRegistry
 
 
 class Source(Node):
     """产生一个字符串的零输入节点。
 
     Attributes:
-        input_ports: 节点声明的输入端口及其类型。
-        output_ports: 节点声明的输出端口及其类型。
+        inputs: 节点声明的输入端口及其类型。
+        outputs: 节点声明的输出端口及其类型。
         input_policy: 仅依据端口和 token 数量生效的输入策略。
     """
 
-    input_ports = Ports()
-    output_ports = Ports(value=str)
-    input_policy = InputPolicy.ON_START
+    inputs = {}
+    outputs = {"value": str}
 
     def execute(self, inputs: Mapping[str, object], context: Context) -> Output:
         """产生固定字符串。
@@ -62,12 +52,12 @@ class Sink(Node):
     """接收一个 object 的终端节点。
 
     Attributes:
-        input_ports: 节点声明的输入端口及其类型。
-        output_ports: 节点声明的输出端口及其类型。
+        inputs: 节点声明的输入端口及其类型。
+        outputs: 节点声明的输出端口及其类型。
     """
 
-    input_ports = Ports(value=object)
-    output_ports = Ports()
+    inputs = {"value": object}
+    outputs = {}
 
     def execute(self, inputs, context: Context) -> None:
         """消费输入。
@@ -103,12 +93,12 @@ def test_graph_rejects_all_node_without_every_required_incoming_port() -> None:
         """当前契约测试使用的 Join 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(left=str, right=str)
-        output_ports = Ports()
+        inputs = {"left": str, "right": str}
+        outputs = {}
 
         def execute(self, inputs, context: Context) -> None:
             """汇聚节点，仅用于结构校验，不产生输出。"""
@@ -321,12 +311,12 @@ def test_graph_accepts_cycle() -> None:
         """当前契约测试使用的 Relay 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(value=str)
-        output_ports = Ports(value=str)
+        inputs = {"value": str}
+        outputs = {"value": str}
 
         def execute(self, inputs, context: Context) -> Output:
             """把 value 输入原样转发。"""
@@ -359,19 +349,19 @@ def test_graph_rejects_incompatible_ports() -> None:
         """当前契约测试使用的 Wide 替代实现。
 
         Attributes:
-            output_ports: 节点声明的输出端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        output_ports = Ports(value=object)
+        outputs = {"value": object}
 
     class Narrow(Sink):
         """当前契约测试使用的 Narrow 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
         """
 
-        input_ports = Ports(value=str)
+        inputs = {"value": str}
 
     graph = Graph.compose(
         nodes={"source": Wide(), "sink": Narrow()},
@@ -625,14 +615,14 @@ def test_execution_plan_uses_identity_equality() -> None:
     assert len({first, second}) == 2
 
 
-def test_plan_rejects_policies_for_frozen_graph() -> None:
-    """已冻结 Graph 保留冻结时的策略绑定，plan 不能静默忽略新的策略注册表。"""
+def test_plan_rejects_selectors_for_frozen_graph() -> None:
+    """已冻结 Graph 保留冻结时的策略绑定，plan 不能静默忽略新的 selector 快照。"""
 
     graph = Graph(entrypoint="source").add(source=Source())
-    graph.plan(include={"source"}, policies=PolicyRegistry())
+    graph.plan(include={"source"}, selectors={})
 
     with pytest.raises(ValueError, match="already frozen"):
-        graph.plan(include={"source"}, policies=PolicyRegistry())
+        graph.plan(include={"source"}, selectors={})
     assert graph.plan(include={"source"}).nodes == frozenset({"source"})
 
 
@@ -666,11 +656,11 @@ def test_execution_plan_rejects_disconnected_selection() -> None:
         """当前契约测试使用的 Relay 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
             input_policy: 仅依据端口和 token 数量生效的输入策略。
         """
 
-        input_ports = Ports(value=str)
+        inputs = {"value": str}
         input_policy = InputPolicy.ALL
 
         def execute(self, inputs, context: Context) -> Output:
@@ -704,12 +694,12 @@ def test_execution_plan_requires_all_join_inputs() -> None:
         """将同一输入分发到两条计算分支的示例节点。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(value=int)
-        output_ports = Ports(left=int, right=int)
+        inputs = {"value": int}
+        outputs = {"left": int, "right": int}
 
         def execute(self, inputs, context: Context):
             """把同一值同时发往 left 与 right 端口。"""
@@ -724,12 +714,12 @@ def test_execution_plan_requires_all_join_inputs() -> None:
         """当前契约测试使用的 Relay 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(value=int)
-        output_ports = Ports(value=int)
+        inputs = {"value": int}
+        outputs = {"value": int}
 
         def execute(self, inputs, context: Context) -> Output:
             """把 value 输入原样转发。"""
@@ -741,13 +731,13 @@ def test_execution_plan_requires_all_join_inputs() -> None:
         """当前契约测试使用的 Join 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
             input_policy: 仅依据端口和 token 数量生效的输入策略。
         """
 
-        input_ports = Ports(left=int, right=int)
-        output_ports = Ports(total=int)
+        inputs = {"left": int, "right": int}
+        outputs = {"total": int}
         input_policy = InputPolicy.ALL
 
         def execute(self, inputs, context: Context) -> Output:
@@ -781,11 +771,11 @@ def test_input_policy_any_uses_declaration_order() -> None:
         """当前契约测试使用的 Select 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
             input_policy: 仅依据端口和 token 数量生效的输入策略。
         """
 
-        input_ports = Ports(left=int, right=int, cancel=int)
+        inputs = {"left": int, "right": int, "cancel": int}
         input_policy = InputPolicy.ANY
 
         def execute(self, inputs, context):
@@ -800,11 +790,19 @@ def test_input_policy_any_uses_declaration_order() -> None:
 
 
 def test_ports_accept_self_as_port_name() -> None:
-    """Ports 构造器的 self 是仅限位置参数，self 可以作为普通端口名称。"""
+    """端口声明中的 self 是普通端口名称，冻结快照照常保留。"""
 
-    ports = Ports(self=int, other=str)
+    class SelfPort(Node):
+        """以 self 命名输入端口的节点。"""
 
-    assert dict(ports) == {"self": int, "other": str}
+        inputs = {"self": int, "other": str}
+
+        def execute(self, inputs: Any, context: Any) -> None:
+            """不产生输出。"""
+
+    graph = Graph(entrypoint="node").add(node=SelfPort()).freeze()
+
+    assert dict(graph.spec_for("node").input_ports) == {"self": int, "other": str}
 
 
 def test_concurrent_add_cannot_enter_graph_during_freeze() -> None:
@@ -817,12 +815,12 @@ def test_concurrent_add_cannot_enter_graph_during_freeze() -> None:
         """读取输出端口时暂停冻结校验的零输入节点。"""
 
         @property  # type: ignore[override]
-        def output_ports(self) -> Ports:
+        def outputs(self) -> Mapping[str, type[Any]]:
             """通知测试冻结已开始，并等待测试放行。"""
 
             entered.set()
             assert release.wait(5)
-            return Ports(value=str)
+            return {"value": str}
 
     graph = Graph(entrypoint="source").add(source=SlowSource())
     errors: list[BaseException] = []

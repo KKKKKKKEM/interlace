@@ -13,7 +13,6 @@ from ..engine.events import Event
 from ..engine.options import snapshot_options
 from ..engine.execution import Execution, ExecutionLimits
 from ..engine.graph import ExecutionPlan, Graph
-from ..engine.hooks import HookHandle, HookPhase, NodeHook
 from ..engine.slots import Slot, SlotLease, SlotProvider
 
 EventHandler = Callable[[Event], None]
@@ -303,12 +302,15 @@ class TaskBackend(TaskPublisher, TaskConsumer, Protocol):
     """同时实现发布与消费的组合协议。"""
 
 
-Emit = Callable[[Event], None]
+Emit = Callable[[Event], object]  # 发布跨图事件的回调；返回值被忽略。
 
 
 @runtime_checkable
 class GraphExecutor(Protocol):
-    """执行单张冻结 Graph 的替换协议，不管理队列、Graph 注册表或 Execution 终态。"""
+    """执行单张冻结 Graph 的替换协议，不管理队列、Graph 注册表或 Execution 终态。
+
+    需要节点中间件、采集或生命周期通知的实现，在构造时从插件扩展接口取得 Runtime 的钩子总线。
+    """
 
     def execute(
         self,
@@ -340,32 +342,6 @@ class GraphExecutor(Protocol):
 
     def close(self) -> None:
         """关闭执行器持有的资源。"""
-
-
-@runtime_checkable
-class HookableGraphExecutor(GraphExecutor, Protocol):
-    """额外支持动态 Node Hook 的 GraphExecutor 可选能力。"""
-
-    def attach(
-        self,
-        hook: NodeHook | Callable[..., object],
-        *,
-        phase: HookPhase | str | None = None,
-        graph: str | None = None,
-        node: str | None = None,
-    ) -> HookHandle:
-        """挂载 Hook，并返回可用于卸载的句柄。
-
-        Args:
-            hook: 节点 Hook 对象或单阶段回调。
-            phase: 函数 Hook 对应的执行阶段；NodeHook 对象必须为 None。
-            graph: 限定生效的 Graph 注册名称，None 表示全部 Graph。
-            node: 限定生效的 Graph 内节点 ID，需要同时指定 graph。
-
-        Returns:
-            可独立卸载本次挂载的句柄。
-        """
-        ...
 
 
 class ExecutionFactory(Protocol):

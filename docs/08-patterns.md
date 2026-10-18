@@ -57,7 +57,7 @@ with Runtime() as runtime:
 
 ## 2. 分支与汇聚
 
-[`examples/fan_in.py`](../examples/fan_in.py) 中 `Split` 一次产生 `left` 与 `right` 两项 Output；`Add` 使用
+[`examples/fan_in.py`](../examples/fan_in.py) 中 `Split` 一次产生 `left` 与 `right` 两项 Output；`Add` 使用默认的
 `InputPolicy.ALL`，只有两个输入各到达一个值后才执行。
 
 ```python
@@ -88,7 +88,7 @@ join = KeyedJoin(max_pending=10_000)
 `KeyedJoin` 使用内建 `interlace.core/longest` 输入策略：每次 firing 消费一个值，优先取积压较多的一侧，
 平局按声明顺序。交错到达的左右输入因此及时配对，`max_pending` 反映真实的未配对积压，而不会因先排空一侧被提前触发。
 
-`InputPolicy.ANY` 适合“任一输入到达即可处理”的消费者；它按 Ports 声明顺序从第一个就绪端口取一个值，因此
+`InputPolicy.ANY` 适合“任一输入到达即可处理”的消费者；它按端口声明顺序从第一个就绪端口取一个值，因此
 Node 必须能根据实际存在的 key 区分输入来源。
 
 ## 3. 循环
@@ -131,12 +131,12 @@ runtime.wait_idle()
 ## 5. 异步 Node
 
 [`examples/async_node.py`](../examples/async_node.py) 展示同一个 `Node` 基类的异步用法：需要等待 I/O 时，将
-`execute()` 写成 `async def`，Ports、Output、Edge 和 InputPolicy 的使用方式不变：
+`execute()` 写成 `async def`，端口声明、Output、Edge 和 InputPolicy 的使用方式不变：
 
 ```python
 class DelayedUpper(Node):
-    input_ports = Ports(text=str)
-    output_ports = Ports(result=str)
+    inputs = {"text": str}
+    outputs = {"result": str}
 
     async def execute(self, inputs, context):
         await asyncio.sleep(0.01)

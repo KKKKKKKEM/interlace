@@ -1,10 +1,10 @@
-"""受控 contribution 和官方可复用 Node 的契约测试。"""
+"""具名 selector 提供、生命周期观察和官方可复用 Node 的契约测试。"""
 
 from __future__ import annotations
 
 import pytest
 
-from interlace import Graph, Node, Output, Ports, Runtime
+from interlace import Graph, Node, Output, Runtime
 from interlace.adapters import memory
 from interlace.engine.errors import (
     ExecutionError,
@@ -13,8 +13,10 @@ from interlace.engine.errors import (
     PolicySelectionError,
 )
 from interlace.engine.observation import RuntimeEventKind
-from interlace.engine.policies import PolicyRef, PolicyRegistry
+from interlace.engine import InputPolicy
+from interlace.engine.policies import bind_policy
 from interlace.nodes import KeyedJoin, KeyedJoinOverflowError, KeyedPair, KeyedValue
+from interlace.plugins.points import RUNTIME_EVENT
 from interlace.spi import (
     DeliveryResult,
     Work,
@@ -25,12 +27,12 @@ class Source(Node):
     """当前契约测试使用的 Source 替代实现。
 
     Attributes:
-        input_ports: 节点声明的输入端口及其类型。
-        output_ports: 节点声明的输出端口及其类型。
+        inputs: 节点声明的输入端口及其类型。
+        outputs: 节点声明的输出端口及其类型。
     """
 
-    input_ports = Ports(value=int)
-    output_ports = Ports(value=int)
+    inputs = {"value": int}
+    outputs = {"value": int}
 
     def execute(self, inputs, context):
         """把 value 输入原样输出到 value 端口。"""
@@ -58,7 +60,7 @@ def test_runtime_observer_sees_read_only_lifecycle_and_cannot_break_work(
 
     graph = Graph(entrypoint="source").add(source=Source())
     with Runtime() as runtime:
-        handle = runtime.observe_runtime(observe)
+        handle = runtime.hooks.on(RUNTIME_EVENT, observe)
         runtime.register("observed.graph", graph)
         assert runtime.run("observed.graph", 3) == (Output(3, "value"),)
         handle.detach()
@@ -71,7 +73,8 @@ def test_runtime_observer_sees_read_only_lifecycle_and_cannot_break_work(
         RuntimeEventKind.EXECUTION_FINISHED,
     ]
     assert events[-1].attributes["steps"] == 1
-    assert "runtime observer failed" in caplog.text
+    logged = [record.exc_info[1] for record in caplog.records if record.exc_info]
+    assert logged and all(str(error) == "telemetry failed" for error in logged)
     with pytest.raises(TypeError):
         events[-1].attributes["steps"] = 2
 
@@ -98,14 +101,14 @@ class ContributedNode(Node):
     """当前契约测试使用的 ContributedNode 替代实现。
 
     Attributes:
-        input_ports: 节点声明的输入端口及其类型。
-        output_ports: 节点声明的输出端口及其类型。
+        inputs: 节点声明的输入端口及其类型。
+        outputs: 节点声明的输出端口及其类型。
         input_policy: 仅依据端口和 token 数量生效的输入策略。
     """
 
-    input_ports = Ports(a=int, b=int, c=int)
-    output_ports = Ports(total=int)
-    input_policy = PolicyRef("example.test/any-two", {"count": 2})
+    inputs = {"a": int, "b": int, "c": int}
+    outputs = {"total": int}
+    input_policy = InputPolicy("example.test/any-two", {"count": 2})
 
     def execute(self, inputs, context):
         """输出全部输入值之和。"""
@@ -118,12 +121,12 @@ class FanOut(Node):
     """当前契约测试使用的 FanOut 替代实现。
 
     Attributes:
-        input_ports: 节点声明的输入端口及其类型。
-        output_ports: 节点声明的输出端口及其类型。
+        inputs: 节点声明的输入端口及其类型。
+        outputs: 节点声明的输出端口及其类型。
     """
 
-    input_ports = Ports(value=int)
-    output_ports = Ports(a=int, b=int)
+    inputs = {"value": int}
+    outputs = {"a": int, "b": int}
 
     def execute(self, inputs, context):
         """把输入值发往 a 端口，把加一后的值发往 b 端口。"""
@@ -133,7 +136,7 @@ class FanOut(Node):
 
 
 def test_contributed_policy_is_bound_when_graph_freezes() -> None:
-    """验证 Graph 冻结时固定贡献策略的实现快照。"""
+    """验证 Graph 冻结时按名称固定已提供 selector 的实现快照。"""
 
     graph = (
         Graph(entrypoint="source")
@@ -142,7 +145,7 @@ def test_contributed_policy_is_bound_when_graph_freezes() -> None:
         .connect("source", "join", source_port="b", target_port="b")
     )
     with Runtime() as runtime:
-        runtime.register_policy("example.test/any-two", AnyTwo())
+        runtime.hooks.provide("example.test/any-two", AnyTwo())
         runtime.register("policy.graph", graph)
         assert runtime.run("policy.graph", 2) == (Output(5, "total"),)
 
@@ -151,7 +154,7 @@ def test_policy_config_is_deeply_frozen_before_graph_registration() -> None:
     """调用方与 selector 都不能改写冻结策略的嵌套配置。"""
 
     original = {"ports": ["a", "b"], "limits": {"count": 2}}
-    policy = PolicyRef("example.test/frozen", original)
+    policy = InputPolicy("example.test/frozen", original)
     original["ports"].append("c")
     original["limits"]["count"] = 3
 
@@ -167,7 +170,7 @@ def test_missing_contributed_policy_fails_at_registration() -> None:
     graph = Graph(entrypoint="join").add(join=ContributedNode())
     with (
         Runtime() as runtime,
-        pytest.raises(GraphValidationError, match="not registered"),
+        pytest.raises(GraphValidationError, match="not provided"),
     ):
         runtime.register("missing.graph", graph)
 
@@ -247,12 +250,12 @@ class PairSource(Node):
     """当前契约测试使用的 PairSource 替代实现。
 
     Attributes:
-        input_ports: 节点声明的输入端口及其类型。
-        output_ports: 节点声明的输出端口及其类型。
+        inputs: 节点声明的输入端口及其类型。
+        outputs: 节点声明的输出端口及其类型。
     """
 
-    input_ports = Ports(items=tuple)
-    output_ports = Ports(left=KeyedValue, right=KeyedValue)
+    inputs = {"items": tuple}
+    outputs = {"left": KeyedValue, "right": KeyedValue}
 
     def execute(self, inputs, context):
         """按 (端口, 值) 对把 items 中的每个值发往对应端口。"""
@@ -349,13 +352,13 @@ def test_keyed_join_pairs_interleaved_batch_within_pending_limit() -> None:
 
 
 def test_policy_ref_compares_by_value_and_is_explicitly_unhashable() -> None:
-    """PolicyRef 按名称与冻结配置比较；只读配置不能稳定哈希，因此显式不可哈希。"""
+    """InputPolicy 按名称与冻结配置比较；只读配置不能稳定哈希，因此显式不可哈希。"""
 
-    first = PolicyRef("example.test/any-two", {"count": 2})
+    first = InputPolicy("example.test/any-two", {"count": 2})
 
-    assert first == PolicyRef("example.test/any-two", {"count": 2})
-    assert first != PolicyRef("example.test/any-two", {"count": 3})
-    assert PolicyRef.__hash__ is None
+    assert first == InputPolicy("example.test/any-two", {"count": 2})
+    assert first != InputPolicy("example.test/any-two", {"count": 3})
+    assert InputPolicy.__hash__ is None
     with pytest.raises(TypeError, match="unhashable"):
         hash(first)
 
@@ -373,9 +376,9 @@ class SelectsEmptyPort:
 def test_bound_policy_rejects_selector_contract_violation() -> None:
     """BoundPolicy 把非法选择报告为 PolicySelectionError，graph 与 node 留给执行器补齐。"""
 
-    policies = PolicyRegistry()
-    policies.register("example.test/bad", SelectsEmptyPort())
-    bound = policies.bind(PolicyRef("example.test/bad"))
+    bound = bind_policy(
+        InputPolicy("example.test/bad"), {"example.test/bad": SelectsEmptyPort()}
+    )
 
     with pytest.raises(PolicySelectionError, match="invalid selection") as caught:
         bound.select(("a", "b", "c"), {"a": [1], "b": [], "c": []})
@@ -388,7 +391,7 @@ def test_selector_violation_fails_execution_with_policy_selection_error() -> Non
     class BadPolicyNode(ContributedNode):
         """使用违约 selector 的贡献策略节点。"""
 
-        input_policy = PolicyRef("example.test/bad")
+        input_policy = InputPolicy("example.test/bad")
 
     graph = (
         Graph(entrypoint="source")
@@ -397,7 +400,7 @@ def test_selector_violation_fails_execution_with_policy_selection_error() -> Non
         .connect("source", "join", source_port="b", target_port="b")
     )
     with Runtime() as runtime:
-        runtime.register_policy("example.test/bad", SelectsEmptyPort())
+        runtime.hooks.provide("example.test/bad", SelectsEmptyPort())
         runtime.register("bad.policy", graph)
         with pytest.raises(PolicySelectionError) as caught:
             runtime.run("bad.policy", 1)

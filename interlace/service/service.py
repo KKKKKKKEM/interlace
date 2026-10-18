@@ -15,10 +15,12 @@ from typing import Any
 from pydantic import TypeAdapter
 from pydantic_core import to_jsonable_python
 
-from interlace import Execution, Runtime
+from interlace import Graph, Runtime
+from interlace.engine import Execution
 from interlace.engine.errors import InterlaceRuntimeError
-from interlace.engine.observation import (
-    CompositeObserverHandle,
+from interlace.plugins import Registration
+from interlace.plugins.points import (
+    RUNTIME_EVENT,
     RuntimeEvent,
     RuntimeEventKind,
 )
@@ -129,7 +131,7 @@ class GraphService:
         _publications: 注册名到发布版本索引项，在启动恢复和发布时维护。
         _descriptions: 注册名到图结构描述的缓存；注册名在 Runtime 生命周期内不变。
         _diagnostics: 节点参数与日志采集器，关闭采集时为 None。
-        _observer: 服务持有的只读观察注册，安装前为 None。
+        _observer: 服务持有的 RUNTIME_EVENT 登记，安装前为 None。
         _adapters: 端口类型到 TypeAdapter 的缓存，避免每次请求重建校验器。
         _archive_queue: 等待终态后归档输出的执行，None 通知归档线程退出。
         _archiver: 在 Worker 线程之外等待执行终止并归档输出的线程。
@@ -191,7 +193,7 @@ class GraphService:
         self._descriptions: dict[str, dict[str, Any]] = {}
         self._adapters: dict[Any, TypeAdapter[Any]] = {}
         self._diagnostics: NodeDiagnostics | None = None
-        self._observer: CompositeObserverHandle | None = None
+        self._observer: Registration | None = None
         self._archive_queue: SimpleQueue[Execution | None] = SimpleQueue()
         self._archiver = Thread(
             target=self._archive_loop, name="interlace-service-archive", daemon=True
@@ -209,7 +211,7 @@ class GraphService:
                         _Publication.of(
                             item["name"], item["version"], item["definition"]
                         ),
-                        self.nodes.compile(definition),
+                        self._compile(definition),
                     )
                 )
             if any(name in registered for name, _, _ in restored):
@@ -221,7 +223,7 @@ class GraphService:
             self._archiver.start()
             if diagnostics:
                 self._diagnostics = NodeDiagnostics(runtime, self.store)
-            self._observer = runtime.observe_runtime(self._observe)
+            self._observer = runtime.hooks.on(RUNTIME_EVENT, self._observe)
             for name, publication, graph in restored:
                 self._publications[name] = publication
                 runtime.register(name, graph)
@@ -256,7 +258,7 @@ class GraphService:
             GraphError: 图未通过冻结校验。
         """
 
-        return describe_graph(definition.name, self.nodes.compile(definition))
+        return describe_graph(definition.name, self._compile(definition))
 
     def node_types(self) -> list[dict[str, Any]]:
         """读取编辑器可用的节点类型及配置表单 Schema。
@@ -283,12 +285,8 @@ class GraphService:
 
         created = self.nodes.create(node.type, node.config)
         return {
-            "inputs": {
-                key: value.__name__ for key, value in created.input_ports.items()
-            },
-            "outputs": {
-                key: value.__name__ for key, value in created.output_ports.items()
-            },
+            "inputs": {key: value.__name__ for key, value in created.inputs.items()},
+            "outputs": {key: value.__name__ for key, value in created.outputs.items()},
         }
 
     def projects(self) -> list[dict[str, Any]]:
@@ -578,7 +576,7 @@ class GraphService:
             ConflictError: 修订号已过期、标识属于其他项目或已被其他定义占用。
         """
 
-        graph = self.nodes.compile(request.definition)
+        graph = self._compile(request.definition)
         name = request.definition.name
         body = request.definition.model_dump()
         self._adopt_code_graphs()
@@ -807,6 +805,11 @@ class GraphService:
         """
 
         return self.store.outputs(execution_id, offset)
+
+    def _compile(self, definition: GraphDefinition) -> Graph:
+        """以 Runtime 当前提供的具名值作为输入 selector 编译并冻结图文档。"""
+
+        return self.nodes.compile(definition, selectors=self.runtime.hooks.provided())
 
     def _observe(self, event: RuntimeEvent) -> None:
         """保存执行相关的生命周期事实；EXECUTION_FINISHED 的终态取自事件本身。

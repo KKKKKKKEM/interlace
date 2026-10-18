@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from threading import TIMEOUT_MAX, RLock
 from types import TracebackType
-from typing import Any, NoReturn
+from typing import Any, ClassVar, NoReturn
 from uuid import uuid4
 
 from .._validation import require_non_empty_string, validate_timeout
@@ -238,6 +238,7 @@ class Execution:
     状态读写受内部锁保护，可跨线程调用。完整输出保存在 OutputStore 中，可多次重放。
 
     Attributes:
+        Status: 生命周期状态枚举，例如 ``Execution.Status.SUCCEEDED``。
         id: execution 标识，缺省为随机 UUID 字符串。
         graph: 目标 Graph 的注册名称。
         limits: 本次执行的步数与总时长限制。
@@ -263,6 +264,8 @@ class Execution:
         _stream_cursors: 活跃输出流编号到下次读取索引的映射，参与背压计算。
         _unbounded: 宿主关闭时置为 True，此后发布不再等待订阅读取，输出全部留在存储中；只置位不复位。
     """
+
+    Status: ClassVar[type[ExecutionStatus]] = ExecutionStatus
 
     def __init__(
         self,
@@ -862,7 +865,7 @@ class Execution:
             except asyncio.TimeoutError:
                 self.checkpoint()
 
-    def _release_backpressure(self) -> None:
+    def release_backpressure(self) -> None:
         """供执行宿主关闭时调用：解除订阅背压，让阻塞的发布方继续并把剩余输出全部留在存储中。
 
         订阅仍可从原游标完整读取；该操作不可撤销，对已结束的执行没有作用。

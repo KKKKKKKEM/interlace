@@ -5,17 +5,18 @@
 | 范围 | 使用的对象 | 用途 |
 | --- | --- | --- |
 | 单张 Graph | `Output`、`Edge` | 把一个 Node 的值交给下游 Node |
-| 单次执行 | `Execution`、`ExecutionLimits` | 查询状态、控制步数/时长并协作式取消 |
+| 单次执行 | `Execution` | 查询状态、控制步数/时长/队列上限并协作式取消 |
 
-## Ports 与 Node
+## 端口与 Node
 
-`Ports` 是一个不可变的端口名到 Python class 的映射。端口类型必须是普通 Python class；连接时，源类型必须
-是目标类型的子类。例如 `str` 可以连接到 `object` 输入，反过来不行。
+Node 以普通字典声明端口：`inputs` 与 `outputs` 是端口名到 Python class 的映射，默认各有一个 `default` 端口。
+端口类型必须是普通 Python class；连接时，源类型必须是目标类型的子类。例如 `str` 可以连接到 `object` 输入，
+反过来不行。Graph 冻结时把声明复制为不可变快照（`graph.spec_for(node_id).input_ports`），冻结后再修改字典不影响该 Graph。
 
 ```python
 class Parse(Node):
-    input_ports = Ports(raw=str)
-    output_ports = Ports(length=int)
+    inputs = {"raw": str}
+    outputs = {"length": int}
     timeout = 5
 
     def execute(self, inputs, context):
@@ -34,7 +35,7 @@ Mapping。执行结果只能是：
 异步生成器和 `AsyncIterable[Output]` 不属于返回契约。批量结果用普通 iterable 表达，也可以先等待异步操作完成，
 再返回该 iterable。
 
-输出的端口必须声明在 `output_ports` 中，值也必须满足声明类型。未连接到 Edge 的合法输出会成为本次
+输出的端口必须声明在 `outputs` 中，值也必须满足声明类型。未连接到 Edge 的合法输出会成为本次
 `Runtime.run()` 的终端输出。
 
 Iterable 由 Engine 逐项推进；terminal Output 可在生成器结束前交付，输出背压会暂停继续推进。生成器的迭代、
@@ -49,7 +50,8 @@ Iterable 由 Engine 逐项推进；terminal Output 可在生成器结束前交�
 Graph 在构建阶段可变，`freeze()` 后成为可执行的静态定义：
 
 ```python
-from interlace import Edge, Graph
+from interlace import Graph
+from interlace.engine import Edge
 
 graph = Graph.compose(
     nodes={"parse": Parse(), "store": Store()},
@@ -112,8 +114,8 @@ Output 决定循环是否继续：
 
 ```python
 class Counter(Node):
-    input_ports = Ports(value=int)
-    output_ports = Ports(again=int, done=int)
+    inputs = {"value": int}
+    outputs = {"again": int, "done": int}
 
     def execute(self, inputs, context):
         value = inputs["value"]
@@ -152,11 +154,11 @@ full = graph.plan(include={"load", "parse", "enrich", "save"})
 runtime.run("document.graph", payload, plan=fast)
 ```
 
-`plan()` 会在需要时先冻结 Graph：尚未冻结时使用 `policies=` 提供的策略注册表（缺省只含内建策略）。已冻结的 Graph
-保留冻结时绑定的策略快照，此时再传 `policies=` 会抛出 `ValueError`，不会静默忽略。
+`plan()` 会在需要时先冻结 Graph：尚未冻结时使用 `selectors=` 提供的具名 selector 映射（缺省只含内建策略）。已冻结的
+Graph 保留冻结时绑定的策略快照，此时再传 `selectors=` 会抛出 `ValueError`，不会静默忽略。
 缺省保留所选节点间的原有 Edge，也可通过 `edges=` 显式选择原图连接。
 连接始终按原图顺序保存，不会跨过未选节点自动补边，也不允许新增或改写连接。
-`entrypoint=` 可指定所选节点中的任意入口，省略时使用原图入口；本次输入按该入口的 Ports 校验。
+`entrypoint=` 可指定所选节点中的任意入口，省略时使用原图入口；本次输入按该入口的端口声明校验。
 入口不在计划内、所选 Node 从该入口不可达，或其他 `ALL` Node 缺少输入端口时，创建计划会立即失败。
 静态连通不保证条件分支一定产生全部输入。计划绑定创建它的 Graph 实例，
 创建后不可变，可以安全复用，也可以在并发 execution 中使用不同计划。没有传 `plan` 时仍执行完整 Graph。
@@ -189,20 +191,23 @@ runtime.run("document.graph", document, plan=parse_only)
 
 ## 输入触发策略
 
-每个 Node 固定使用一种 `InputPolicy`：
+`inputs = {}` 的 Node 是源节点：作为入口时在 Graph 执行开始时触发一次，本次 `inputs` 为空 Mapping，不需要也不读取
+输入策略。其他 Node 固定使用一种 `InputPolicy`：
 
 | 策略 | 何时执行 | 本次 `inputs` |
 | --- | --- | --- |
-| `ALL`（默认） | 每个声明端口各有一个值 | 包含所有端口 |
-| `ANY` | 按端口声明顺序找到第一个有值的端口 | 只包含被消费的一个端口 |
-| `ON_START` | Graph 执行开始时 | 空 Mapping |
+| `InputPolicy.ALL`（默认） | 每个声明端口各有一个值 | 包含所有端口 |
+| `InputPolicy.ANY` | 按端口声明顺序找到第一个有值的端口 | 只包含被消费的一个端口 |
+| `InputPolicy.LONGEST` | 可用值最多的端口，相同时按声明顺序 | 只包含被消费的一个端口 |
+| `InputPolicy("ns/name", config)` | 由同名的已提供 selector 决定 | 只包含 selector 选中的端口 |
 
-`ON_START` 只能用于零输入入口 Node。执行器为每个端口维护 FIFO 队列，并用 FIFO 就绪队列调度 Node；每次
-调度只消费一组输入，再把仍然就绪的 Node 放到队尾，因此持续循环不会独占其他已就绪分支。如果 Graph 静止后
-还剩无法组合的值，例如 `ALL` Node 只收到一半输入，会抛出 `IncompleteInputsError`。
+`InputPolicy` 从 `interlace.engine` 导入，按名称与只读配置比较。执行器为每个端口维护 FIFO 队列，并用 FIFO 就绪
+队列调度 Node；每次调度只消费一组输入，再把仍然就绪的 Node 放到队尾，因此持续循环不会独占其他已就绪分支。
+如果 Graph 静止后还剩无法组合的值，例如 `ALL` Node 只收到一半输入，会抛出 `IncompleteInputsError`。
 
-三种固定策略对应内建 selector `interlace.core/all`、`interlace.core/any` 与 `interlace.core/on-start`。
-通过插件贡献的 selector 返回非元组、空元组、重复端口、未声明端口或空端口，或在选择时抛出异常，execution 都以
-`PolicySelectionError` 失败；该错误属于 `ExecutionError`，带有 graph 与 node，原异常保留为 `__cause__`。
+三种内建策略对应 selector `interlace.core/all`、`interlace.core/any` 与 `interlace.core/longest`，自定义 selector
+的提供方式见[输入选择器](07-plugins.md#输入选择器)。selector 返回非元组、空元组、重复端口、未声明端口或空端口，
+或在选择时抛出异常，execution 都以 `PolicySelectionError` 失败；该错误属于 `ExecutionError`，带有 graph 与 node，
+原异常保留为 `__cause__`。
 
 [上一章：第一张 Graph](02-first-graph.md) · [下一章：Event 与跨图工作流](04-events-and-workflows.md)

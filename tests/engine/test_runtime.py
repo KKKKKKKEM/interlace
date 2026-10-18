@@ -10,19 +10,8 @@ from typing import Any, cast
 
 import pytest
 
-from interlace import (
-    Context,
-    Event,
-    ExecutionStatus,
-    Graph,
-    InputPolicy,
-    Node,
-    Output,
-    Ports,
-    Runtime,
-    Slot,
-    SlotPool,
-)
+from interlace import Context, Event, Graph, Node, Output, Runtime
+from interlace.engine import Execution, InputPolicy, Slot, SlotPool
 from interlace.adapters import memory
 from interlace.engine.errors import (
     IncompleteInputsError,
@@ -31,7 +20,14 @@ from interlace.engine.errors import (
     PortValueTypeError,
 )
 from interlace.engine.observation import RuntimeEvent, RuntimeEventKind
-from interlace.runtime import EventRouter, GraphWorker, LocalRuntimePlugin
+from interlace.plugins import HookBus
+from interlace.plugins.points import RUNTIME_EVENT
+from interlace.runtime import (
+    EventRouter,
+    GraphWorker,
+    LocalInfrastructurePlugin,
+    LocalRuntimePlugin,
+)
 from interlace.spi import Work
 
 
@@ -39,12 +35,12 @@ class Split(Node):
     """产生 join 所需的两个图内端口。
 
     Attributes:
-        input_ports: 节点声明的输入端口及其类型。
-        output_ports: 节点声明的输出端口及其类型。
+        inputs: 节点声明的输入端口及其类型。
+        outputs: 节点声明的输出端口及其类型。
     """
 
-    input_ports = Ports(value=int)
-    output_ports = Ports(left=int, right=int)
+    inputs = {"value": int}
+    outputs = {"left": int, "right": int}
 
     def execute(self, inputs, context: Context) -> Output | tuple[Output, ...]:
         """把整数复制到两个端口。
@@ -66,13 +62,13 @@ class Join(Node):
     """等待两个输入端口后求和。
 
     Attributes:
-        input_ports: 节点声明的输入端口及其类型。
-        output_ports: 节点声明的输出端口及其类型。
+        inputs: 节点声明的输入端口及其类型。
+        outputs: 节点声明的输出端口及其类型。
         input_policy: 仅依据端口和 token 数量生效的输入策略。
     """
 
-    input_ports = Ports(left=int, right=int)
-    output_ports = Ports(total=int)
+    inputs = {"left": int, "right": int}
+    outputs = {"total": int}
     input_policy = InputPolicy.ALL
 
     def execute(self, inputs, context: Context) -> Output:
@@ -147,12 +143,12 @@ def test_runtime_executes_self_loop_until_node_stops_emitting_feedback() -> None
         """通过回边递增计数并在达到边界时结束的示例节点。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(value=int)
-        output_ports = Ports(again=int, done=int)
+        inputs = {"value": int}
+        outputs = {"again": int, "done": int}
 
         def execute(self, inputs, context: Context) -> Output:
             """记录访问值，未到 4 时加一回到 again，否则输出到 done。"""
@@ -185,12 +181,12 @@ def test_runtime_does_not_impose_cycle_step_limit() -> None:
         """通过回边递增计数并在达到边界时结束的示例节点。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(value=int)
-        output_ports = Ports(again=int, done=int)
+        inputs = {"value": int}
+        outputs = {"again": int, "done": int}
 
         def execute(self, inputs, context: Context) -> Output:
             """未到 10000 时加一回到 again，否则输出到 done。"""
@@ -223,12 +219,12 @@ def test_runtime_executes_cycle_across_multiple_nodes() -> None:
         """当前契约测试使用的 Check 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(value=int)
-        output_ports = Ports(continue_=int, done=int)
+        inputs = {"value": int}
+        outputs = {"continue_": int, "done": int}
 
         def execute(self, inputs, context: Context) -> Output:
             """记录检查值，小于 3 时进入 continue_，否则输出到 done。"""
@@ -244,12 +240,12 @@ def test_runtime_executes_cycle_across_multiple_nodes() -> None:
         """当前契约测试使用的 Increment 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(value=int)
-        output_ports = Ports(value=int)
+        inputs = {"value": int}
+        outputs = {"value": int}
 
         def execute(self, inputs, context: Context) -> Output:
             """记录本次递增，并输出加一后的值。"""
@@ -289,12 +285,12 @@ def test_runtime_executes_cycle_inside_execution_plan() -> None:
         """通过回边递增计数并在达到边界时结束的示例节点。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(value=int)
-        output_ports = Ports(again=int, done=int)
+        inputs = {"value": int}
+        outputs = {"again": int, "done": int}
 
         def execute(self, inputs, context: Context) -> Output:
             """小于 2 时加一回到 again，否则输出到 done。"""
@@ -329,12 +325,12 @@ def test_cycle_scheduler_does_not_starve_ready_branch() -> None:
         """当前契约测试使用的 Loop 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(value=int)
-        output_ports = Ports(again=int, observe=int, done=int)
+        inputs = {"value": int}
+        outputs = {"again": int, "observe": int, "done": int}
 
         def execute(self, inputs, context: Context):
             """小于 3 时同时回到 again 并输出观察值，否则输出到 done。"""
@@ -353,12 +349,12 @@ def test_cycle_scheduler_does_not_starve_ready_branch() -> None:
         """当前契约测试使用的 Observe 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(value=int)
-        output_ports = Ports()
+        inputs = {"value": int}
+        outputs = {}
 
         def execute(self, inputs, context: Context) -> None:
             """记录收到的观察值，不产生输出。"""
@@ -396,12 +392,12 @@ def test_cycle_quiescence_reports_incomplete_inputs() -> None:
         """当前契约测试使用的 Loop 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(value=int)
-        output_ports = Ports(again=int, partial=int, absent=int, done=int)
+        inputs = {"value": int}
+        outputs = {"again": int, "partial": int, "absent": int, "done": int}
 
         def execute(self, inputs, context: Context):
             """小于 2 时回到 again 并产生 partial 输出，否则输出到 done。"""
@@ -419,13 +415,13 @@ def test_cycle_quiescence_reports_incomplete_inputs() -> None:
         """当前契约测试使用的 Join 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
             input_policy: 仅依据端口和 token 数量生效的输入策略。
         """
 
-        input_ports = Ports(left=int, right=int)
-        output_ports = Ports()
+        inputs = {"left": int, "right": int}
+        outputs = {}
         input_policy = InputPolicy.ALL
 
         def execute(self, inputs, context: Context) -> None:
@@ -456,12 +452,12 @@ def test_runtime_executes_different_plans_from_one_graph() -> None:
         """当前契约测试使用的 SourceNode 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(value=int)
-        output_ports = Ports(value=int)
+        inputs = {"value": int}
+        outputs = {"value": int}
 
         def execute(self, inputs, context: Context) -> Output:
             """记录调用并原样转发输入值。"""
@@ -474,13 +470,13 @@ def test_runtime_executes_different_plans_from_one_graph() -> None:
         """当前契约测试使用的 Branch 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
             name: 当前注册项或具名策略的名称。
         """
 
-        input_ports = Ports(value=int)
-        output_ports = Ports(result=str)
+        inputs = {"value": int}
+        outputs = {"result": str}
 
         def __init__(self, name: str) -> None:
             """初始化实例及其依赖，建立当前对象独立维护的状态。
@@ -524,14 +520,13 @@ def test_runtime_rejects_plan_from_another_graph() -> None:
         """当前契约测试使用的 Start 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
             input_policy: 仅依据端口和 token 数量生效的输入策略。
         """
 
-        input_ports = Ports()
-        output_ports = Ports()
-        input_policy = InputPolicy.ON_START
+        inputs = {}
+        outputs = {}
 
         def execute(self, inputs, context: Context) -> None:
             """只作为入口启动，不产生输出。"""
@@ -555,12 +550,12 @@ def test_single_port_receives_complete_mapping_payload() -> None:
         """当前契约测试使用的 MappingConsumer 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(task=dict)
-        output_ports = Ports(result=dict)
+        inputs = {"task": dict}
+        outputs = {"result": dict}
 
         def execute(self, inputs, context: Context) -> Output:
             """把映射入口中的 task 值输出为结果。"""
@@ -585,14 +580,13 @@ def test_runtime_classifies_invalid_node_results(node: str) -> None:
         """当前契约测试使用的 InvalidSync 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
             input_policy: 仅依据端口和 token 数量生效的输入策略。
         """
 
-        input_ports = Ports()
-        output_ports = Ports()
-        input_policy = InputPolicy.ON_START
+        inputs = {}
+        outputs = {}
 
         def execute(self, inputs, context: Context):
             """违规地同步返回非 Output 值。"""
@@ -604,14 +598,13 @@ def test_runtime_classifies_invalid_node_results(node: str) -> None:
         """当前契约测试使用的 InvalidAsync 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
             input_policy: 仅依据端口和 token 数量生效的输入策略。
         """
 
-        input_ports = Ports()
-        output_ports = Ports()
-        input_policy = InputPolicy.ON_START
+        inputs = {}
+        outputs = {}
 
         async def execute(self, inputs, context: Context):
             """违规地异步返回非 Output 值。"""
@@ -646,12 +639,12 @@ def test_context_emit_routes_to_another_graph() -> None:
         """当前契约测试使用的 Producer 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(value=str)
-        output_ports = Ports()
+        inputs = {"value": str}
+        outputs = {}
 
         def execute(self, inputs, context: Context) -> None:
             """把输入值作为 value.created 事件发布。"""
@@ -662,12 +655,12 @@ def test_context_emit_routes_to_another_graph() -> None:
         """当前契约测试使用的 Consumer 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(value=str)
-        output_ports = Ports()
+        inputs = {"value": str}
+        outputs = {}
 
         def execute(self, inputs, context: Context) -> None:
             """记录事件路由过来的值。"""
@@ -703,12 +696,12 @@ def test_runtime_keeps_observe_separate_from_combined_on() -> None:
         """当前契约测试使用的 Consumer 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(value=str)
-        output_ports = Ports()
+        inputs = {"value": str}
+        outputs = {}
 
         def execute(self, inputs, context: Context) -> None:
             """记录事件路由过来的值。"""
@@ -740,12 +733,12 @@ def test_runtime_on_forwards_subscription() -> None:
         """当前契约测试使用的 Consumer 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(value=str)
-        output_ports = Ports()
+        inputs = {"value": str}
+        outputs = {}
 
         def execute(self, inputs, context: Context) -> None:
             """消费事件但不做处理。"""
@@ -770,12 +763,12 @@ def test_runtime_on_does_not_leave_route_when_consumer_setup_fails() -> None:
         """当前契约测试使用的 Consumer 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(value=str)
-        output_ports = Ports()
+        inputs = {"value": str}
+        outputs = {}
 
         def execute(self, inputs, context: Context) -> None:
             """消费事件但不做处理。"""
@@ -809,12 +802,12 @@ def test_event_is_committed_even_if_source_node_later_fails() -> None:
         """当前契约测试使用的 Broken 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(value=str)
-        output_ports = Ports()
+        inputs = {"value": str}
+        outputs = {}
 
         def execute(self, inputs, context: Context) -> None:
             """先发布 value.committed 事件，再抛出业务异常。"""
@@ -842,12 +835,12 @@ def test_runtime_dispatches_each_event_without_domain_deduplication() -> None:
         """当前契约测试使用的 Consumer 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(value=str)
-        output_ports = Ports()
+        inputs = {"value": str}
+        outputs = {}
 
         def execute(self, inputs, context: Context) -> None:
             """记录事件路由过来的值。"""
@@ -877,12 +870,12 @@ def test_queue_concurrency_limits_graph_executions() -> None:
         """当前契约测试使用的 Slow 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(value=int)
-        output_ports = Ports()
+        inputs = {"value": int}
+        outputs = {}
 
         async def execute(self, inputs, context: Context) -> None:
             """统计同时运行的执行数，并异步休眠 20 毫秒。"""
@@ -923,12 +916,12 @@ def test_event_can_drive_a_chain_of_graphs() -> None:
         """当前契约测试使用的 Relay 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(value=str)
-        output_ports = Ports()
+        inputs = {"value": str}
+        outputs = {}
 
         def execute(self, inputs, context: Context) -> None:
             """把输入值作为 relayed 事件转发。"""
@@ -939,12 +932,12 @@ def test_event_can_drive_a_chain_of_graphs() -> None:
         """当前契约测试使用的 Sink 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(value=str)
-        output_ports = Ports()
+        inputs = {"value": str}
+        outputs = {}
 
         def execute(self, inputs, context: Context) -> None:
             """记录事件路由过来的值。"""
@@ -974,12 +967,12 @@ def test_slot_follows_work_across_consumers() -> None:
         """当前契约测试使用的 Producer 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(value=int)
-        output_ports = Ports()
+        inputs = {"value": int}
+        outputs = {}
 
         def execute(self, inputs, context: Context) -> None:
             """把值写入 Slot，记录 Slot 与线程，再发布 slot.forwarded 事件。"""
@@ -993,12 +986,12 @@ def test_slot_follows_work_across_consumers() -> None:
         """当前契约测试使用的 Consumer 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(value=int)
-        output_ports = Ports()
+        inputs = {"value": int}
+        outputs = {}
 
         def execute(self, inputs, context: Context) -> None:
             """确认 Slot 携带源图写入的值，并记录 Slot 与线程。"""
@@ -1051,12 +1044,12 @@ def test_default_slot_pool_matches_consumer_concurrency() -> None:
         """当前契约测试使用的 Capture 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(value=int)
-        output_ports = Ports()
+        inputs = {"value": int}
+        outputs = {}
 
         async def execute(self, inputs, context: Context) -> None:
             """记录 Slot ID 并统计同时运行的执行数。"""
@@ -1101,12 +1094,12 @@ def test_slot_lease_waits_for_all_event_branches() -> None:
         """当前契约测试使用的 Fork 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(value=str)
-        output_ports = Ports()
+        inputs = {"value": str}
+        outputs = {}
 
         def execute(self, inputs, context: Context) -> None:
             """向左右两个分支各发布一个事件。"""
@@ -1119,13 +1112,13 @@ def test_slot_lease_waits_for_all_event_branches() -> None:
         """当前契约测试使用的 Branch 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
             name: 当前注册项或具名策略的名称。
         """
 
-        input_ports = Ports(value=str)
-        output_ports = Ports()
+        inputs = {"value": str}
+        outputs = {}
 
         def __init__(self, name: str) -> None:
             """初始化实例及其依赖，建立当前对象独立维护的状态。
@@ -1169,12 +1162,12 @@ def test_failed_work_releases_its_slot() -> None:
         """当前契约测试使用的 Broken 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(value=int)
-        output_ports = Ports()
+        inputs = {"value": int}
+        outputs = {}
 
         def execute(self, inputs, context: Context) -> None:
             """在携带 Slot 的工作中抛出业务异常。"""
@@ -1201,12 +1194,12 @@ def test_rejected_emitted_event_releases_its_retained_slot() -> None:
         """发出一个会被 Emitter 拒绝的跨图事件。
 
         Attributes:
-            input_ports: 接收整数入口值的端口。
-            output_ports: 无输出端口。
+            inputs: 接收整数入口值的端口。
+            outputs: 无输出端口。
         """
 
-        input_ports = Ports(value=int)
-        output_ports = Ports()
+        inputs = {"value": int}
+        outputs = {}
 
         def execute(self, inputs, context: Context) -> None:
             """发出携带入口值的 rejected 事件。
@@ -1241,7 +1234,7 @@ def test_rejected_emitted_event_releases_its_retained_slot() -> None:
 
     with pytest.raises(Exception, match="rejected event"):
         worker.wait_idle(2)
-    assert worker.get_execution(work.id).status is ExecutionStatus.FAILED
+    assert worker.get_execution(work.id).status is Execution.Status.FAILED
     assert slots.available == 1
     worker.close()
     slots.close()
@@ -1254,12 +1247,12 @@ def test_failed_event_dispatch_releases_forwarded_slot_once() -> None:
         """把入口值转发为 rejected 事件。
 
         Attributes:
-            input_ports: 接收整数入口值的端口。
-            output_ports: 无输出端口。
+            inputs: 接收整数入口值的端口。
+            outputs: 无输出端口。
         """
 
-        input_ports = Ports(value=int)
-        output_ports = Ports()
+        inputs = {"value": int}
+        outputs = {}
 
         def execute(self, inputs, context: Context) -> None:
             """发出携带入口值的 rejected 事件。
@@ -1294,12 +1287,12 @@ def test_waiting_roots_do_not_starve_slot_continuations() -> None:
         """当前契约测试使用的 Relay 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(value=int)
-        output_ports = Ports()
+        inputs = {"value": int}
+        outputs = {}
 
         def execute(self, inputs, context: Context) -> None:
             """把输入值作为 continued 事件转发。"""
@@ -1310,12 +1303,12 @@ def test_waiting_roots_do_not_starve_slot_continuations() -> None:
         """当前契约测试使用的 Sink 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(value=int)
-        output_ports = Ports()
+        inputs = {"value": int}
+        outputs = {}
 
         def execute(self, inputs, context: Context) -> None:
             """记录事件路由过来的值。"""
@@ -1360,12 +1353,12 @@ def test_shared_pool_works_when_consumer_and_slot_sizes_differ() -> None:
         """当前契约测试使用的 Slow 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(value=int)
-        output_ports = Ports()
+        inputs = {"value": int}
+        outputs = {}
 
         async def execute(self, inputs, context: Context) -> None:
             """统计同时持有 Slot 的执行数，并异步休眠 10 毫秒。"""
@@ -1409,12 +1402,12 @@ def test_multiple_routes_retain_one_slot_until_every_work_finishes() -> None:
         """当前契约测试使用的 FanOut 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(value=int)
-        output_ports = Ports()
+        inputs = {"value": int}
+        outputs = {}
 
         def execute(self, inputs, context: Context) -> None:
             """把输入值作为 fanout 事件发布。"""
@@ -1425,13 +1418,13 @@ def test_multiple_routes_retain_one_slot_until_every_work_finishes() -> None:
         """当前契约测试使用的 Sink 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
             name: 当前注册项或具名策略的名称。
         """
 
-        input_ports = Ports(value=int)
-        output_ports = Ports()
+        inputs = {"value": int}
+        outputs = {}
 
         def __init__(self, name: str) -> None:
             """初始化实例及其依赖，建立当前对象独立维护的状态。
@@ -1493,12 +1486,12 @@ def test_returned_slot_keeps_state_for_later_root_work() -> None:
         """当前契约测试使用的 Reuse 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(value=int)
-        output_ports = Ports()
+        inputs = {"value": int}
+        outputs = {}
 
         def execute(self, inputs, context: Context) -> None:
             """在 Slot 中累加复用次数并记录。"""
@@ -1522,7 +1515,7 @@ def test_returned_slot_keeps_state_for_later_root_work() -> None:
 
 
 def test_runtime_validates_entry_value_type() -> None:
-    """入口 payload 必须满足 Ports 声明。"""
+    """入口 payload 必须满足 端口声明。"""
 
     with Runtime() as runtime:
         runtime.register("join.graph", join_graph())
@@ -1579,8 +1572,8 @@ def test_mixed_node_styles_preserve_outputs_events_options_and_slot() -> None:
     class Immediate(Node):
         """执行混合图第一步的同步节点。"""
 
-        input_ports = Ports(value=int)  # 当前图的整数入口。
-        output_ports = Ports(value=int)  # 发往异步节点的整数输出。
+        inputs = {"value": int}  # 当前图的整数入口。
+        outputs = {"value": int}  # 发往异步节点的整数输出。
 
         def execute(self, inputs: Mapping[str, Any], context: Context) -> Output:
             """记录同步阶段并沿 Edge 传递加一结果。
@@ -1599,8 +1592,8 @@ def test_mixed_node_styles_preserve_outputs_events_options_and_slot() -> None:
     class Asynchronous(Node):
         """通过协程方法执行混合图第二步的节点。"""
 
-        input_ports = Ports(value=int)  # 上游同步节点的整数结果。
-        output_ports = Ports(value=int)  # 发往 Awaitable 节点的整数输出。
+        inputs = {"value": int}  # 上游同步节点的整数结果。
+        outputs = {"value": int}  # 发往 Awaitable 节点的整数输出。
 
         async def execute(self, inputs: Mapping[str, Any], context: Context) -> Output:
             """等待后记录异步阶段，并继续使用相同数据流契约。
@@ -1620,8 +1613,8 @@ def test_mixed_node_styles_preserve_outputs_events_options_and_slot() -> None:
     class Deferred(Node):
         """由同步方法返回协程，完成原图输出并发布跨图事件。"""
 
-        input_ports = Ports(value=int)  # 上游协程节点的整数结果。
-        output_ports = Ports(value=int)  # 无下游 Edge 的原图终端结果。
+        inputs = {"value": int}  # 上游协程节点的整数结果。
+        outputs = {"value": int}  # 无下游 Edge 的原图终端结果。
 
         def execute(
             self, inputs: Mapping[str, Any], context: Context
@@ -1654,8 +1647,8 @@ def test_mixed_node_styles_preserve_outputs_events_options_and_slot() -> None:
     class FollowUp(Node):
         """在第二张图中验证事件输入、空配置和同一个 Slot。"""
 
-        input_ports = Ports(value=int)  # 已接受跨图事件的整数 payload。
-        output_ports = Ports(value=int)  # 第二张图独立产生的终端结果。
+        inputs = {"value": int}  # 已接受跨图事件的整数 payload。
+        outputs = {"value": int}  # 第二张图独立产生的终端结果。
 
         async def execute(self, inputs: Mapping[str, Any], context: Context) -> Output:
             """继续原 Slot 逻辑链，但使用新的 execution 配置。
@@ -1688,7 +1681,7 @@ def test_mixed_node_styles_preserve_outputs_events_options_and_slot() -> None:
     work = Work("mixed", 3, options=options)
     options["pipeline.rules"].append("caller change")
     try:
-        with Runtime(plugins=[LocalRuntimePlugin(tasks=tasks)]) as runtime:
+        with Runtime(plugins=[LocalInfrastructurePlugin(tasks=tasks)]) as runtime:
             runtime.register("mixed", graph)
             runtime.register("follow", Graph(entrypoint="node").add(node=FollowUp()))
             runtime.consume("source", slots=slots)
@@ -1799,7 +1792,7 @@ def test_execution_finished_is_published_before_waiters_wake(fail: bool) -> None
                 execution = runtime.get_execution(event.execution_id)
                 finished.append((event, execution.done))
 
-        handle = runtime.observe_runtime(observe)
+        handle = runtime.hooks.on(RUNTIME_EVENT, observe)
         if fail:
             with pytest.raises(Exception, match="graph failed"):
                 runtime.run("finish")
@@ -1821,7 +1814,8 @@ def test_redelivered_work_replaces_finished_record_and_rejects_active_duplicate(
 
     node = Gate(fail_first=True)
     tasks = memory.TaskBackend()
-    worker = GraphWorker(consumer=tasks, close_injected=True)
+    hooks = HookBus()
+    worker = GraphWorker(consumer=tasks, close_injected=True, hooks=hooks)
     results: list[tuple[str | None, int]] = []
     rejected = ThreadEvent()
 
@@ -1837,7 +1831,7 @@ def test_redelivered_work_replaces_finished_record_and_rejects_active_duplicate(
             if event.status == "rejected":
                 rejected.set()
 
-    worker.observe_runtime(observe)
+    hooks.on(RUNTIME_EVENT, observe)
     worker.register("gate", Graph(entrypoint="node").add("node", node))
     worker.consume("gate", concurrency=2)
     work = Work("gate")
@@ -1855,13 +1849,13 @@ def test_redelivered_work_replaces_finished_record_and_rejects_active_duplicate(
     # 后端先传播首个失败，即重复交付的拒绝原因。
     with pytest.raises(InterlaceRuntimeError, match="still active"):
         worker.wait_idle(2)
-    assert first.status is ExecutionStatus.FAILED
+    assert first.status is Execution.Status.FAILED
 
     tasks.submit("gate", work)
     worker.wait_idle(2)
     retried = worker.get_execution(work.id)
     assert retried is not first
-    assert retried.status is ExecutionStatus.SUCCEEDED
+    assert retried.status is Execution.Status.SUCCEEDED
     assert [item.id for item in worker.executions()] == [work.id]
     worker.close()
 
@@ -1889,7 +1883,7 @@ def test_history_limit_and_direct_workers_are_constructor_parameters() -> None:
         assert node.entered.wait(1)
         # 单线程直接执行池中，第二次执行排在阻塞执行之后；未结束记录不被淘汰。
         queued = runtime.start("gate")
-        assert queued.status is ExecutionStatus.PENDING
+        assert queued.status is Execution.Status.PENDING
         assert runtime.executions() == (blocked, queued)
         node.release.set()
         runtime.wait_idle(2)
@@ -1898,8 +1892,14 @@ def test_history_limit_and_direct_workers_are_constructor_parameters() -> None:
             runtime.get_execution(blocked.id)
 
 
-def test_on_rolls_back_only_the_consumer_it_created_when_route_fails() -> None:
-    """route 失败时 on 撤销本次新建的消费者，保留此前已有的消费者。"""
+def test_on_rolls_back_only_the_consumer_it_created_when_route_fails(
+    roles_plugin: Any,
+) -> None:
+    """route 失败时 on 撤销本次新建的消费者，保留此前已有的消费者。
+
+    Args:
+        roles_plugin: 把现成角色作为插件提供的工厂。
+    """
 
     class FailingRouter(EventRouter):
         """在测试放行前拒绝所有 route 的 Router。
@@ -1933,7 +1933,7 @@ def test_on_rolls_back_only_the_consumer_it_created_when_route_fails() -> None:
     router = FailingRouter(events=bus, publisher=tasks)
     worker = GraphWorker(consumer=tasks, emit=router.publish)
     try:
-        with Runtime(router=router, worker=worker) as runtime:
+        with Runtime(plugins=(roles_plugin(router, worker),)) as runtime:
             with pytest.raises(RuntimeError, match="route rejected"):
                 runtime.on("value", graph="graph", queue="fresh")
             with pytest.raises(Exception, match="no active consumers"):

@@ -10,7 +10,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from interlace import Context, Graph, Node, Output, Ports, Runtime
+from interlace import Context, Graph, Node, Output, Runtime
 from interlace.service import GraphService, NodeCatalog
 
 # 示例主动启用 INFO；服务采集遵守应用已有的日志级别配置。
@@ -36,13 +36,13 @@ class TextNode(Node):
     """可重入的异步文本转换节点。
 
     Attributes:
-        input_ports: 接收文本的入口。
-        output_ports: 转换后文本的出口。
+        inputs: 接收文本的入口。
+        outputs: 转换后文本的出口。
         config: 构造时复制的节点配置，不保存执行状态。
     """
 
-    input_ports = Ports(text=str)
-    output_ports = Ports(text=str)
+    inputs = {"text": str}
+    outputs = {"text": str}
 
     def __init__(self, config: TextConfig) -> None:
         """保存独立的构造配置。
@@ -76,12 +76,12 @@ class SplitNode(Node):
     """将文本按行拆分为多个输出。
 
     Attributes:
-        input_ports: 接收多行文本。
-        output_ports: 逐行输出文本。
+        inputs: 接收多行文本。
+        outputs: 逐行输出文本。
     """
 
-    input_ports = Ports(text=str)
-    output_ports = Ports(text=str)
+    inputs = {"text": str}
+    outputs = {"text": str}
 
     def execute(self, inputs: Mapping[str, Any], context: Context) -> list[Output]:
         """按行产生独立数据流 token。

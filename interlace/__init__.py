@@ -1,37 +1,13 @@
-"""Interlace 顶层公共 API。"""
+"""Interlace 顶层公共 API：写业务和编排只需要这六个名字。"""
 
-from .engine import (
-    Context,
-    Edge,
-    Event,
-    Execution,
-    ExecutionLimits,
-    ExecutionPlan,
-    ExecutionStatus,
-    Graph,
-    InputPolicy,
-    Node,
-    Output,
-    Ports,
-    Slot,
-    SlotPool,
-)
+from .engine import Context, Event, Graph, Node, Output
 from .runtime import Runtime
 
 __all__ = [
     "Context",
-    "Edge",
     "Event",
-    "Execution",
-    "ExecutionLimits",
-    "ExecutionPlan",
-    "ExecutionStatus",
     "Graph",
-    "InputPolicy",
     "Node",
     "Output",
-    "Ports",
     "Runtime",
-    "Slot",
-    "SlotPool",
 ]

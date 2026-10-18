@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from interlace import Context, Graph, Node, Output, Ports, Runtime
+from interlace import Context, Graph, Node, Output, Runtime
 
 
 @dataclass
@@ -87,8 +87,8 @@ class AirContext(Context):
 class BuildRequest(Node):
     """通过领域上下文构造请求地址。"""
 
-    input_ports = Ports(data=CrawlData)  # 当前任务拥有的领域数据。
-    output_ports = Ports(data=CrawlData)  # 携带请求地址的同一任务数据。
+    inputs = {"data": CrawlData}  # 当前任务拥有的领域数据。
+    outputs = {"data": CrawlData}  # 携带请求地址的同一任务数据。
 
     def execute(self, inputs: Mapping[str, Any], context: Context) -> Output:
         """构造 URL 后通过 Output 交付当前任务数据。
@@ -110,8 +110,8 @@ class BuildRequest(Node):
 class ReadRequest(Node):
     """用新的上下文读取沿 Edge 到达的数据。"""
 
-    input_ports = Ports(data=CrawlData)  # 上游交付的领域数据。
-    output_ports = Ports(url=str)  # 本示例的终端请求地址。
+    inputs = {"data": CrawlData}  # 上游交付的领域数据。
+    outputs = {"url": str}  # 本示例的终端请求地址。
 
     def execute(self, inputs: Mapping[str, Any], context: Context) -> Output:
         """输出上游构造的 URL，不执行网络请求。

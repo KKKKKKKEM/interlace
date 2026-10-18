@@ -27,6 +27,29 @@ def require_non_empty_string(value: object, label: str) -> str:
     return value
 
 
+def require_namespaced(value: object, label: str) -> str:
+    """校验带 ``/`` 命名空间且不含空白的标识，例如 ``"acme/name"``。
+
+    Args:
+        value: 待校验的值。
+        label: 校验失败时用于指明字段的说明名称。
+
+    Returns:
+        通过校验的原始字符串。
+
+    Raises:
+        TypeError: value 不是字符串。
+        ValueError: value 为空、缺少命名空间、以 ``/`` 开头或结尾，或包含空白。
+    """
+
+    value = require_non_empty_string(value, label)
+    if "/" not in value or value.startswith("/") or value.endswith("/"):
+        raise ValueError(f"{label} must be namespaced, for example 'acme/name'")
+    if any(char.isspace() for char in value):
+        raise ValueError(f"{label} must not contain whitespace")
+    return value
+
+
 def validate_timeout(timeout: float | None) -> None:
     """校验等待接口使用的超时参数。
 

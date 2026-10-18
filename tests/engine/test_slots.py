@@ -7,8 +7,53 @@ from threading import Event as ThreadEvent, Thread
 import pytest
 
 import interlace
-from interlace import Slot, SlotPool
+from interlace.engine import Slot, SlotPool
+from interlace.engine.errors import InterlaceRuntimeError
 from interlace.spi import Delivery, SlotLease, Work
+
+
+def test_integer_slots_bound_logical_chains_independently_of_concurrency() -> None:
+    """整数 slots 创建该容量的自有池，与 concurrency 独立；同通道以不同容量重复消费或非正容量明确失败。"""
+
+    entered = ThreadEvent()
+    release = ThreadEvent()
+    seen: set[int] = set()
+
+    class Hold(interlace.Node):
+        """记录所用 Slot 并等待放行的节点。"""
+
+        outputs = {}
+
+        def execute(self, inputs: Any, context: Any) -> None:
+            """登记 Slot 身份后阻塞到测试放行。"""
+
+            seen.add(id(context.slot))
+            if len(seen) == 2:
+                entered.set()
+            assert release.wait(5)
+
+    with interlace.Runtime() as runtime:
+        runtime.register("hold", interlace.Graph(entrypoint="node").add(node=Hold()))
+        runtime.on("go", graph="hold", queue="hold", concurrency=4, slots=2)
+        for index in range(4):
+            runtime.emit("go", index)
+        assert entered.wait(5)
+        assert (
+            sum(
+                1
+                for execution in runtime.executions()
+                if execution.status.value == "running"
+            )
+            == 2
+        )
+        release.set()
+        runtime.wait_idle(5)
+        with pytest.raises(InterlaceRuntimeError, match="different SlotPool"):
+            runtime.consume("hold", concurrency=4, slots=3)
+        runtime.consume("hold", concurrency=4, slots=2)
+        with pytest.raises(ValueError, match="at least 1"):
+            runtime.consume("other", slots=0)
+    assert len(seen) == 2
 
 
 def test_slot_lease_is_an_extension_protocol_only() -> None:

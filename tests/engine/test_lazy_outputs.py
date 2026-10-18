@@ -6,22 +6,22 @@ from typing import Any
 
 import pytest
 
-from interlace import Context, Graph, Node, Output, Ports, Runtime
+from interlace import Context, Graph, Node, Output, Runtime
 from interlace.engine.errors import (
     ExecutionCancelledError,
     HookExecutionError,
     PortValueTypeError,
 )
-from interlace.engine.hooks import NodeCall, NodeHook, ShortCircuit, StopGraph
 from interlace.engine.observation import RuntimeEventKind
+from interlace.plugins.points import NODE_CALL, RUNTIME_EVENT, NodeCall, StopGraph
 
 
 @pytest.mark.parametrize("with_hook", [False, True])
 def test_first_output_arrives_before_generator_finishes(with_hook: bool) -> None:
-    """首项输出到达后才允许生产下一项，且 Hook 不提前耗尽源。
+    """首项输出到达后才允许生产下一项，且中间件不提前耗尽源。
 
     Args:
-        with_hook: 是否通过惰性出口 Hook 转换每项输出。
+        with_hook: 是否通过惰性中间件转换每项输出。
     """
 
     received = ThreadEvent()
@@ -46,26 +46,24 @@ def test_first_output_arrives_before_generator_finishes(with_hook: bool) -> None
             assert received.wait(1), "first output was buffered until exhaustion"
             yield Output(2)
 
-    class Transform(NodeHook):
-        """保持惰性的逐项输出转换。"""
+    def transform(call: NodeCall, call_next: Any) -> Iterator[Output]:
+        """逐项转换内层输出，不读取下一项。
 
-        def exit(self, call: NodeCall, output: Output) -> Output:
-            """转换当前项，不读取下一项。
+        Args:
+            call: 当前节点调用。
+            call_next: 调用内层的函数。
 
-            Args:
-                call: 当前节点调用。
-                output: Engine 已读取的当前输出。
+        Yields:
+            将当前整数翻倍的输出。
+        """
 
-            Returns:
-                将当前整数翻倍的输出。
-            """
-
-            return Output(output.value * 2)
+        for output in call_next(call):
+            yield Output(output.value * 2)
 
     with Runtime() as runtime:
         runtime.register("lazy", Graph(entrypoint="source").add(source=Producer()))
         if with_hook:
-            runtime.attach(Transform())
+            runtime.hooks.on(NODE_CALL, transform)
         stream = runtime.iter("lazy", output_buffer=1)
         try:
             assert next(stream) == Output(2 if with_hook else 1)
@@ -74,22 +72,17 @@ def test_first_output_arrives_before_generator_finishes(with_hook: bool) -> None
         assert tuple(stream) == (Output(4 if with_hook else 2),)
 
 
-@pytest.mark.parametrize("signal", [ShortCircuit, StopGraph])
-def test_generator_cannot_raise_hook_control(signal: type[BaseException]) -> None:
-    """迭代阶段的节点控制信号仍被拒绝，已交付输出保留。
-
-    Args:
-        signal: 节点不得自行发出的 Hook 控制信号类型。
-    """
+def test_generator_cannot_raise_stop_graph() -> None:
+    """迭代阶段节点自行发出的 StopGraph 仍被拒绝，已交付输出保留。"""
 
     class Invalid(Node):
         """在第二次推进时冒充 Hook 的节点。
 
         Attributes:
-            output_ports: 仅允许默认端口的整数输出。
+            outputs: 仅允许默认端口的整数输出。
         """
 
-        output_ports = Ports(default=int)
+        outputs = {"default": int}
 
         def execute(
             self, inputs: Mapping[str, Any], context: Context
@@ -104,11 +97,11 @@ def test_generator_cannot_raise_hook_control(signal: type[BaseException]) -> Non
                 第一项合法整数。
 
             Raises:
-                BaseException: 用于验证节点不能发出的 Hook 控制信号。
+                StopGraph: 节点不得自行发出的控制信号。
             """
 
             yield Output(1)
-            raise signal(Output("escape", "undeclared"))
+            raise StopGraph(Output("escape", "undeclared"))
 
     with Runtime() as runtime:
         runtime.register("invalid", Graph(entrypoint="source").add(source=Invalid()))
@@ -174,10 +167,10 @@ def test_invalid_output_marks_node_observation_failed() -> None:
         """返回错误类型的节点。
 
         Attributes:
-            output_ports: 默认输出必须为整数。
+            outputs: 默认输出必须为整数。
         """
 
-        output_ports = Ports(default=int)
+        outputs = {"default": int}
 
         def execute(self, inputs: Mapping[str, Any], context: Context) -> Output:
             """返回与声明不一致的字符串。
@@ -193,7 +186,7 @@ def test_invalid_output_marks_node_observation_failed() -> None:
             return Output("wrong")
 
     with Runtime() as runtime:
-        runtime.observe_runtime(events.append)
+        runtime.hooks.on(RUNTIME_EVENT, events.append)
         runtime.register("invalid", Graph(entrypoint="source").add(source=Invalid()))
         with pytest.raises(PortValueTypeError):
             runtime.run("invalid")

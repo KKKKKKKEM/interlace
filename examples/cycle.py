@@ -2,19 +2,20 @@
 
 from __future__ import annotations
 
-from interlace import Edge, Graph, Node, Output, Ports, Runtime
+from interlace import Graph, Node, Output, Runtime
+from interlace.engine import Edge
 
 
 class Counter(Node):
     """通过回边递增计数并在达到边界时结束的示例节点。
 
     Attributes:
-        input_ports: 输入端口，value 为当前计数，可来自入口或 again 回边。
-        output_ports: 输出端口，again 继续循环，done 输出最终计数。
+        inputs: 输入端口，value 为当前计数，可来自入口或 again 回边。
+        outputs: 输出端口，again 继续循环，done 输出最终计数。
     """
 
-    input_ports = Ports(value=int)
-    output_ports = Ports(again=int, done=int)
+    inputs = {"value": int}
+    outputs = {"again": int, "done": int}
 
     def execute(self, inputs, context):
         """value 小于 3 时加一并经 again 回送，否则从 done 输出。

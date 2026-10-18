@@ -13,8 +13,8 @@ Node 使用 `Context.emit()` 发布事件：
 
 ```python
 class Publish(Node):
-    input_ports = Ports(message=str)
-    output_ports = Ports()
+    inputs = {"message": str}
+    outputs = {}
 
     def execute(self, inputs, context):
         context.emit("message.created", inputs["message"])
@@ -28,8 +28,8 @@ class Publish(Node):
 
 ```python
 class Collect(Node):
-    input_ports = Ports(message=str)
-    output_ports = Ports()
+    inputs = {"message": str}
+    outputs = {}
 
     def __init__(self, received):
         self.received = received

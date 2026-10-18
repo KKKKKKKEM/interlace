@@ -2,21 +2,26 @@
 
 import threading
 import time
-from contextlib import AbstractContextManager
 from collections.abc import Callable
+from contextlib import AbstractContextManager
 from threading import Event as ThreadEvent
 from threading import Thread
 
 import pytest
 
-from interlace import Event, Graph, Node, Runtime, Slot, SlotPool
+from interlace import Event, Graph, Node, Runtime
+from interlace.engine import Slot, SlotPool
 from interlace.adapters import memory
 from interlace.engine.errors import (
     ExecutionError,
     RuntimeClosedError,
     SlotProviderClosedError,
 )
-from interlace.runtime import EventRouter, GraphWorker, LocalRuntimePlugin
+from interlace.runtime import (
+    EventRouter,
+    GraphWorker,
+    LocalInfrastructurePlugin,
+)
 from interlace.spi import Delivery, DeliveryResult, SlotLease, Work, WorkHandler
 
 
@@ -39,8 +44,12 @@ def test_event_subscription_detaches_only_its_registration() -> None:
         bus.close()
 
 
-def test_closed_roles_release_shared_transport_registrations() -> None:
-    """关闭角色后旧订阅和消费者消失，共享组件支持重新装配。"""
+def test_closed_roles_release_shared_transport_registrations(roles_plugin) -> None:
+    """关闭角色后旧订阅和消费者消失，共享组件支持重新装配。
+
+    Args:
+        roles_plugin: 把现成角色作为插件提供的工厂。
+    """
 
     class Record(Node):
         """将执行次数写入调用方持有的记录。"""
@@ -64,7 +73,7 @@ def test_closed_roles_release_shared_transport_registrations() -> None:
         for _ in range(2):
             router = EventRouter(events=bus, publisher=tasks)
             worker = GraphWorker(consumer=tasks, emit=router.publish)
-            with Runtime(router=router, worker=worker) as runtime:
+            with Runtime(plugins=(roles_plugin(router, worker),)) as runtime:
                 runtime.register(
                     "graph", Graph(entrypoint="record").add("record", Record())
                 )
@@ -542,7 +551,9 @@ def test_runtime_close_rejects_events_after_last_consumer_unbind() -> None:
     bus = memory.EventBus()
     tasks = PausedTasks()
     runtime = Runtime(
-        plugins=(LocalRuntimePlugin(events=bus, tasks=tasks, close_injected=True),)
+        plugins=(
+            LocalInfrastructurePlugin(events=bus, tasks=tasks, close_injected=True),
+        )
     )
     runtime.on("value", graph="graph", queue="queue")
 
@@ -767,7 +778,9 @@ def test_concurrent_close_shares_one_drain_and_rejects_new_roots(target: str) ->
     tasks = SignalledTasks()
     owner: Runtime | GraphWorker
     if target == "runtime":
-        owner = Runtime(plugins=(LocalRuntimePlugin(tasks=tasks, close_injected=True),))
+        owner = Runtime(
+            plugins=(LocalInfrastructurePlugin(tasks=tasks, close_injected=True),)
+        )
     else:
         owner = GraphWorker(consumer=tasks, close_injected=True)
     owner.register("block", Graph(entrypoint="node").add("node", Block()))

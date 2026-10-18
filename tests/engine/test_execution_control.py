@@ -13,28 +13,18 @@ from threading import enumerate as live_threads
 
 import pytest
 
-from interlace import (
-    Context,
-    Execution,
-    ExecutionLimits,
-    ExecutionStatus,
-    Graph,
-    InputPolicy,
-    Node,
-    Output,
-    Ports,
-    Runtime,
-    SlotPool,
-)
+from interlace import Context, Graph, Node, Output, Runtime
+from interlace.engine import Execution, InputPolicy, SlotPool
+from interlace.spi import ExecutionLimits
 from interlace.adapters import memory
 from interlace.engine import runner as runner_module
 from interlace.engine.errors import (
-    InterlaceRuntimeError,
     ExecutionCancelledError,
     ExecutionError,
     ExecutionTimeoutError,
     HookExecutionError,
     IncompleteInputsError,
+    InterlaceRuntimeError,
     NodeTimeoutError,
     PolicySelectionError,
     PortValueTypeError,
@@ -42,9 +32,9 @@ from interlace.engine.errors import (
     StepLimitExceededError,
 )
 from interlace.engine.executor import Engine
-from interlace.engine.hooks import NodeHook, StopGraph
-from interlace.engine.policies import PolicyRef, PolicyRegistry
+from interlace.engine.execution import ExecutionStatus
 from interlace.engine.runner import LocalRunner
+from interlace.plugins.points import NODE_CALL, StopGraph
 from interlace.runtime import GraphWorker, LocalRuntimePlugin
 
 
@@ -127,12 +117,12 @@ class Increment(Node):
     """当前契约测试使用的 Increment 替代实现。
 
     Attributes:
-        input_ports: 节点声明的输入端口及其类型。
-        output_ports: 节点声明的输出端口及其类型。
+        inputs: 节点声明的输入端口及其类型。
+        outputs: 节点声明的输出端口及其类型。
     """
 
-    input_ports = Ports(value=int)
-    output_ports = Ports(value=int)
+    inputs = {"value": int}
+    outputs = {"value": int}
 
     def execute(self, inputs, context: Context) -> Output:
         """输出加一后的值。"""
@@ -198,8 +188,8 @@ def burst_graph() -> Graph:
     class Burst(Node):
         """单次 firing 产出多个值的入口节点。"""
 
-        input_ports = Ports(count=int)
-        output_ports = Ports(value=int)
+        inputs = {"count": int}
+        outputs = {"value": int}
 
         def execute(self, inputs, context):
             """按 count 依次产出 0..count-1。"""
@@ -210,8 +200,8 @@ def burst_graph() -> Graph:
     class Sink(Node):
         """逐个消费输入、不产生输出的下游节点。"""
 
-        input_ports = Ports(value=int)
-        output_ports = Ports()
+        inputs = {"value": int}
+        outputs = {}
 
         def execute(self, inputs, context):
             """丢弃收到的值。"""
@@ -234,7 +224,7 @@ def test_max_queued_stops_single_firing_burst_that_max_steps_cannot_see() -> Non
     assert caught.value.node == "source"
     assert "sink.value=3" in str(caught.value)
     execution = runtime.executions()[-1]
-    assert execution.status is ExecutionStatus.QUEUE_LIMITED
+    assert execution.status is Execution.Status.QUEUE_LIMITED
     assert execution.steps == 1
     runtime.close()
 
@@ -246,7 +236,7 @@ def test_max_queued_counts_consumed_tokens_and_allows_exact_boundary() -> None:
         runtime.register("burst", burst_graph())
         assert runtime.run("burst", 3, max_queued=3) == ()
         execution = runtime.executions()[-1]
-        assert execution.status is ExecutionStatus.SUCCEEDED
+        assert execution.status is Execution.Status.SUCCEEDED
         assert execution.steps == 4
 
 
@@ -259,7 +249,7 @@ def test_routed_work_applies_max_queued_per_execution() -> None:
         runtime.emit("burst.requested", 5)
         with pytest.raises(QueueLimitExceededError):
             runtime.wait_idle(2)
-        assert runtime.executions()[-1].status is ExecutionStatus.QUEUE_LIMITED
+        assert runtime.executions()[-1].status is Execution.Status.QUEUE_LIMITED
 
 
 def test_max_steps_counts_node_firings_and_preserves_execution_state() -> None:
@@ -273,7 +263,7 @@ def test_max_steps_counts_node_firings_and_preserves_execution_state() -> None:
 
     execution = runtime.executions()[-1]
     assert execution.steps == 3
-    assert execution.status is ExecutionStatus.STEP_LIMITED
+    assert execution.status is Execution.Status.STEP_LIMITED
     assert isinstance(execution.error, StepLimitExceededError)
     assert runtime.get_execution(execution.id) is execution
     runtime.close()
@@ -298,12 +288,12 @@ def test_zero_max_steps_keeps_existing_unlimited_behavior() -> None:
         """当前契约测试使用的 StopAt 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(value=int)
-        output_ports = Ports(again=int, done=int)
+        inputs = {"value": int}
+        outputs = {"again": int, "done": int}
 
         def execute(self, inputs, context: Context) -> Output:
             """值未超过 20 时加一后回到 again 端口，否则输出到 done。"""
@@ -334,7 +324,7 @@ def test_start_returns_successful_queryable_execution() -> None:
         execution = runtime.start("increment.graph", 2)
 
         assert execution.result(1) == (Output(3, "value"),)
-        assert execution.status is ExecutionStatus.SUCCEEDED
+        assert execution.status is Execution.Status.SUCCEEDED
         assert execution.started_at is not None
         assert execution.finished_at is not None
         assert execution.steps == 1
@@ -368,12 +358,12 @@ def test_runtime_iter_streams_terminal_outputs_and_keeps_final_result() -> None:
         """当前契约测试使用的 Many 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(count=int)
-        output_ports = Ports(value=int)
+        inputs = {"count": int}
+        outputs = {"value": int}
 
         def execute(self, inputs, context):
             """按 count 依次产生 0..count-1 个 Output。"""
@@ -404,12 +394,12 @@ def test_async_output_iteration() -> None:
         """当前契约测试使用的 Many 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(count=int)
-        output_ports = Ports(value=int)
+        inputs = {"count": int}
+        outputs = {"value": int}
 
         def execute(self, inputs, context):
             """按 count 依次产生 0..count-1 个 Output。"""
@@ -442,12 +432,12 @@ def test_stream_yields_committed_outputs_before_later_failure() -> None:
         """当前契约测试使用的 EmitThenFail 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(value=int)
-        output_ports = Ports(result=int, next=int)
+        inputs = {"value": int}
+        outputs = {"result": int, "next": int}
 
         def execute(self, inputs, context):
             """先输出终端结果，再把同一值交给失败节点。"""
@@ -459,12 +449,12 @@ def test_stream_yields_committed_outputs_before_later_failure() -> None:
         """当前契约测试使用的 Fail 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(value=int)
-        output_ports = Ports()
+        inputs = {"value": int}
+        outputs = {}
 
         def execute(self, inputs, context):
             """在上游输出已交付后抛出业务异常。"""
@@ -494,12 +484,12 @@ def test_active_stream_applies_bounded_backpressure() -> None:
         """当前契约测试使用的 Many 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(count=int)
-        output_ports = Ports(value=int)
+        inputs = {"count": int}
+        outputs = {"value": int}
 
         def execute(self, inputs, context):
             """按 count 依次产生 0..count-1 个 Output。"""
@@ -530,12 +520,12 @@ def test_unconsumed_stream_can_be_closed_without_blocking_execution() -> None:
         """当前契约测试使用的 Many 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(count=int)
-        output_ports = Ports(value=int)
+        inputs = {"count": int}
+        outputs = {"value": int}
 
         def execute(self, inputs, context):
             """按 count 依次产生 0..count-1 个 Output。"""
@@ -565,12 +555,12 @@ def test_close_releases_backpressure_of_unread_stream(target: str) -> None:
         """按 count 一次产生多项输出的节点。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(count=int)
-        output_ports = Ports(value=int)
+        inputs = {"count": int}
+        outputs = {"value": int}
 
         def execute(self, inputs, context):
             """按 count 依次产生 0..count-1 个 Output。"""
@@ -601,7 +591,7 @@ def test_close_releases_backpressure_of_unread_stream(target: str) -> None:
     closer.join(5)
     assert not closer.is_alive()
     assert failures == []
-    assert execution.status is ExecutionStatus.SUCCEEDED
+    assert execution.status is Execution.Status.SUCCEEDED
     assert list(stream) == [Output(value, "value") for value in range(5)]
 
 
@@ -612,13 +602,13 @@ def test_async_node_timeout_interrupts_awaitable() -> None:
         """当前契约测试使用的 Slow 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
             timeout: 超时秒数，None 表示不限制。
         """
 
-        input_ports = Ports(value=int)
-        output_ports = Ports(value=int)
+        inputs = {"value": int}
+        outputs = {"value": int}
         timeout = 0.02
 
         async def execute(self, inputs, context: Context) -> Output:
@@ -635,7 +625,7 @@ def test_async_node_timeout_interrupts_awaitable() -> None:
     with pytest.raises(NodeTimeoutError, match=r"timeout=0.02"):
         runtime.run("slow.graph", 1)
     assert time.monotonic() - started < 0.5
-    assert runtime.executions()[-1].status is ExecutionStatus.TIMED_OUT
+    assert runtime.executions()[-1].status is Execution.Status.TIMED_OUT
     runtime.close()
 
 
@@ -646,12 +636,12 @@ def test_none_timeouts_leave_slow_node_unlimited() -> None:
         """当前契约测试使用的 Slow 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(value=int)
-        output_ports = Ports(value=int)
+        inputs = {"value": int}
+        outputs = {"value": int}
 
         async def execute(self, inputs, context: Context) -> Output:
             """异步休眠 30 毫秒后原样输出。"""
@@ -676,12 +666,12 @@ def test_async_node_business_timeout_is_not_misclassified_as_control_timeout() -
         """当前契约测试使用的 Failing 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(value=int)
-        output_ports = Ports()
+        inputs = {"value": int}
+        outputs = {}
 
         async def execute(self, inputs, context: Context) -> None:
             """抛出业务自身的 TimeoutError，而非执行控制超时。"""
@@ -708,13 +698,13 @@ def test_graph_timeout_is_distinct_from_node_timeout() -> None:
         """当前契约测试使用的 SlowRelay 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
             timeout: 超时秒数，None 表示不限制。
         """
 
-        input_ports = Ports(value=int)
-        output_ports = Ports(value=int)
+        inputs = {"value": int}
+        outputs = {"value": int}
         timeout = 0.2
 
         async def execute(self, inputs, context: Context) -> Output:
@@ -747,12 +737,12 @@ def test_each_node_uses_its_own_timeout() -> None:
         """当前契约测试使用的 SlowRelay 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(value=int)
-        output_ports = Ports(value=int)
+        inputs = {"value": int}
+        outputs = {"value": int}
 
         async def execute(self, inputs, context: Context) -> Output:
             """异步休眠 20 毫秒后输出加一的值。"""
@@ -786,12 +776,12 @@ def test_graph_freeze_snapshots_node_timeout() -> None:
         """当前契约测试使用的 Slow 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(value=int)
-        output_ports = Ports(value=int)
+        inputs = {"value": int}
+        outputs = {"value": int}
 
         async def execute(self, inputs, context: Context) -> Output:
             """异步休眠 30 毫秒后原样输出。"""
@@ -818,13 +808,13 @@ def test_sync_node_can_observe_timeout_at_context_checkpoint() -> None:
         """当前契约测试使用的 Cooperative 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
             timeout: 超时秒数，None 表示不限制。
         """
 
-        input_ports = Ports(value=int)
-        output_ports = Ports(value=int)
+        inputs = {"value": int}
+        outputs = {"value": int}
         timeout = 0.02
 
         def execute(self, inputs, context: Context) -> Output:
@@ -851,13 +841,13 @@ def test_non_cooperative_sync_node_is_checked_when_it_returns() -> None:
         """当前契约测试使用的 Blocking 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
             timeout: 超时秒数，None 表示不限制。
         """
 
-        input_ports = Ports(value=int)
-        output_ports = Ports(value=int)
+        inputs = {"value": int}
+        outputs = {"value": int}
         timeout = 0.01
 
         def execute(self, inputs, context: Context) -> Output:
@@ -884,12 +874,12 @@ def test_execution_cancel_interrupts_async_node() -> None:
         """当前契约测试使用的 Waiting 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(value=int)
-        output_ports = Ports(value=int)
+        inputs = {"value": int}
+        outputs = {"value": int}
 
         async def execute(self, inputs, context: Context) -> Output:
             """异步等待 10 秒，用于在等待中被取消。"""
@@ -905,33 +895,33 @@ def test_execution_cancel_interrupts_async_node() -> None:
     )
     execution = runtime.start("waiting.graph", 1)
     deadline = time.monotonic() + 1
-    while execution.status is ExecutionStatus.PENDING:
+    while execution.status is Execution.Status.PENDING:
         assert time.monotonic() < deadline
         time.sleep(0.001)
 
     assert execution.cancel()
     with pytest.raises(ExecutionCancelledError):
         execution.result(1)
-    assert execution.status is ExecutionStatus.CANCELLED
+    assert execution.status is Execution.Status.CANCELLED
     assert execution.cancel_requested
     assert not execution.cancel()
     runtime.close()
 
 
-def test_control_timeout_bypasses_hook_business_error_recovery() -> None:
-    """验证控制超时不能被业务错误 Hook 恢复。"""
+def test_control_timeout_bypasses_middleware_error_recovery() -> None:
+    """验证控制超时不能被中间件的业务错误恢复吞掉。"""
 
     class Waiting(Node):
         """当前契约测试使用的 Waiting 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
             timeout: 超时秒数，None 表示不限制。
         """
 
-        input_ports = Ports(value=int)
-        output_ports = Ports(value=int)
+        inputs = {"value": int}
+        outputs = {"value": int}
         timeout = 0.02
 
         async def execute(self, inputs, context: Context) -> Output:
@@ -941,19 +931,20 @@ def test_control_timeout_bypasses_hook_business_error_recovery() -> None:
             await asyncio.sleep(1)
             return Output(inputs["value"], "value")
 
-    class Recover(NodeHook):
-        def error(self, call, error):
-            """在错误阶段执行回调，未恢复的异常继续传播。
+    def recover(call, call_next):
+        """捕获内层全部普通异常并以替代输出恢复。
 
-            Args:
-                call: Hook 当前处理的节点调用记录。
-                error: 需要传播、记录或用于恢复的异常。
+        Args:
+            call: 当前节点调用。
+            call_next: 调用内层的函数。
 
-            Returns:
-                同步调用或异步等待完成后的处理结果。
-            """
+        Returns:
+            内层输出，或失败时的替代输出。
+        """
 
-            del call, error
+        try:
+            return tuple(call_next(call))
+        except Exception:
             return (Output(99, "value"),)
 
     runtime = Runtime()
@@ -961,7 +952,7 @@ def test_control_timeout_bypasses_hook_business_error_recovery() -> None:
         "waiting.graph",
         Graph(entrypoint="waiting").add(waiting=Waiting()),
     )
-    runtime.attach(Recover(), graph="waiting.graph")
+    runtime.hooks.on(NODE_CALL, recover, graph="waiting.graph")
     with pytest.raises(NodeTimeoutError):
         runtime.run("waiting.graph", 1)
     runtime.close()
@@ -974,12 +965,12 @@ def test_arun_cancellation_cancels_underlying_execution() -> None:
         """当前契约测试使用的 Waiting 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(value=int)
-        output_ports = Ports(value=int)
+        inputs = {"value": int}
+        outputs = {"value": int}
 
         async def execute(self, inputs, context: Context) -> Output:
             """异步等待 10 秒，用于在等待中被取消。"""
@@ -1011,7 +1002,7 @@ def test_arun_cancellation_cancels_underlying_execution() -> None:
         runtime.close()
         return execution.status
 
-    assert asyncio.run(scenario()) is ExecutionStatus.CANCELLED
+    assert asyncio.run(scenario()) is Execution.Status.CANCELLED
 
 
 def test_queue_work_inherits_route_execution_limits() -> None:
@@ -1031,7 +1022,7 @@ def test_queue_work_inherits_route_execution_limits() -> None:
         runtime.wait_idle()
     execution = runtime.executions()[-1]
     assert execution.steps == 4
-    assert execution.status is ExecutionStatus.STEP_LIMITED
+    assert execution.status is Execution.Status.STEP_LIMITED
     runtime.close()
 
 
@@ -1045,12 +1036,12 @@ def test_wait_idle_tracks_synchronous_run_from_another_thread() -> None:
         """当前契约测试使用的 Blocking 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(value=int)
-        output_ports = Ports(value=int)
+        inputs = {"value": int}
+        outputs = {"value": int}
 
         def execute(self, inputs, context: Context) -> Output:
             """通知已进入后阻塞，直到测试放行或 1 秒到期。"""
@@ -1091,12 +1082,12 @@ def test_completed_execution_burst_is_trimmed_to_history_limit() -> None:
         """当前契约测试使用的 Block 替代实现。
 
         Attributes:
-            input_ports: 节点声明的输入端口及其类型。
-            output_ports: 节点声明的输出端口及其类型。
+            inputs: 节点声明的输入端口及其类型。
+            outputs: 节点声明的输出端口及其类型。
         """
 
-        input_ports = Ports(value=int)
-        output_ports = Ports()
+        inputs = {"value": int}
+        outputs = {}
 
         def execute(self, inputs, context: Context) -> None:
             """计数进入的并发执行，第三个到达时发信号，然后阻塞到放行。"""
@@ -1136,7 +1127,7 @@ def test_queued_unknown_graph_is_recorded_as_failed_execution() -> None:
         runtime.wait_idle()
     execution = runtime.executions()[-1]
     assert execution.graph == "missing.graph"
-    assert execution.status is ExecutionStatus.FAILED
+    assert execution.status is Execution.Status.FAILED
     assert isinstance(execution.error, InterlaceRuntimeError)
     runtime.close()
 
@@ -1170,9 +1161,8 @@ def execute_directly(graph: Graph, inputs: object = None) -> Execution:
 class Burst(Node):
     """启动时向 value 端口产出 0、1、2。"""
 
-    input_ports = Ports()
-    input_policy = InputPolicy.ON_START
-    output_ports = Ports(value=int)
+    inputs = {}
+    outputs = {"value": int}
 
     def execute(self, inputs, context: Context):
         """产出三项输出。"""
@@ -1188,9 +1178,9 @@ class Collect(Node):
         seen: 按触发顺序记录的输入值。
     """
 
-    input_ports = Ports(value=int)
-    output_ports = Ports(value=int)
-    input_policy = PolicyRef("example.test/selector")
+    inputs = {"value": int}
+    outputs = {"value": int}
+    input_policy = InputPolicy("example.test/selector")
 
     def __init__(self) -> None:
         """创建空的触发记录。"""
@@ -1208,13 +1198,11 @@ class Collect(Node):
 def selector_graph(selector: object, sink: Collect) -> Graph:
     """构造 Burst -> sink 的 Graph，并用给定 selector 冻结。"""
 
-    policies = PolicyRegistry()
-    policies.register("example.test/selector", selector)
     return (
         Graph(entrypoint="source")
         .add(source=Burst(), sink=sink)
         .connect("source", "sink", source_port="value", target_port="value")
-        .freeze(policies)
+        .freeze({"example.test/selector": selector})
     )
 
 
@@ -1285,7 +1273,7 @@ def test_selector_failures_are_attributed_to_graph_and_node(failure) -> None:
     assert isinstance(error, PolicySelectionError)
     assert (error.graph, error.node) == ("work", "sink")
     assert error.__cause__ is (cause if failure == "raises" else None)
-    assert execution.status is ExecutionStatus.FAILED
+    assert execution.status is Execution.Status.FAILED
     assert sink.seen == []
 
 
@@ -1296,9 +1284,8 @@ class Register(Node):
         register: 接收本次 Context 并注册回调的函数。
     """
 
-    input_ports = Ports()
-    input_policy = InputPolicy.ON_START
-    output_ports = Ports()
+    inputs = {}
+    outputs = {}
 
     def __init__(self, register) -> None:
         """保存注册函数。"""
@@ -1331,7 +1318,7 @@ def test_quiescence_runs_callbacks_registered_by_callbacks_in_order() -> None:
 
     execution = execute_directly(Graph(entrypoint="node").add(node=Register(register)))
 
-    assert execution.status is ExecutionStatus.SUCCEEDED
+    assert execution.status is Execution.Status.SUCCEEDED
     assert calls == ["first", "second", "nested"]
 
 
@@ -1382,8 +1369,8 @@ def test_quiescence_does_not_run_after_incomplete_inputs() -> None:
     class Pair(Node):
         """需要 left 与 right 同时就绪的节点。"""
 
-        input_ports = Ports(left=int, right=int)
-        output_ports = Ports()
+        inputs = {"left": int, "right": int}
+        outputs = {}
 
         def execute(self, inputs, context: Context) -> None:
             """不应被调用。"""
@@ -1393,9 +1380,8 @@ def test_quiescence_does_not_run_after_incomplete_inputs() -> None:
     class Source(Node):
         """只向 left 产出一项、right 不产出，并注册静止回调。"""
 
-        input_ports = Ports()
-        input_policy = InputPolicy.ON_START
-        output_ports = Ports(left=int, right=int)
+        inputs = {}
+        outputs = {"left": int, "right": int}
 
         def execute(self, inputs, context: Context) -> Output:
             """注册回调并产出半组输入。"""
@@ -1589,10 +1575,10 @@ def test_execution_errors_raised_outside_engine_wrapping_get_attribution() -> No
         """直接抛出领域侧 ExecutionError。
 
         Attributes:
-            input_ports: 整数输入端口。
+            inputs: 整数输入端口。
         """
 
-        input_ports = Ports(default=int)
+        inputs = {"default": int}
 
         def execute(self, inputs, context):
             """抛出未设置归属的 ExecutionError。"""
@@ -1708,7 +1694,7 @@ def test_cancellation_cleanup_failure_is_logged(caplog) -> None:
             assert entered.wait(5)
             execution.cancel()
             assert execution.wait(5)
-    assert execution.status is ExecutionStatus.CANCELLED
+    assert execution.status is Execution.Status.CANCELLED
     assert any(
         record.exc_info and str(record.exc_info[1]) == "cleanup broke"
         for record in caplog.records

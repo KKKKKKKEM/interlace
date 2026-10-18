@@ -17,7 +17,7 @@
 ### 第二部分：掌握运行语义
 
 3. [Graph 数据流](03-graph-dataflow.md)
-   Ports、Edge、InputPolicy、循环、冻结和 ExecutionPlan。
+   端口声明、Edge、InputPolicy、循环、冻结和 ExecutionPlan。
 4. [Event 与跨图工作流](04-events-and-workflows.md)
    Context.emit、事件路由、Work、观察者和 Slot 链路。
 5. [Execution、并发与失败](05-execution.md)
@@ -26,9 +26,9 @@
 ### 第三部分：理解和扩展系统
 
 6. [Runtime 内部架构](06-runtime-architecture.md)
-   Router、Worker、Backend、Executor 与 PluginHost 的组装和调用序列。
+   Router、Worker、Backend、Executor 与 PluginHost 的组装、钩子总线和调用序列。
 7. [插件、SPI 与适配器开发](07-plugins.md)
-   插件生命周期、能力贡献、后端协议、Hook 和 Observer。
+   两种钩子点、具名值与 capability 装饰链、`setup(api)` 与 `defer` 清理、后端协议与节点中间件。
 8. [编排模式](08-patterns.md)
    线性、分支汇聚、KeyedJoin、循环、事件路由、异步和输出流。
 9. [RPC 与可视化工作台](09-service-and-studio.md)
@@ -51,9 +51,8 @@
 
 ## 当前能力边界
 
-默认 Runtime 由 PluginHost 安装单进程 LocalRuntimePlugin：事件在内存中同步分发，路由后的 Graph 使用内存队列
-和线程池执行。它支持类型校验、Graph 冻结、命名队列并发、可独立替换的事件/任务传输与执行器，以及受控插件
-贡献；不提供持久化、broker
-消息确认、进程恢复、定时任务、死信队列或 exactly-once。
+默认 Runtime 由 PluginHost 安装两个内建插件：事件在内存中同步分发，路由后的 Graph 使用内存队列和线程池执行。
+它支持类型校验、Graph 冻结、命名队列并发、可独立替换或装饰的事件/任务传输、执行器与角色，以及统一的钩子点
+扩展；不提供持久化、broker 消息确认、进程恢复、定时任务、死信队列或 exactly-once。
 
 [开始阅读：第一章](01-design-philosophy.md)

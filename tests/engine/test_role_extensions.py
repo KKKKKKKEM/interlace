@@ -1,23 +1,24 @@
-"""角色与资源池无需继承默认实现即可替换的结构化契约测试。"""
+"""角色与资源池无需继承默认实现即可装饰或替换的结构化契约测试。"""
 
+import time
 from collections import deque
 from contextlib import contextmanager
 from threading import Condition, RLock
-import time
 
 import pytest
 
-from interlace import Graph, Node, Output, Runtime, Slot, SlotPool
+from interlace import Graph, Node, Output, Runtime
+from interlace.engine import Slot, SlotPool
 from interlace.adapters import memory
 from interlace.engine.observation import RuntimeEvent
-from interlace.engine.policies import PolicyRef
+from interlace.engine import InputPolicy
 from interlace.plugins import (
     CAP_EVENT_ROUTER,
     CAP_GRAPH_WORKER,
-    ContributionPlugin,
-    NodeHookContribution,
     PluginDescriptor,
+    plugin,
 )
+from interlace.plugins.points import NODE_CALL, RUNTIME_EVENT
 from interlace.runtime import EventRouter, GraphWorker
 from interlace.spi import RouterRole, SlotProvider, WorkerRole
 
@@ -60,12 +61,12 @@ class RouterWrapper:
     def publish(self, event):
         """将事件原样交给被包装路由角色的 publish。"""
 
-        self.router.publish(event)
+        return self.router.publish(event)
 
-    def observe_runtime(self, observer):
-        """将运行时观察者转交给被包装的路由角色注册并返回其结果。"""
+    def publish_local(self, event, lease):
+        """将事件与 Slot lease 原样交给被包装路由角色的 publish_local。"""
 
-        return self.router.observe_runtime(observer)
+        return self.router.publish_local(event, lease)
 
     def wait_idle(self, timeout=None):
         """以相同 timeout 等待被包装路由角色进入空闲。"""
@@ -134,30 +135,15 @@ class WorkerWrapper:
 
         return self.worker.executions()
 
-    def attach(self, *args, **kwargs):
-        """将扩展回调注册转发给被包装的执行器角色并返回其卸载句柄。"""
-
-        return self.worker.attach(*args, **kwargs)
-
-    def contribute_hook(self, *args, **kwargs):
-        """将节点 Hook 贡献转发给被包装的执行器角色并返回其卸载函数。"""
-
-        return self.worker.contribute_hook(*args, **kwargs)
-
-    def register_policy(self, *args, **kwargs):
-        """将输入选择策略注册转发给被包装的执行器角色。"""
-
-        return self.worker.register_policy(*args, **kwargs)
-
-    def observe_runtime(self, observer):
-        """将运行时观察者转交给被包装的执行器角色注册并返回其结果。"""
-
-        return self.worker.observe_runtime(observer)
-
     def wait_idle(self, timeout=None):
         """以相同 timeout 等待被包装执行器角色进入空闲。"""
 
         self.worker.wait_idle(timeout)
+
+    def begin_close(self):
+        """转发关闭前的预备。"""
+
+        self.worker.begin_close()
 
     def close(self):
         """标记包装器已关闭，再关闭被包装的执行器角色。"""
@@ -176,63 +162,52 @@ class Echo(Node):
 
 
 @pytest.mark.parametrize("wrapped", ["router", "worker", "both"])
-@pytest.mark.parametrize("plugin", [False, True])
-def test_roles_can_be_independently_decorated_and_composed_without_inheritance(
-    wrapped, plugin
-):
-    """验证包装 router、worker 或两者后，经直接注入或插件装配均可运行并被 Runtime 关闭。
+def test_roles_can_be_independently_decorated_without_inheritance(wrapped):
+    """经 wraps 装饰默认 router、worker 或两者后照常运行，Runtime 关闭装饰后的角色。
 
     Args:
-        wrapped: 替换为包装器的角色，取值 router、worker 或 both。
-        plugin: 为 True 时通过插件提供角色，否则直接传给 Runtime 构造函数。
+        wrapped: 被装饰的角色，取值 router、worker 或 both。
     """
 
-    tasks = memory.TaskBackend()
-    router = EventRouter(publisher=tasks)
-    worker = GraphWorker(
-        consumer=tasks, emit=router.publish, emit_local=router.publish_local
-    )
-    selected_router = RouterWrapper(router) if wrapped in ("router", "both") else router
-    selected_worker = WorkerWrapper(worker) if wrapped in ("worker", "both") else worker
-    assert isinstance(selected_router, RouterRole)
-    assert isinstance(selected_worker, WorkerRole)
+    wraps = {
+        "router": (CAP_EVENT_ROUTER,),
+        "worker": (CAP_GRAPH_WORKER,),
+        "both": (CAP_EVENT_ROUTER, CAP_GRAPH_WORKER),
+    }[wrapped]
+    created: list[object] = []
 
-    class Roles:
-        """通过插件 capability 提供本用例所选路由与执行器角色的插件。
+    def decorate(wrapper):
+        """返回记录所创建包装器的装饰函数。"""
 
-        Attributes:
-            descriptor: 声明提供 CAP_EVENT_ROUTER 与 CAP_GRAPH_WORKER 的插件描述。
+        def apply(inner):
+            """包装内层角色。"""
+
+            created.append(wrapper(inner))
+            return created[-1]
+
+        return apply
+
+    @plugin("example/wrappers", wraps=wraps)
+    def wrappers(api):
+        """装饰所选角色。
+
+        Args:
+            api: 绑定插件身份的扩展接口。
         """
 
-        descriptor = PluginDescriptor(
-            "example/roles", "1", provides=(CAP_EVENT_ROUTER, CAP_GRAPH_WORKER)
-        )
+        if CAP_EVENT_ROUTER in wraps:
+            api.wrap(CAP_EVENT_ROUTER, decorate(RouterWrapper))
+        if CAP_GRAPH_WORKER in wraps:
+            api.wrap(CAP_GRAPH_WORKER, decorate(WorkerWrapper))
 
-        def setup(self, context):
-            """将所选的路由与执行器角色登记为对应 capability。"""
-
-            context.provide(CAP_EVENT_ROUTER, selected_router)
-            context.provide(CAP_GRAPH_WORKER, selected_worker)
-
-        def start(self, context):
-            """启动阶段无需额外操作。"""
-
-            pass
-
-        def stop(self, context):
-            """先关闭所选执行器角色，再关闭所选路由角色。"""
-
-            selected_worker.close()
-            selected_router.close()
-
-    runtime = (
-        Runtime(plugins=(Roles(),))
-        if plugin
-        else Runtime(router=selected_router, worker=selected_worker)
-    )
+    runtime = Runtime(plugins=(wrappers,))
     observations: list[RuntimeEvent] = []
     try:
-        runtime.observe_runtime(lambda event: observations.append(event))
+        assert isinstance(runtime.router, RouterRole)
+        assert isinstance(runtime.worker, WorkerRole)
+        assert (runtime.router in created) == (CAP_EVENT_ROUTER in wraps)
+        assert (runtime.worker in created) == (CAP_GRAPH_WORKER in wraps)
+        runtime.hooks.on(RUNTIME_EVENT, observations.append)
         runtime.register("echo", Graph(entrypoint="node").add(node=Echo()))
         assert runtime.run("echo", 1) == (Output(1),)
         assert tuple(runtime.iter("echo", 2)) == (Output(2),)
@@ -243,21 +218,13 @@ def test_roles_can_be_independently_decorated_and_composed_without_inheritance(
         assert observations
     finally:
         runtime.close()
-        tasks.close()
-    if wrapped in ("router", "both"):
-        assert isinstance(selected_router, RouterWrapper)
-        assert selected_router.closed
-    if wrapped in ("worker", "both"):
-        assert isinstance(selected_worker, WorkerWrapper)
-        assert selected_worker.closed
+    assert created and all(wrapper.closed for wrapper in created)
 
 
-def test_role_plugins_install_contributions_before_start() -> None:
-    """验证替代角色在插件启动前取得 selector、延迟 Hook 和观察者贡献。"""
+def test_replacement_roles_share_runtime_hooks_and_named_values() -> None:
+    """在 setup 中以 api.hooks 组装的替代角色，能使用其他插件提供的 selector、中间件与观察者。"""
 
     tasks = memory.TaskBackend()
-    router = RouterWrapper(EventRouter(publisher=tasks))
-    worker = WorkerWrapper(GraphWorker(consumer=tasks, emit=router.publish))
     observed: list[RuntimeEvent] = []
 
     class Selector:
@@ -285,85 +252,69 @@ def test_role_plugins_install_contributions_before_start() -> None:
             input_policy: 由贡献插件提供的具名选择策略。
         """
 
-        input_policy = PolicyRef("example/first")
+        input_policy = InputPolicy("example/first")
 
     class Roles:
-        """提供非继承角色，并在启动时注册依赖贡献的 Graph。
+        """以宿主钩子总线组装非继承角色，并在 runtime.started 时注册依赖 selector 的 Graph。
 
         Attributes:
             descriptor: 当前插件提供的角色 capability。
+            router: setup 后创建的路由包装器。
+            worker: setup 后创建的执行器包装器。
         """
 
         descriptor = PluginDescriptor(
-            "example/roles", "1", provides=(CAP_EVENT_ROUTER, CAP_GRAPH_WORKER)
+            "example/roles", provides=(CAP_EVENT_ROUTER, CAP_GRAPH_WORKER)
         )
 
-        def setup(self, context):
-            """提供本次测试使用的公开角色。
+        def setup(self, api):
+            """用宿主钩子总线组装并提供角色，订阅 runtime.started 注册 Graph。
 
             Args:
-                context: 宿主提供的能力注册上下文。
+                api: 绑定插件身份的扩展接口。
             """
 
-            context.provide(CAP_EVENT_ROUTER, router)
-            context.provide(CAP_GRAPH_WORKER, worker)
-
-        def start(self, context):
-            """在启动阶段注册使用插件 selector 的 echo Graph，验证 selector 已可用于冻结。"""
-
-            del context
-            worker.register("echo", Graph(entrypoint="node").add(node=SelectedEcho()))
-
-        def stop(self, context):
-            """关闭本插件提供的执行器与路由包装器。"""
-
-            del context
-            worker.close()
-            router.close()
-
-    contributions = ContributionPlugin(
-        "example/features",
-        selectors={"example/first": Selector()},
-        hooks={
-            "example/double": NodeHookContribution(
-                lambda call, output: Output(output.value * 2, output.port),
-                phase="exit",
-                graph="echo",
-                node="node",
+            self.router = RouterWrapper(EventRouter(publisher=tasks, hooks=api.hooks))
+            self.worker = WorkerWrapper(
+                GraphWorker(consumer=tasks, emit=self.router.publish, hooks=api.hooks)
             )
-        },
-        observers={"example/trace": observed.append},
-    )
-    try:
-        with Runtime(plugins=(Roles(), contributions)) as runtime:
-            assert runtime.run("echo", 3) == (Output(6),)
-            runtime.emit("example/observed", 1)
-        assert observed
-        assert any(event.event_type == "example/observed" for event in observed)
-    finally:
-        tasks.close()
-        worker.close()
-        router.close()
+            api.provide(CAP_EVENT_ROUTER, self.router)
+            api.provide(CAP_GRAPH_WORKER, self.worker)
+            api.on(RUNTIME_EVENT, self.started, kind="runtime.started")
 
+        def started(self, event):
+            """全部插件装配完成后注册使用插件 selector 的 echo Graph，验证 selector 已可用于冻结。"""
 
-def test_deferred_hook_can_be_detached_before_graph_registration() -> None:
-    """验证提前注销延迟 Hook 后注册同名 Graph 不会重新激活该 Hook。"""
+            del event
+            self.worker.register(
+                "echo", Graph(entrypoint="node").add(node=SelectedEcho())
+            )
 
-    tasks = memory.TaskBackend()
-    worker = GraphWorker(consumer=tasks)
-    try:
-        detach = worker.contribute_hook(
-            lambda call, output: Output(output.value * 2),
-            phase="exit",
+    @plugin("example/features")
+    def features(api):
+        """提供 selector，登记节点中间件与生命周期观察者。
+
+        Args:
+            api: 绑定插件身份的扩展接口。
+        """
+
+        api.provide("example/first", Selector())
+        api.on(
+            NODE_CALL,
+            lambda call, call_next: tuple(
+                Output(output.value * 2, output.port) for output in call_next(call)
+            ),
             graph="echo",
             node="node",
         )
-        detach()
-        detach()
-        worker.register("echo", Graph(entrypoint="node").add(node=Echo()))
-        assert worker.start("echo", 3).result() == (Output(3),)
+        api.on(RUNTIME_EVENT, observed.append)
+
+    try:
+        with Runtime(plugins=(Roles(), features)) as runtime:
+            assert runtime.run("echo", 3) == (Output(6),)
+            runtime.emit("example/observed", 1)
+        assert any(event.event_type == "example/observed" for event in observed)
     finally:
-        worker.close()
         tasks.close()
 
 

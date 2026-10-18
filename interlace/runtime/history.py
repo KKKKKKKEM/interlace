@@ -69,7 +69,7 @@ class _ExecutionHistory:
             self._records[execution.id] = execution
             self._active[execution.id] = execution
             if self._unbounded:
-                execution._release_backpressure()
+                execution.release_backpressure()
             self._trim_locked()
 
     def finish(self, execution: Execution) -> None:
@@ -90,7 +90,7 @@ class _ExecutionHistory:
             self._unbounded = True
             active = tuple(self._active.values())
         for execution in active:
-            execution._release_backpressure()
+            execution.release_backpressure()
 
     def get(self, execution_id: str) -> Execution:
         """按 ID 读取保留的执行。

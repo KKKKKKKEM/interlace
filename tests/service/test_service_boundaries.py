@@ -18,9 +18,12 @@ pytest.importorskip("jsonrpcserver")
 
 from fastapi.testclient import TestClient
 
-from interlace import ExecutionStatus, Graph, Node, Output, Runtime
+from interlace import Graph, Node, Output, Runtime
+from interlace.engine import Execution
 from interlace.engine.errors import ExecutionError
+from interlace.engine.execution import ExecutionStatus
 from interlace.engine.observation import RuntimeEvent, RuntimeEventKind
+from interlace.plugins.points import RUNTIME_EVENT
 from interlace.service import GraphService, NodeCatalog, RunRequest
 from interlace.service.http import (
     RPC_CAPACITY_EXCEEDED,
@@ -491,7 +494,7 @@ def test_finished_event_status_is_recorded_before_handle_turns_terminal(
                 )
             )
 
-    handle = runtime.observe_runtime(after_service)
+    handle = runtime.hooks.on(RUNTIME_EVENT, after_service)
     succeeded = runtime.start("echo", "value")
     succeeded.result()
     failed = runtime.start("broken", None)
@@ -500,7 +503,7 @@ def test_finished_event_status_is_recorded_before_handle_turns_terminal(
     runtime.wait_idle()
     handle.detach()
     service.close()
-    assert [status for status, _ in seen] == [ExecutionStatus.RUNNING] * 2
+    assert [status for status, _ in seen] == [Execution.Status.RUNNING] * 2
     assert [(item["status"], item["done"]) for _, item in seen] == [
         ("succeeded", True),
         ("failed", True),
@@ -615,27 +618,33 @@ def test_constructor_failure_before_registration_allows_rebuild(
     root = logging.getLogger()
     handlers = tuple(root.handlers)
     with Runtime() as runtime:
-        original = runtime.observe_runtime
+        original = runtime.hooks.on
 
-        def reject(observer: Any) -> Any:
-            """拒绝观察注册。
+        def reject(point: Any, handler: Any, /, **scope: Any) -> Any:
+            """拒绝生命周期观察登记，其他登记照常进行。
 
             Args:
-                observer: 服务观察回调。
+                point: 登记的钩子点。
+                handler: 处理函数。
+                **scope: 作用域过滤条件。
+
+            Returns:
+                其他钩子点的登记句柄。
 
             Raises:
-                RuntimeError: 模拟安装失败。
+                RuntimeError: 登记 RUNTIME_EVENT 时模拟安装失败。
             """
 
-            del observer
-            raise RuntimeError("observer rejected")
+            if point is RUNTIME_EVENT:
+                raise RuntimeError("observer rejected")
+            return original(point, handler, **scope)
 
-        monkeypatch.setattr(runtime, "observe_runtime", reject)
+        monkeypatch.setattr(runtime.hooks, "on", reject)
         with pytest.raises(RuntimeError, match="observer rejected"):
             GraphService(runtime, nodes=catalog(), database=database)
         assert "saved@v1" not in runtime.graphs()
         assert tuple(root.handlers) == handlers
-        monkeypatch.setattr(runtime, "observe_runtime", original)
+        monkeypatch.setattr(runtime.hooks, "on", original)
         service = GraphService(runtime, nodes=catalog(), database=database)
         assert runtime.run("saved@v1", 5)[0].value == 5
         runtime.wait_idle()
@@ -709,7 +718,7 @@ def test_redelivered_work_history_keeps_only_latest_attempt() -> None:
     """同一 Work.id 重投递后，历史输出与快照只反映最新一次尝试，不混杂旧尝试。"""
 
     from interlace.adapters import memory
-    from interlace.runtime import EventRouter, GraphWorker
+    from interlace.runtime import LocalInfrastructurePlugin
     from interlace.spi import Work
 
     attempts: list[int] = []
@@ -740,8 +749,7 @@ def test_redelivered_work_history_keeps_only_latest_attempt() -> None:
             yield Output("B2")
 
     tasks = memory.TaskBackend()
-    worker = GraphWorker(consumer=tasks)
-    runtime = Runtime(router=EventRouter(publisher=tasks), worker=worker)
+    runtime = Runtime(plugins=(LocalInfrastructurePlugin(tasks=tasks),))
     runtime.register("attempt", Graph(entrypoint="attempt").add(attempt=Attempt()))
     runtime.consume("attempt")
     work = Work("attempt")

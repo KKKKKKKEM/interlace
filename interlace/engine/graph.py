@@ -12,10 +12,10 @@ from types import MappingProxyType
 from typing import Any, TypeVar, overload
 
 from .._validation import require_non_empty_string
-from .core import InputPolicy, Node, Ports
+from .core import ALL_POLICY, InputPolicy, Node, Ports
 from .errors import GraphError, GraphFrozenError, GraphValidationError
 from .events import Context, ContextFactory
-from .policies import ALL_POLICY, BoundPolicy, PolicyRef, PolicyRegistry
+from .policies import BoundPolicy, InputSelector, bind_policy
 
 _G = TypeVar("_G", bound="Graph")  # 快捷构建保留调用方 Graph 子类的返回类型。
 
@@ -52,13 +52,13 @@ class NodeSpec:
     Attributes:
         input_ports: 冻结时读取的输入端口声明。
         output_ports: 冻结时读取的输出端口声明。
-        input_policy: 冻结时绑定的策略引用与 selector 快照。
+        input_policy: 冻结时绑定的策略与 selector 快照；没有输入端口的源节点为 None。
         timeout: 单次 firing 超时秒数，None 表示不限制。
     """
 
     input_ports: Ports
     output_ports: Ports
-    input_policy: BoundPolicy
+    input_policy: BoundPolicy | None
     timeout: float | None
 
 
@@ -109,7 +109,8 @@ def _starved_all_node(
         incoming[edge.target].add(edge.target_port)
     for node_id in nodes:
         spec = specs[node_id]
-        if node_id == entrypoint or spec.input_policy.ref.name != ALL_POLICY:
+        policy = spec.input_policy
+        if node_id == entrypoint or policy is None or policy.policy.name != ALL_POLICY:
             continue
         missing = set(spec.input_ports) - incoming[node_id]
         if missing:
@@ -664,63 +665,66 @@ class Graph:
         entrypoint: str | None = None,
         edges: Iterable[Edge] | None = None,
         outputs: Iterable[tuple[str, str]] | None = None,
-        policies: PolicyRegistry | None = None,
+        selectors: Mapping[str, InputSelector] | None = None,
     ) -> ExecutionPlan:
         """选择由原有节点和边组成的严格执行子图。
 
-        未选节点不会执行，也不会自动连接其前后节点。Graph 尚未冻结时先用 policies
+        未选节点不会执行，也不会自动连接其前后节点。Graph 尚未冻结时先用 selectors
         冻结，保证计划引用的定义之后不再变化；已冻结的 Graph 保留冻结时绑定的策略，
-        此时传入 policies 会被拒绝。
+        此时传入 selectors 会被拒绝。
 
         Args:
             include: 计划保留的节点 ID 集合。
             entrypoint: 所选节点中的执行入口，None 使用原图入口。
             edges: 明确保留的原图连接，None 使用所选节点间全部原有连接。
             outputs: 预期完整出口集合，None 不额外校验；不改变输出交付。
-            policies: 冻结未冻结 Graph 时使用的策略注册表，None 只使用内建策略。
+            selectors: 冻结未冻结 Graph 时使用的具名 selector 快照，None 只使用内建策略。
 
         Returns:
             新建的 ExecutionPlan。
 
         Raises:
-            ValueError: Graph 已冻结且 policies 不为 None，或 entrypoint 为空。
-            TypeError: policies 不是 PolicyRegistry，或计划参数类型不合法。
+            ValueError: Graph 已冻结且 selectors 不为 None，或 entrypoint 为空。
+            TypeError: selectors 不是映射，或计划参数类型不合法。
             GraphValidationError: 冻结校验失败，或节点选择不满足 ExecutionPlan 约束。
         """
 
         with self._lock:
             if not self._frozen:
-                self.freeze(policies)
-            elif policies is not None:
+                self.freeze(selectors)
+            elif selectors is not None:
                 raise ValueError(
-                    "policies cannot be applied to an already frozen Graph"
+                    "selectors cannot be applied to an already frozen Graph"
                 )
         return ExecutionPlan(
             self, include, entrypoint=entrypoint, edges=edges, outputs=outputs
         )
 
-    def freeze(self, policies: PolicyRegistry | None = None) -> Graph:
+    def freeze(self, selectors: Mapping[str, InputSelector] | None = None) -> Graph:
         """校验并冻结 Graph；已冻结时直接返回，不重新绑定策略。
 
         Args:
-            policies: 绑定输入策略的注册表，None 只使用内建策略。
+            selectors: 按名称查找具名输入策略 selector 的快照，None 只使用内建策略；
+                Runtime 传入 ``hooks.provided()``。
 
         Returns:
             已冻结的当前 Graph。
 
         Raises:
-            TypeError: policies 不是 PolicyRegistry。
+            TypeError: selectors 不是映射。
             GraphValidationError: 节点、端口、策略、连接或可达性不合法。
         """
 
         with self._lock:
             if self._frozen:
                 return self
-            if policies is None:
-                policies = PolicyRegistry()
-            if not isinstance(policies, PolicyRegistry):
-                raise TypeError("policies must be a PolicyRegistry or None")
-            self._node_specs = self._validate_structure(policies)
+            if selectors is None:
+                selectors = {}
+            if not isinstance(selectors, Mapping):
+                raise TypeError("selectors must be a mapping or None")
+            self._node_specs = self._validate_structure(
+                MappingProxyType(dict(selectors))
+            )
             self._frozen_edges = tuple(self._edges)
             self._outgoing = MappingProxyType(_outgoing_index(self._frozen_edges))
             self._frozen = True
@@ -768,7 +772,9 @@ class Graph:
         self._ensure_frozen()
         return self._outgoing.get((node_id, port), ())
 
-    def _validate_structure(self, policies: PolicyRegistry) -> dict[str, NodeSpec]:
+    def _validate_structure(
+        self, selectors: Mapping[str, InputSelector]
+    ) -> dict[str, NodeSpec]:
         """执行冻结前的完整静态校验，返回各节点的执行元数据。
 
         Raises:
@@ -780,7 +786,7 @@ class Graph:
         if self._entrypoint not in self._nodes:
             raise GraphValidationError("graph entrypoint must reference a node")
         specs = {
-            node_id: self._node_spec(node_id, node, policies)
+            node_id: self._node_spec(node_id, node, selectors)
             for node_id, node in self._nodes.items()
         }
         self._validate_edges(specs)
@@ -799,18 +805,18 @@ class Graph:
         return specs
 
     @staticmethod
-    def _node_spec(node_id: str, node: Node, policies: PolicyRegistry) -> NodeSpec:
+    def _node_spec(
+        node_id: str, node: Node, selectors: Mapping[str, InputSelector]
+    ) -> NodeSpec:
         """读取并校验单个 Node 的端口、超时与输入策略，生成冻结快照。"""
 
-        inputs = node.input_ports
-        outputs = node.output_ports
+        inputs = Graph._ports(node_id, "inputs", node.inputs)
+        outputs = Graph._ports(node_id, "outputs", node.outputs)
         policy = node.input_policy
         timeout = node.timeout
-        if not isinstance(inputs, Ports) or not isinstance(outputs, Ports):
-            raise GraphValidationError(f"node {node_id!r} ports must be Ports")
-        if not isinstance(policy, (InputPolicy, PolicyRef)):
+        if not isinstance(policy, InputPolicy):
             raise GraphValidationError(
-                f"node {node_id!r} input_policy must be InputPolicy or PolicyRef"
+                f"node {node_id!r} input_policy must be InputPolicy"
             )
         if timeout is not None:
             if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
@@ -821,21 +827,30 @@ class Graph:
                 raise GraphValidationError(
                     f"node {node_id!r} timeout must be finite and greater than zero"
                 )
+        if not inputs:
+            return NodeSpec(inputs, outputs, None, timeout)
         try:
-            bound_policy = policies.bind(policy)
+            bound_policy = bind_policy(policy, selectors)
         except (TypeError, ValueError) as exc:
             raise GraphValidationError(
                 f"node {node_id!r} has invalid input policy: {exc}"
             ) from exc
-        if bound_policy.on_start and inputs:
-            raise GraphValidationError(
-                f"node {node_id!r} on_start policy requires zero inputs"
-            )
-        if not bound_policy.on_start and not inputs:
-            raise GraphValidationError(
-                f"zero-input node {node_id!r} must use InputPolicy.ON_START"
-            )
         return NodeSpec(inputs, outputs, bound_policy, timeout)
+
+    @staticmethod
+    def _ports(node_id: str, label: str, declared: object) -> Ports:
+        """把节点声明的端口映射转换为冻结快照中的不可变端口集合。"""
+
+        if not isinstance(declared, Mapping) or not all(
+            isinstance(name, str) for name in declared
+        ):
+            raise GraphValidationError(
+                f"node {node_id!r} {label} must be a mapping of port names to types"
+            )
+        try:
+            return Ports(**declared)
+        except (TypeError, ValueError) as exc:
+            raise GraphValidationError(f"node {node_id!r} {label}: {exc}") from exc
 
     def _validate_edges(self, specs: Mapping[str, NodeSpec]) -> None:
         """校验每条边引用已有节点、已声明端口，且源类型兼容目标类型。"""

@@ -63,12 +63,12 @@ Engine 等待，再按相同的 Output 契约处理结果。
 ## 最小示例
 
 ```python
-from interlace import Graph, Node, Output, Ports, Runtime
+from interlace import Graph, Node, Output, Runtime
 
 
 class Upper(Node):
-    input_ports = Ports(text=str)
-    output_ports = Ports(result=str)
+    inputs = {"text": str}
+    outputs = {"result": str}
     timeout = 5
 
     def execute(self, inputs, context):

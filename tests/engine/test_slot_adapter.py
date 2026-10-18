@@ -6,7 +6,8 @@ from contextlib import contextmanager
 
 import pytest
 
-from interlace import Event, Graph, Node, Runtime, SlotPool
+from interlace import Event, Graph, Node, Runtime
+from interlace.engine import SlotPool
 from interlace.adapters import memory
 from interlace.adapters.memory import EventBus
 from interlace.runtime import EventRouter, GraphWorker
@@ -267,11 +268,12 @@ class PumpTasks:
 
 
 @pytest.mark.parametrize("failure", [None, "graph", "publication"])
-def test_independent_adapter_preserves_chain_and_recovers_pool(failure):
+def test_independent_adapter_preserves_chain_and_recovers_pool(failure, roles_plugin):
     """验证独立适配器保留执行链并最终归还资源池。
 
     Args:
         failure: 先前已经记录的失败，None 表示没有失败。
+        roles_plugin: 把现成角色作为插件提供的工厂。
     """
 
     tasks = PumpTasks()
@@ -304,7 +306,7 @@ def test_independent_adapter_preserves_chain_and_recovers_pool(failure):
     worker = GraphWorker(
         consumer=tasks, emit=router.publish, emit_local=router.publish_local
     )
-    runtime = Runtime(router=router, worker=worker)
+    runtime = Runtime(plugins=(roles_plugin(router, worker),))
     try:
         runtime.register("source", Graph(entrypoint="node").add(node=Source()))
         runtime.register("target", Graph(entrypoint="node").add(node=Target()))

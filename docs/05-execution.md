@@ -98,8 +98,8 @@ class AirContext(Context):
 不会自动沿 Event 传播，目标图使用自己的工厂和配置；进程边界只传递可序列化任务数据。
 
 工厂执行计入节点步数和超时；错误保留原始异常链和节点位置，控制异常直接传播。同步工厂仍遵循协作式取消，
-可以调用 `base.checkpoint()`；异步和生成器工厂会被拒绝，耗时业务应放入 Node。工厂失败发生在 Hook 调用前，
-不会进入 NodeHook.error 恢复路径。替代 GraphExecutor 也必须调用图上配置的工厂并保持这些边界。
+可以调用 `base.checkpoint()`；异步和生成器工厂会被拒绝，耗时业务应放入 Node。工厂失败发生在节点中间件调用前，
+不会进入中间件的恢复路径。替代 GraphExecutor 也必须调用图上配置的工厂并保持这些边界。
 
 完整示例见 [domain_context.py](../examples/domain_context.py)：两个节点各自创建领域 Context，通过 CrawlData
 携带 seed 与 request，执行时不访问网络。
@@ -157,7 +157,8 @@ import pickle
 import tempfile
 from array import array
 
-from interlace import Execution, Output, Runtime
+from interlace import Output, Runtime
+from interlace.engine import Execution
 from interlace.runtime import LocalRuntimePlugin
 
 
@@ -290,11 +291,13 @@ Node 失败、取消、超时、步数限制、残留输入或 Hook 以 `StopGra
 
 ## Slot 与逻辑并发
 
-不传 `slots` 时，`consume()` 自动创建一个大小等于 `concurrency` 的池；显式传入同一个池即可让多个 Consumer
-共享逻辑执行槽：
+不传 `slots` 时，`consume()` 与 `on()` 自动创建一个大小等于 `concurrency` 的池；传入整数创建该大小的自有池，
+与 `concurrency` 互相独立。需要让多个 Consumer 共享逻辑执行槽时，显式传入同一个池：
 
 ```python
-from interlace import SlotPool
+from interlace.engine import SlotPool
+
+runtime.on("crawl.page", graph="page", queue="pages", concurrency=8, slots=2)
 
 slots = SlotPool(size=10)
 runtime.consume("requests", concurrency=20, slots=slots)
@@ -345,13 +348,14 @@ SlotPool 的生命周期由创建者管理；自动池由 GraphWorker 关闭。
 | `observe()` 观察者失败 | 记录日志，不影响 `emit()` 或业务结果 |
 | 队列中异步 Graph 失败 | 下一次 `wait_idle()` 抛出该失败 |
 
-`NodeHook.error` 只接收 Node 或内层 Hook 的业务异常。执行控制异常与 Engine 契约错误（`HookExecutionError`、
-`InvalidOutputError`、`PortValueTypeError`、`PolicySelectionError`）不会交给 Hook 恢复，而是直接传播。
+`NODE_CALL` 中间件可以恢复 Node 或内层中间件的业务异常；执行控制异常、Engine 契约错误（`HookExecutionError`、
+`InvalidOutputError`、`PortValueTypeError`、`PolicySelectionError`）与 `StopGraph` 即使被中间件捕获也会重新抛出。
 `StopGraph` 携带的输出按停止节点声明的 output port 与类型校验，违反时同样以上述契约错误失败。
 
-生命周期观察者在发布事件的线程上同步运行，失败只写日志。`execution.finished` 先于 Execution 写入终态发布：
-观察者应从事件的 `status` 与 `error_type` 读取结果，此时 `execution.status` 可能仍为 `RUNNING`。异步任务没有自动
-重试；一次 `wait_idle()` 已报告的队列失败会被消费，不会在下一次等待时重复报告。
+`RUNTIME_EVENT` 处理函数在发布事实的线程上同步运行，失败只写日志。`execution.finished` 先于 Execution 写入终态发布：
+处理函数应从事件的 `status` 与 `error_type` 读取结果，此时 `execution.status` 可能仍为 `RUNNING`。核心不自动重试；
+需要重投的队列交付由 `WORK_DELIVER` 中间件明确返回 `retry`。一次 `wait_idle()` 已报告的队列失败会被消费，不会在
+下一次等待时重复报告。
 
 ## 生命周期
 

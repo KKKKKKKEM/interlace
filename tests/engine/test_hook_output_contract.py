@@ -1,9 +1,10 @@
-"""逐项 Hook 输出转换、惰性恢复和资源关闭的契约测试。"""
+"""NODE_CALL 中间件的逐项输出改写、惰性恢复、控制异常与资源关闭契约测试。"""
 
 from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterable, Iterator, Mapping
+from contextlib import closing
 from threading import Event as ThreadEvent
 from threading import get_ident
 from typing import Any
@@ -18,7 +19,7 @@ from interlace.engine.errors import (
     NodeTimeoutError,
     StepLimitExceededError,
 )
-from interlace.engine.hooks import NodeCall, NodeHook, Outputs, StopGraph
+from interlace.plugins.points import NODE_CALL, NodeCall, Outputs, StopGraph
 
 
 class CloseTrackedCursor(Iterator[Output]):
@@ -60,8 +61,10 @@ class CloseTrackedCursor(Iterator[Output]):
         self.close_calls += 1
 
 
-def test_async_item_hooks_recover_original_generator_error_off_source_thread() -> None:
-    """异步逐项转换与恢复共享异步线程，同步生成器保留独立线程和原始异常。"""
+def test_middleware_waits_async_work_off_source_thread_and_recovers_original_error() -> (
+    None
+):
+    """中间件经 call.wait 在异步线程完成转换与恢复，同步生成器保留独立线程和原始异常。"""
 
     source_threads: list[int] = []
     hook_threads: list[int] = []
@@ -94,46 +97,56 @@ def test_async_item_hooks_recover_original_generator_error_off_source_thread() -
             source_threads.append(get_ident())
             raise domain_error
 
-    class Recover(NodeHook):
-        """异步转换输出，并按原始异常身份提供恢复输出。"""
+    async def convert(value: int) -> Output:
+        """在异步循环中转换单项输出。
 
-        async def exit(self, call: NodeCall, output: Output) -> Output:
-            """在异步循环中对当前单项输出进行转换。
+        Args:
+            value: 当前输出值。
 
-            Args:
-                call: 当前节点调用身份，本场景不修改。
-                output: Engine 已经读取的当前输出。
+        Returns:
+            数值扩大十倍的新输出。
+        """
 
-            Returns:
-                数值扩大十倍的新输出。
-            """
+        await asyncio.sleep(0)
+        hook_threads.append(get_ident())
+        converted.append(value)
+        return Output(value * 10)
 
-            del call
-            await asyncio.sleep(0)
-            hook_threads.append(get_ident())
-            converted.append(output.value)
-            return Output(output.value * 10)
+    async def fallback(error: Exception) -> Output:
+        """保留原始异常证据并异步产生恢复输出。
 
-        async def error(self, call: NodeCall, error: Exception) -> Output:
-            """保留原始异常证据并异步产生恢复输出。
+        Args:
+            error: 同步源迭代时发生的原始领域异常。
 
-            Args:
-                call: 当前节点调用身份，本场景不修改。
-                error: 同步源迭代时发生的原始领域异常。
+        Returns:
+            随后同样经过转换的恢复输出。
+        """
 
-            Returns:
-                随后同样经过逐项出口转换的恢复输出。
-            """
+        await asyncio.sleep(0)
+        hook_threads.append(get_ident())
+        errors.append(error)
+        return Output(2)
 
-            del call
-            await asyncio.sleep(0)
-            hook_threads.append(get_ident())
-            errors.append(error)
-            return Output(2)
+    def recover(call: NodeCall, call_next: Any) -> Iterator[Output]:
+        """逐项转换内层输出，内层业务失败时以恢复输出继续。
+
+        Args:
+            call: 当前节点调用。
+            call_next: 调用内层的函数。
+
+        Yields:
+            转换后的输出与恢复输出。
+        """
+
+        try:
+            for output in call_next(call):
+                yield call.wait(convert(output.value))
+        except ValueError as error:
+            yield call.wait(convert(call.wait(fallback(error)).value))
 
     with Runtime() as runtime:
         runtime.register("recover", Graph(entrypoint="source").add(source=Producer()))
-        runtime.attach(Recover(), graph="recover")
+        runtime.hooks.on(NODE_CALL, recover, graph="recover")
         assert tuple(runtime.iter("recover")) == (Output(10), Output(20))
 
     assert errors == [domain_error]
@@ -144,11 +157,13 @@ def test_async_item_hooks_recover_original_generator_error_off_source_thread() -
 
 
 @pytest.mark.parametrize("stop", [True, False], ids=["stop-graph", "exit-error"])
-def test_hook_termination_closes_source_cursor_once_without_reading_ahead(stop) -> None:
-    """Hook 在当前项终止执行时关闭源游标，并且不预读剩余输出。
+def test_middleware_termination_closes_source_cursor_once_without_reading_ahead(
+    stop,
+) -> None:
+    """中间件在当前项终止执行时关闭源游标，并且不预读剩余输出。
 
     Args:
-        stop: 为 True 时通过 StopGraph 终止，否则在出口抛出业务异常。
+        stop: 为 True 时通过 StopGraph 终止，否则在改写当前项时抛出业务异常。
     """
 
     cursor = CloseTrackedCursor([Output(1), Output(2)])
@@ -171,29 +186,30 @@ def test_hook_termination_closes_source_cursor_once_without_reading_ahead(stop) 
             del inputs, context
             return cursor
 
-    class Terminate(NodeHook):
-        """在取得第一项输出后停止 Graph 或终止当前节点。"""
+    def terminate(call: NodeCall, call_next: Any) -> Iterator[Output]:
+        """在取得第一项输出后停止 Graph 或终止当前节点。
 
-        def exit(self, call: NodeCall, output: Output) -> Outputs:
-            """在当前项边界终止，禁止 Engine 继续推进源。
+        Args:
+            call: 当前节点调用。
+            call_next: 调用内层的函数。
 
-            Args:
-                call: 当前节点调用身份，本场景不修改。
-                output: 已从源取得的第一项输出。
+        Yields:
+            不产生任何输出。
 
-            Raises:
-                StopGraph: 本场景选择整图短路成功。
-                ValueError: 本场景选择出口转换失败。
-            """
+        Raises:
+            StopGraph: 本场景选择整图短路成功。
+            ValueError: 本场景选择改写失败。
+        """
 
-            del call, output
+        for _ in call_next(call):
             if stop:
                 raise StopGraph(Output(9))
             raise domain_error
+        yield from ()
 
     with Runtime() as runtime:
         runtime.register("cursor", Graph(entrypoint="source").add(source=Producer()))
-        runtime.attach(Terminate(), graph="cursor")
+        runtime.hooks.on(NODE_CALL, terminate, graph="cursor")
         if stop:
             assert runtime.run("cursor") == (Output(9),)
         else:
@@ -247,8 +263,10 @@ def test_cancellation_closes_returned_cursor_before_first_advance() -> None:
 
 
 @pytest.mark.parametrize("node_timeout", [False, True], ids=["graph", "node"])
-def test_unbounded_source_times_out_without_hook_error_recovery(node_timeout) -> None:
-    """无自然结束条件的输出源响应执行预算，控制异常绕过业务恢复。
+def test_unbounded_source_timeout_cannot_be_swallowed_by_middleware(
+    node_timeout,
+) -> None:
+    """无自然结束条件的输出源响应执行预算；中间件捕获控制异常后也无法交付替代输出。
 
     Args:
         node_timeout: 为 True 时使用节点预算，否则使用整图预算。
@@ -256,6 +274,7 @@ def test_unbounded_source_times_out_without_hook_error_recovery(node_timeout) ->
 
     abort = ThreadEvent()
     closed = ThreadEvent()
+    delivered: list[object] = []
     recovered: list[Exception] = []
 
     class Producer(Node):
@@ -287,27 +306,42 @@ def test_unbounded_source_times_out_without_hook_error_recovery(node_timeout) ->
             finally:
                 closed.set()
 
-    class Recover(NodeHook):
-        """记录不应该接收到的控制异常恢复调用。"""
+    def observe(call: NodeCall, call_next: Any) -> Iterator[Output]:
+        """外层记录实际交付的输出。
 
-        def error(self, call: NodeCall, error: Exception) -> Output:
-            """记录恢复尝试，以便断言控制异常没有进入此处。
+        Args:
+            call: 当前节点调用。
+            call_next: 调用内层的函数。
 
-            Args:
-                call: 当前节点调用身份，本场景不修改。
-                error: Hook 收到的待恢复异常。
+        Yields:
+            内层输出。
+        """
 
-            Returns:
-                可被测试识别的恢复输出。
-            """
+        for output in call_next(call):
+            delivered.append(output.value)
+            yield output
 
-            del call
+    def recover(call: NodeCall, call_next: Any) -> Iterator[Output]:
+        """记录收到的异常并尝试以替代输出恢复。
+
+        Args:
+            call: 当前节点调用。
+            call_next: 调用内层的函数。
+
+        Yields:
+            内层输出，或失败时的替代输出。
+        """
+
+        try:
+            yield from call_next(call)
+        except Exception as error:
             recovered.append(error)
-            return Output("unexpected recovery")
+            yield Output("unexpected recovery")
 
     with Runtime() as runtime:
         runtime.register("unbounded", Graph(entrypoint="source").add(source=Producer()))
-        runtime.attach(Recover(), graph="unbounded")
+        runtime.hooks.on(NODE_CALL, observe, graph="unbounded")
+        runtime.hooks.on(NODE_CALL, recover, graph="unbounded")
         execution = runtime.start("unbounded", timeout=None if node_timeout else 0.02)
         try:
             expected = NodeTimeoutError if node_timeout else ExecutionTimeoutError
@@ -319,14 +353,15 @@ def test_unbounded_source_times_out_without_hook_error_recovery(node_timeout) ->
             assert execution.wait(1)
 
     assert closed.is_set()
-    assert recovered == []
+    assert "unexpected recovery" not in delivered
+    assert all(isinstance(error, expected) for error in recovered)
 
 
 @pytest.mark.parametrize(
     "error_type", [ExecutionCancelledError, StepLimitExceededError]
 )
-def test_generator_control_signal_bypasses_hook_recovery(error_type) -> None:
-    """生成器显式抛出的控制异常也不会被逐项 Hook 当作业务错误恢复。
+def test_generator_control_signal_cannot_be_swallowed_by_middleware(error_type) -> None:
+    """生成器显式抛出的控制异常即使被中间件捕获，也按原实例传播且替代输出不交付。
 
     Args:
         error_type: 需要按原实例传播的执行控制异常类型。
@@ -359,38 +394,39 @@ def test_generator_control_signal_bypasses_hook_recovery(error_type) -> None:
             yield Output(1)
             raise control_error
 
-    class Recover(NodeHook):
-        """记录误入业务恢复分支的控制异常。"""
+    def recover(call: NodeCall, call_next: Any) -> Iterator[Output]:
+        """尝试把内层全部普通异常转换为替代输出。
 
-        def error(self, call: NodeCall, error: Exception) -> Output:
-            """记录不应发生的恢复尝试。
+        Args:
+            call: 当前节点调用。
+            call_next: 调用内层的函数。
 
-            Args:
-                call: 当前节点调用身份，本场景不修改。
-                error: 被错误传入的控制异常。
+        Yields:
+            内层输出，或失败时的替代输出。
+        """
 
-            Returns:
-                可用于识别错误恢复行为的输出。
-            """
-
-            del call
+        try:
+            yield from call_next(call)
+        except Exception as error:
             recovered.append(error)
-            return Output(2)
+            yield Output(2)
 
     with Runtime() as runtime:
         runtime.register("control", Graph(entrypoint="source").add(source=Producer()))
-        runtime.attach(Recover(), graph="control")
+        runtime.hooks.on(NODE_CALL, recover, graph="control")
         stream = runtime.iter("control")
         assert next(stream) == Output(1)
         with pytest.raises(error_type) as captured:
             next(stream)
         assert captured.value is control_error
 
-    assert recovered == []
+    assert recovered == [control_error]
 
 
-def test_item_hooks_drop_expand_and_close_each_output_before_source_advances() -> None:
-    """逐项转换可保留、丢弃与展开，并在读取下个源项前释放当前展开游标。"""
+def test_middleware_drops_expands_and_closes_each_output_before_source_advances() -> (
+    None
+):
+    """中间件可保留、丢弃与展开输出，链路保持惰性：读取下个源项前当前展开已消费并关闭。"""
 
     converted: list[int] = []
     observed: list[int] = []
@@ -417,54 +453,48 @@ def test_item_hooks_drop_expand_and_close_each_output_before_source_advances() -
                 assert all(cursor.close_calls == 1 for cursor in expansions)
                 yield Output(index)
 
-    class Transform(NodeHook):
-        """覆盖单项保留、两种丢弃和资源游标展开的出口转换。"""
+    def transform(call: NodeCall, call_next: Any) -> Iterator[Output]:
+        """对每项独立改写：丢弃、保留或展开为资源游标。
 
-        def exit(self, call: NodeCall, output: Output) -> Outputs:
-            """对当前项独立转换，转换输出不再次交回同一个 Hook。
+        Args:
+            call: 当前节点调用。
+            call_next: 调用内层的函数。
 
-            Args:
-                call: 当前节点调用身份，本场景不修改。
-                output: 等待转换的单项源输出。
+        Yields:
+            改写后的输出。
+        """
 
-            Returns:
-                单项输出、展开游标或代表丢弃的空结果。
-            """
-
-            del call
+        for output in call_next(call):
             converted.append(output.value)
-            if output.value == 0:
-                return None
-            if output.value == 1:
-                return ()
+            if output.value in (0, 1):
+                continue
             if output.value == 2:
-                return Output(20)
+                yield Output(20)
+                continue
             cursor = CloseTrackedCursor([Output(output.value * 10), Output(99)])
             expansions.append(cursor)
-            return cursor
+            with closing(cursor):
+                yield from cursor
 
-    class Observe(NodeHook):
-        """记录内层转换之后抵达外层 Hook 的实际输出。"""
+    def observe(call: NodeCall, call_next: Any) -> Iterator[Output]:
+        """记录内层改写之后抵达外层的实际输出。
 
-        def exit(self, call: NodeCall, output: Output) -> Output:
-            """记录已展开且未丢弃的输出并继续交付。
+        Args:
+            call: 当前节点调用。
+            call_next: 调用内层的函数。
 
-            Args:
-                call: 当前节点调用身份，本场景不修改。
-                output: 内层 Hook 已经转换的单项输出。
+        Yields:
+            保持原值的输出。
+        """
 
-            Returns:
-                保持原值的当前输出。
-            """
-
-            del call
+        for output in call_next(call):
             observed.append(output.value)
-            return output
+            yield output
 
     with Runtime() as runtime:
         runtime.register("transform", Graph(entrypoint="source").add(source=Producer()))
-        runtime.attach(Observe(), graph="transform")
-        runtime.attach(Transform(), graph="transform")
+        runtime.hooks.on(NODE_CALL, observe, graph="transform")
+        runtime.hooks.on(NODE_CALL, transform, graph="transform")
         assert runtime.run("transform", 5) == (
             Output(20),
             Output(30),

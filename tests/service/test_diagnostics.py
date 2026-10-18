@@ -12,9 +12,15 @@ import pytest
 
 pytest.importorskip("jsonrpcserver")
 
-from interlace import Graph, Node, Output, Ports, Runtime
-from interlace.engine.hooks import HookPhase, NodeCall, NodeHook, StopGraph
+from interlace import Graph, Node, Output, Runtime
 from interlace.engine.observation import current_node_event
+from interlace.plugins.points import (
+    NODE_CALL,
+    NODE_INSPECT,
+    NodeCall,
+    NodeInspection,
+    StopGraph,
+)
 from interlace.service import GraphService
 from interlace.service.diagnostics import redact_text, snapshot_value
 from interlace.service.errors import OutputEncodingError
@@ -28,12 +34,12 @@ class Echo(Node):
     """产出输入字典并记录日志的节点。
 
     Attributes:
-        input_ports: 接收字典对象。
-        output_ports: 产出字典对象。
+        inputs: 接收字典对象。
+        outputs: 产出字典对象。
     """
 
-    input_ports = Ports(default=dict)
-    output_ports = Ports(default=dict)
+    inputs = {"default": dict}
+    outputs = {"default": dict}
 
     def execute(self, inputs: Any, context: Any) -> Output:
         """记录当前业务标识并直接返回数据。
@@ -72,44 +78,29 @@ class AsyncEcho(Echo):
         return Output(inputs["default"])
 
 
-class Rewrite(NodeHook):
-    """在采集器注册之后转换节点输入和输出。"""
+def rewrite(call: NodeCall, call_next: Any) -> Iterator[Output]:
+    """在采集器登记之后改写节点输入，并原地修改实际输出对象。
 
-    def enter(self, call: NodeCall) -> NodeCall:
-        """改写实际节点将收到的输入。
+    Args:
+        call: 当前调用。
+        call_next: 调用内层的函数。
 
-        Args:
-            call: 当前调用。
+    Yields:
+        被原地修改后的终端输出，用于检验采集快照是否独立。
+    """
 
-        Returns:
-            标识已变更的调用。
-        """
-
-        return call.with_inputs({"default": {"id": "rewritten"}})
-
-    def exit(self, call: NodeCall, output: Output) -> Output:
-        """修改实际输出对象，检验采集快照是否独立。
-
-        Args:
-            call: 当前调用。
-            output: 节点原始输出。
-
-        Returns:
-            Hook 转换后的终端输出。
-        """
-
-        del call
+    for output in call_next(call.with_inputs({"default": {"id": "rewritten"}})):
         output.value["id"] = "terminal"
-        return output
+        yield output
 
 
 def test_inspection_records_actual_inputs_before_output_rewrites() -> None:
-    """采集位置不受 Hook 注册顺序影响，快照不随原对象变化。"""
+    """采集位置不受中间件登记顺序影响，快照不随原对象变化。"""
 
     with Runtime() as runtime:
         runtime.register("echo", Graph(entrypoint="echo").add(echo=Echo()))
         service = GraphService(runtime)
-        runtime.attach(Rewrite())
+        runtime.hooks.on(NODE_CALL, rewrite)
         handle = runtime.start(
             "echo", {"id": "original"}, options={"test": {"token": "hidden"}}
         )
@@ -249,27 +240,22 @@ def test_diagnostics_can_be_disabled_and_close_preserves_logging_configuration()
 def test_inspector_cannot_short_circuit_business_execution() -> None:
     """诊断方法抛出的控制信号不能接管节点执行。"""
 
-    class Broken(NodeHook):
-        """故意违反诊断权限的 Hook。"""
+    def broken(inspection: NodeInspection) -> None:
+        """尝试用控制信号干预执行。
 
-        def inspect(self, call: NodeCall, phase: HookPhase, value: Any) -> None:
-            """尝试用控制信号干预执行。
+        Args:
+            inspection: 当前采集记录。
 
-            Args:
-                call: 当前调用。
-                phase: 当前采集阶段。
-                value: 当前诊断值。
+        Raises:
+            StopGraph: 无权由采集回调发出的控制信号。
+        """
 
-            Raises:
-                StopGraph: 无权由诊断回调发出的控制信号。
-            """
-
-            del call, phase, value
-            raise StopGraph(Output({"id": "wrong"}))
+        del inspection
+        raise StopGraph(Output({"id": "wrong"}))
 
     with Runtime() as runtime:
         runtime.register("echo", Graph(entrypoint="echo").add(echo=Echo()))
-        runtime.attach(Broken())
+        runtime.hooks.on(NODE_INSPECT, broken)
         assert runtime.run("echo", {"id": "correct"})[0].value == {"id": "correct"}
 
 
@@ -325,8 +311,8 @@ def test_diagnostics_batch_output_records_and_flush_before_node_finish(
     class Many(Node):
         """产生超过一个诊断批次的终端输出。"""
 
-        input_ports = Ports(count=int)
-        output_ports = Ports(value=int)
+        inputs = {"count": int}
+        outputs = {"value": int}
 
         def execute(self, inputs: Any, context: Any) -> Iterator[Output]:
             """按顺序产生指定数量的输出。

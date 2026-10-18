@@ -8,6 +8,7 @@ from types import MappingProxyType
 from typing import Any, TypeVar
 
 from .._validation import require_non_empty_string
+from .extension import HookBus, HookCaller
 from .options import snapshot_options
 from .slots import Slot
 
@@ -34,7 +35,7 @@ class Event:
         require_non_empty_string(self.type, "event type")
 
 
-Emit = Callable[[Event], None]
+Emit = Callable[[Event], object]  # 发布跨图事件的回调；返回值被忽略。
 _C = TypeVar("_C", bound="Context")  # 保留领域工厂返回的具体 Context 子类类型。
 
 
@@ -110,6 +111,16 @@ class Context:
         """
 
         return self._parent.slot
+
+    @property
+    def hooks(self) -> HookCaller:
+        """返回当前 Runtime 钩子总线的只触发视图，供领域代码调用插件定义的钩子点。
+
+        Returns:
+            只能 notify/filter/wrap 及其异步版本的视图，不能注册或注销。
+        """
+
+        return self._parent.hooks
 
     def emit(self, event_type: str, payload: Any = None) -> Event:
         """向 Runtime 提交一项跨 Graph 领域事件。
@@ -196,12 +207,14 @@ class _BoundContext(Context):
         _finalizers: execution 共享的静止回调列表；由执行器拥有并调用。
         _scope: 当前 Node 的状态隔离作用域。
         _options: 本次 firing 独立深复制的执行配置，顶层只读。
+        _hooks: 当前 Runtime 钩子总线的只触发视图。
     """
 
     __slots__ = (
         "_checkpoint",
         "_emit",
         "_finalizers",
+        "_hooks",
         "_is_cancelled",
         "_local",
         "_options",
@@ -219,6 +232,7 @@ class _BoundContext(Context):
         finalizers: list[Callable[[], None]],
         scope: str,
         options: Mapping[str, Any] | None,
+        hooks: HookCaller,
     ) -> None:
         """保存已由 bind_context 校验的执行绑定。"""
 
@@ -230,6 +244,7 @@ class _BoundContext(Context):
         self._finalizers = finalizers
         self._scope = scope
         self._options = MappingProxyType(snapshot_options(options))
+        self._hooks = hooks
 
     @property
     def options(self) -> Mapping[str, Any]:
@@ -242,6 +257,12 @@ class _BoundContext(Context):
         """返回绑定的 Slot。"""
 
         return self._slot
+
+    @property
+    def hooks(self) -> HookCaller:
+        """返回绑定的钩子触发视图。"""
+
+        return self._hooks
 
     def emit(self, event_type: str, payload: Any = None) -> Event:
         """构造 Event 并交给绑定的发布回调。"""
@@ -285,6 +306,7 @@ def bind_context(
     finalizers: list[Callable[[], None]] | None = None,
     scope: str = "",
     options: Mapping[str, Any] | None = None,
+    hooks: HookCaller | None = None,
 ) -> Context:
     """为一次 Node firing 创建直接持有执行能力的基础 Context。
 
@@ -299,13 +321,14 @@ def bind_context(
         finalizers: execution 共享的静止回调列表，调用方负责执行；None 时新建独立列表。
         scope: 当前 Node 的状态隔离作用域，通常为 Node ID。
         options: 执行配置；深复制后顶层只读。
+        hooks: 当前 Runtime 钩子总线的只触发视图；None 时使用空总线。
 
     Returns:
         绑定上述能力的基础 Context。
 
     Raises:
         TypeError: emit、checkpoint 或 is_cancelled 不可调用，slot 不是 Slot 或 None，
-            options 不是映射或其值无法深复制。
+            hooks 不是 HookCaller，options 不是映射或其值无法深复制。
         ValueError: options 的键不是非空字符串。
     """
 
@@ -317,6 +340,10 @@ def bind_context(
     is_cancelled = _false if is_cancelled is None else is_cancelled
     if not callable(checkpoint) or not callable(is_cancelled):
         raise TypeError("context control callbacks must be callable")
+    if hooks is None:
+        hooks = HookBus().caller()
+    elif not isinstance(hooks, HookCaller):
+        raise TypeError("context hooks must be a HookCaller")
     return _BoundContext(
         emit,
         slot,
@@ -326,6 +353,7 @@ def bind_context(
         [] if finalizers is None else finalizers,
         scope,
         options,
+        hooks,
     )
 
 
