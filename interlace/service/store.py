@@ -559,6 +559,45 @@ class ServiceStore:
                         ),
                     )
 
+    def restart_execution(self, snapshot: dict[str, Any]) -> None:
+        """以新一次尝试的快照替换同 ID 记录，并删除旧尝试的输出。
+
+        同一 Work.id 被重投递时会以相同 ID 开始新的 Execution；已结束的旧记录也会被覆盖，
+        历史输出只保留最新一次尝试。观测事件按追加顺序保留全部尝试。
+
+        Args:
+            snapshot: 新尝试开始时的执行快照。
+        """
+
+        with self.lock:
+            if self._closed:
+                return
+            with self.connection:
+                self.connection.execute(
+                    "DELETE FROM outputs WHERE execution_id=?", (snapshot["id"],)
+                )
+                updated = self.connection.execute(
+                    "UPDATE executions SET body=?, graph=?, definition=? WHERE id=?",
+                    (
+                        _dump(snapshot),
+                        snapshot.get("graph"),
+                        snapshot.get("definition_name"),
+                        snapshot["id"],
+                    ),
+                ).rowcount
+                if not updated:
+                    self.connection.execute(
+                        "INSERT INTO executions(id, body, graph, definition) "
+                        "VALUES (?, ?, ?, ?)",
+                        (
+                            snapshot["id"],
+                            _dump(snapshot),
+                            snapshot.get("graph"),
+                            snapshot.get("definition_name"),
+                        ),
+                    )
+                    self._prune()
+
     def _prune(self) -> None:
         """在当前事务内删除超出 retention 的最早已结束执行及其观测与输出。"""
 

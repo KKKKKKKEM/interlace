@@ -26,23 +26,26 @@ from interlace import (
     Runtime,
     SlotPool,
 )
+from interlace.adapters import memory
 from interlace.engine import runner as runner_module
 from interlace.engine.errors import (
     InterlaceRuntimeError,
     ExecutionCancelledError,
     ExecutionError,
     ExecutionTimeoutError,
+    HookExecutionError,
     IncompleteInputsError,
     NodeTimeoutError,
     PolicySelectionError,
+    PortValueTypeError,
     QueueLimitExceededError,
     StepLimitExceededError,
 )
 from interlace.engine.executor import Engine
-from interlace.engine.hooks import NodeHook
+from interlace.engine.hooks import NodeHook, StopGraph
 from interlace.engine.policies import PolicyRef, PolicyRegistry
 from interlace.engine.runner import LocalRunner
-from interlace.runtime import LocalRuntimePlugin
+from interlace.runtime import GraphWorker, LocalRuntimePlugin
 
 
 @pytest.mark.parametrize("control", ["cancel", "timeout"])
@@ -548,6 +551,58 @@ def test_unconsumed_stream_can_be_closed_without_blocking_execution() -> None:
     close()
     runtime.wait_idle(1)
     runtime.close()
+
+
+@pytest.mark.parametrize("target", ["runtime", "worker"])
+def test_close_releases_backpressure_of_unread_stream(target: str) -> None:
+    """关闭不因未读订阅永久阻塞；执行排空后订阅仍能按序读到全部输出。
+
+    Args:
+        target: 被关闭的对象，Runtime 门面或单独的 GraphWorker。
+    """
+
+    class Many(Node):
+        """按 count 一次产生多项输出的节点。
+
+        Attributes:
+            input_ports: 节点声明的输入端口及其类型。
+            output_ports: 节点声明的输出端口及其类型。
+        """
+
+        input_ports = Ports(count=int)
+        output_ports = Ports(value=int)
+
+        def execute(self, inputs, context):
+            """按 count 依次产生 0..count-1 个 Output。"""
+
+            del context
+            return tuple(Output(value, "value") for value in range(inputs["count"]))
+
+    owner: Runtime | GraphWorker
+    if target == "runtime":
+        owner = Runtime()
+    else:
+        owner = GraphWorker(consumer=memory.TaskBackend(), close_injected=True)
+    owner.register("many.graph", Graph(entrypoint="many").add(many=Many()))
+    stream = owner.iter("many.graph", 5, output_buffer=1)
+    execution = owner.executions()[-1]
+    failures: list[BaseException] = []
+
+    def close() -> None:
+        """关闭目标并记录失败。"""
+
+        try:
+            owner.close()
+        except BaseException as exc:
+            failures.append(exc)
+
+    closer = Thread(target=close, daemon=True)
+    closer.start()
+    closer.join(5)
+    assert not closer.is_alive()
+    assert failures == []
+    assert execution.status is ExecutionStatus.SUCCEEDED
+    assert list(stream) == [Output(value, "value") for value in range(5)]
 
 
 def test_async_node_timeout_interrupts_awaitable() -> None:
@@ -1496,3 +1551,165 @@ def test_repeated_error_reraise_does_not_grow_traceback() -> None:
         depths.append(len(traceback.extract_tb(captured.value.__traceback__)))
     assert len(set(depths[0::2])) == 1
     assert len(set(depths[1::2])) == 1
+
+
+def test_huge_finite_timeouts_do_not_overflow_thread_waits() -> None:
+    """远超线程等待上限的有限时限按“近似不限时”工作，不以 OverflowError 失败。"""
+
+    release = ThreadEvent()
+
+    class Slow(Node):
+        """异步等待测试放行，使 Graph 与 Node 时限都参与等待。
+
+        Attributes:
+            timeout: 超过 threading.TIMEOUT_MAX 的 Node 时限秒数。
+        """
+
+        timeout = 1e12
+
+        async def execute(self, inputs, context):
+            """等待放行后返回输入。"""
+
+            del context
+            await asyncio.to_thread(release.wait, 5)
+            return Output(inputs["default"])
+
+    with Runtime() as runtime:
+        runtime.register("slow", Graph(entrypoint="slow").add(slow=Slow()))
+        execution = runtime.start("slow", 1, timeout=1e10)
+        Thread(target=lambda: (time.sleep(0.05), release.set())).start()
+        assert execution.wait(1e10)
+        assert execution.result() == (Output(1),)
+
+
+def test_execution_errors_raised_outside_engine_wrapping_get_attribution() -> None:
+    """Node 直接抛出的 ExecutionError 与入口输入错误同样带有 graph 与 node 归属。"""
+
+    class Custom(Node):
+        """直接抛出领域侧 ExecutionError。
+
+        Attributes:
+            input_ports: 整数输入端口。
+        """
+
+        input_ports = Ports(default=int)
+
+        def execute(self, inputs, context):
+            """抛出未设置归属的 ExecutionError。"""
+
+            del inputs, context
+            raise ExecutionError("custom")
+
+    with Runtime() as runtime:
+        runtime.register("custom", Graph(entrypoint="node").add(node=Custom()))
+        with pytest.raises(ExecutionError, match="custom") as raised:
+            runtime.run("custom", 1)
+        assert (raised.value.graph, raised.value.node) == ("custom", "node")
+        with pytest.raises(PortValueTypeError) as invalid:
+            runtime.run("custom", "not an int")
+        assert (invalid.value.graph, invalid.value.node) == ("custom", "node")
+
+
+def test_hook_signals_from_context_factory_are_rejected() -> None:
+    """context_factory 抛出 StopGraph 不能被当作正常停止，而是以 Hook 契约错误失败。"""
+
+    def factory(base, inputs):
+        """错误地在工厂中抛出 Hook 专用信号。"""
+
+        del base, inputs
+        raise StopGraph(Output(7))
+
+    class Echo(Node):
+        """不会执行的节点。"""
+
+        def execute(self, inputs, context):
+            """返回输入。"""
+
+            del context
+            return Output(inputs["default"])
+
+    with Runtime() as runtime:
+        runtime.register(
+            "factory",
+            Graph(entrypoint="node", context_factory=factory).add(node=Echo()),
+        )
+        with pytest.raises(HookExecutionError, match="StopGraph"):
+            runtime.run("factory", 1)
+
+
+def test_closing_stream_from_another_thread_ends_blocked_reader() -> None:
+    """读取方阻塞等待时，另一线程关闭同一订阅，读取方正常结束而不是抛 KeyError。"""
+
+    release = ThreadEvent()
+
+    class Wait(Node):
+        """直到测试放行才结束。"""
+
+        def execute(self, inputs, context):
+            """等待放行。"""
+
+            del inputs, context
+            assert release.wait(5)
+
+    with Runtime() as runtime:
+        runtime.register("wait", Graph(entrypoint="node").add(node=Wait()))
+        stream = runtime.iter("wait", 1)
+        outcome: list[object] = []
+
+        def read() -> None:
+            """阻塞读取并记录结束方式。"""
+
+            try:
+                outcome.append(next(stream))
+            except StopIteration:
+                outcome.append("stopped")
+            except BaseException as exc:
+                outcome.append(exc)
+
+        reader = Thread(target=read)
+        reader.start()
+        deadline = time.monotonic() + 5
+        while not runtime.executions()[-1].steps:
+            assert time.monotonic() < deadline
+            time.sleep(0.005)
+        time.sleep(0.05)
+        stream.close()
+        reader.join(5)
+        release.set()
+        assert outcome == ["stopped"]
+
+
+def test_cancellation_cleanup_failure_is_logged(caplog) -> None:
+    """取消后协程清理阶段的失败不替换控制异常，但写入错误日志。
+
+    Args:
+        caplog: 日志捕获夹具。
+    """
+
+    entered = ThreadEvent()
+
+    class Leaky(Node):
+        """清理阶段失败的异步节点。"""
+
+        async def execute(self, inputs, context):
+            """等待被取消，并在 finally 中失败。"""
+
+            del inputs, context
+            try:
+                entered.set()
+                await asyncio.sleep(10)
+            finally:
+                raise RuntimeError("cleanup broke")
+
+    with Runtime() as runtime:
+        runtime.register("leaky", Graph(entrypoint="node").add(node=Leaky()))
+        with caplog.at_level(logging.ERROR, logger="interlace.engine.runner"):
+            execution = runtime.start("leaky", 1)
+            assert entered.wait(5)
+            execution.cancel()
+            assert execution.wait(5)
+    assert execution.status is ExecutionStatus.CANCELLED
+    assert any(
+        record.exc_info and str(record.exc_info[1]) == "cleanup broke"
+        for record in caplog.records
+    )

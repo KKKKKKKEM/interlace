@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sqlite3
+import threading
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -243,6 +245,8 @@ def test_token_compares_bytes_and_rejects_non_ascii_authorization(
         )
         assert authorized.headers["Cache-Control"] == "no-store"
         assert authorized.headers["X-Content-Type-Options"] == "nosniff"
+        assert authorized.headers["X-Frame-Options"] == "DENY"
+        assert authorized.headers["Content-Security-Policy"] == "frame-ancestors 'none'"
 
 
 def test_serve_warns_without_token_on_public_address(
@@ -650,3 +654,105 @@ def test_newer_database_schema_is_rejected(tmp_path: Path) -> None:
         connection.execute("PRAGMA user_version=99")
     with pytest.raises(RuntimeError, match="newer"):
         ServiceStore(database)
+
+
+def test_unread_output_stream_does_not_backpressure_execution(runtime: Runtime) -> None:
+    """输出 SSE 客户端停止读取时，服务端仍及时读空输出，执行不被观察端阻塞。"""
+
+    gate = threading.Event()
+
+    class Burst(Node):
+        """放行后一次产出超过默认输出缓冲的条目。"""
+
+        def execute(self, inputs: Any, context: Any) -> list[Output]:
+            """等待测试放行后产出 200 条输出。
+
+            Args:
+                inputs: 忽略的入口值。
+                context: 当前执行上下文。
+
+            Returns:
+                200 条输出。
+            """
+
+            del inputs, context
+            assert gate.wait(5)
+            return [Output(index) for index in range(200)]
+
+    runtime.register("burst", Graph(entrypoint="burst").add(burst=Burst()))
+    with GraphService(runtime) as service:
+        handle = runtime.start("burst", None)
+        route = next(
+            route
+            for route in service.create_app().routes
+            if getattr(route, "path", "") == "/api/executions/{execution_id}/outputs"
+        )
+
+        async def observe() -> bool:
+            """读取首个事件后不再读取，等待执行自行结束。"""
+
+            response = await route.endpoint(handle.id)  # type: ignore[attr-defined]
+            body = response.body_iterator
+            gate.set()
+            first = await body.__anext__()
+            assert "event: output" in first
+            try:
+                return await asyncio.to_thread(handle.wait, 5)
+            finally:
+                await body.aclose()
+
+        assert asyncio.run(observe())
+        assert len(handle.result()) == 200
+
+
+def test_redelivered_work_history_keeps_only_latest_attempt() -> None:
+    """同一 Work.id 重投递后，历史输出与快照只反映最新一次尝试，不混杂旧尝试。"""
+
+    from interlace.adapters import memory
+    from interlace.runtime import EventRouter, GraphWorker
+    from interlace.spi import Work
+
+    attempts: list[int] = []
+
+    class Attempt(Node):
+        """首次产出一项后失败，第二次产出两项后成功。"""
+
+        def execute(self, inputs: Any, context: Any) -> Iterator[Output]:
+            """按尝试次数逐项产出不同输出。
+
+            Args:
+                inputs: 忽略的入口值。
+                context: 当前执行上下文。
+
+            Yields:
+                首次尝试的 A1，或第二次尝试的 B1、B2。
+
+            Raises:
+                ValueError: 第一次尝试在发布 A1 后的业务失败。
+            """
+
+            del inputs, context
+            attempts.append(len(attempts) + 1)
+            if len(attempts) == 1:
+                yield Output("A1")
+                raise ValueError("first attempt failed")
+            yield Output("B1")
+            yield Output("B2")
+
+    tasks = memory.TaskBackend()
+    worker = GraphWorker(consumer=tasks)
+    runtime = Runtime(router=EventRouter(publisher=tasks), worker=worker)
+    runtime.register("attempt", Graph(entrypoint="attempt").add(attempt=Attempt()))
+    runtime.consume("attempt")
+    work = Work("attempt")
+    with runtime, GraphService(runtime) as service:
+        tasks.submit("attempt", work)
+        with pytest.raises(ExecutionError):
+            runtime.wait_idle(5)
+        tasks.submit("attempt", work)
+        runtime.wait_idle(5)
+        deadline = time.monotonic() + 5
+        while [item["value"] for item in service.outputs(work.id)] != ["B1", "B2"]:
+            assert time.monotonic() < deadline, service.outputs(work.id)
+            time.sleep(0.01)
+        assert service.execution(work.id)["status"] == "succeeded"

@@ -137,6 +137,10 @@ Output 开始读取，再等待后续输出；`result()` 仍返回完整 tuple�
 Output 后失败，已发布 Output 不撤回，迭代器在读完它们后抛出执行异常。停止迭代或回收迭代器只解除该订阅的背压，
 不会隐式取消 Graph，需要调用 `execution.cancel()` 显式取消。
 
+`Runtime.close()` 与 `GraphWorker.close()` 进入 CLOSING 后，对尚未结束的执行解除订阅背压，让它们跑完而不是等待
+从未读取的订阅；剩余 Output 全部留在输出存储中，订阅方关闭后仍可从原位置读完。此后的内存占用不再受
+`output_buffer` 约束。Runtime 门面对关闭开始时 Worker 保留的执行生效，Worker 自身关闭时对关闭期间新登记的执行同样生效。
+
 默认 Engine 不会提前耗尽 Node 返回的 Iterable。背压计数限制已提交的未读输出，执行器最多再持有正在交付的一项；
 取消和超时会中止后续推进并关闭输出迭代器。Node Hook 的出口转换逐项执行，同步 Node 的迭代由执行线程推进，
 异步 Hook 只接收已读取的单项 Output。

@@ -8,7 +8,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from queue import SimpleQueue
-from threading import RLock, Thread
+from threading import Lock, RLock, Thread
 from types import TracebackType
 from typing import Any
 
@@ -24,7 +24,13 @@ from interlace.engine.observation import (
 )
 
 from .catalog import NodeCatalog, describe_graph
-from .diagnostics import NodeDiagnostics, redact_text, redact_value, snapshot_value
+from .diagnostics import (
+    NodeDiagnostics,
+    contains_iterator,
+    redact_text,
+    redact_value,
+    snapshot_value,
+)
 from .errors import (
     ConflictError,
     InvalidRequestError,
@@ -51,9 +57,14 @@ def encode(value: Any) -> Any:
         可无损表示于 JSON 的结构。
 
     Raises:
-        OutputEncodingError: 对象无法通过声明的序列化规则编码。
+        OutputEncodingError: 对象无法通过声明的序列化规则编码，或包含会被序列化耗尽的
+            一次性迭代器。
     """
 
+    if contains_iterator(value):
+        raise OutputEncodingError(
+            f"output contains a one-shot iterator: {type(value).__name__}"
+        )
     try:
         result = to_jsonable_python(value, serialize_unknown=False)
         json.dumps(result, allow_nan=False)
@@ -122,6 +133,9 @@ class GraphService:
         _adapters: 端口类型到 TypeAdapter 的缓存，避免每次请求重建校验器。
         _archive_queue: 等待终态后归档输出的执行，None 通知归档线程退出。
         _archiver: 在 Worker 线程之外等待执行终止并归档输出的线程。
+        _attempts: 执行 ID 到最近一次开始的 Execution；同 ID 重投递时据此跳过被取代的旧尝试，
+            归档完成后移除。
+        _attempts_lock: 串行化新尝试的重置与旧尝试的归档写入。
     """
 
     def __init__(
@@ -182,6 +196,8 @@ class GraphService:
         self._archiver = Thread(
             target=self._archive_loop, name="interlace-service-archive", daemon=True
         )
+        self._attempts: dict[str, Execution] = {}
+        self._attempts_lock = Lock()
         self.store = ServiceStore(database, retention=retention)
         try:
             restored = []
@@ -823,7 +839,10 @@ class GraphService:
         )
         if event.kind is RuntimeEventKind.EXECUTION_STARTED:
             execution = self.runtime.get_execution(event.execution_id)
-            self.store.record_execution(self.snapshot(execution))
+            with self._attempts_lock:
+                # 同一 Work.id 重投递以相同 ID 开始新 Execution：替换旧快照并清除旧尝试的输出。
+                self._attempts[execution.id] = execution
+                self.store.restart_execution(self.snapshot(execution))
         elif event.kind is RuntimeEventKind.EXECUTION_FINISHED:
             execution = self.runtime.get_execution(event.execution_id)
             snapshot = self.snapshot(execution)
@@ -850,17 +869,22 @@ class GraphService:
     def _archive(self, execution: Execution) -> None:
         """通过公开迭代接口逐项归档已终止执行的输出，并写入最终快照。
 
-        输出编码失败记为 output_error，不改变执行终态。
+        输出编码失败记为 output_error，不改变执行终态；已被同 ID 新尝试取代的执行不再写入。
         """
 
-        snapshot = self.snapshot(execution)
-        try:
-            for index, output in enumerate(execution):
-                self.store.append_output(execution.id, index, encode(output))
-        except Exception as exc:
-            if exc is not execution.error:
-                snapshot["output_error"] = redact_text(str(exc))
-        self.store.record_execution(snapshot)
+        with self._attempts_lock:
+            current = self._attempts.get(execution.id)
+            if current is not None and current is not execution:
+                return
+            snapshot = self.snapshot(execution)
+            try:
+                for index, output in enumerate(execution):
+                    self.store.append_output(execution.id, index, encode(output))
+            except Exception as exc:
+                if exc is not execution.error:
+                    snapshot["output_error"] = redact_text(str(exc))
+            self.store.record_execution(snapshot)
+            self._attempts.pop(execution.id, None)
 
     def _run_summary(self) -> dict[str, tuple[int, dict[str, Any] | None]]:
         """汇总每个定义的执行数量与最近一次执行，合并尚未写入历史的 Runtime 执行。"""

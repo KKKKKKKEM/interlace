@@ -137,3 +137,11 @@ class EventDispatchError(InterlaceRuntimeError):
 
 class RuntimeClosedError(InterlaceRuntimeError):
     """调用方在 Runtime 关闭后继续提交工作。"""
+
+
+class SlotProviderClosedError(InterlaceRuntimeError, RuntimeError):
+    """SlotProvider 已关闭，不会再提供新的 Slot；同时是 RuntimeError 以兼容既有捕获。
+
+    TaskConsumer 据此区分永久不可用与暂时的申请失败：前者拒绝无法再分配的根投递，
+    后者保留排队等待后续推进。
+    """

@@ -278,12 +278,12 @@ class EventRouter:
             for unsubscribe in subscriptions:
                 try:
                     unsubscribe()
-                except Exception as exc:
+                except BaseException as exc:
                     if failure is None:
                         failure = exc
             try:
                 self.wait_idle()
-            except Exception as exc:
+            except BaseException as exc:
                 if failure is None:
                     failure = exc
             components = (
@@ -333,6 +333,7 @@ class EventRouter:
             RuntimeClosedError: Router 正在关闭或已经关闭。
         """
 
+        # 关闭先注销路由再排空，CLOSING 期间接受的分发将找不到路由，因此明确拒绝而非静默丢弃。
         self._lifecycle.ensure_open()
         # 先于分发记录，保证同一 Event 引起的 WORK_SUBMITTED 按因果顺序出现在其后。
         self._observations.publish(

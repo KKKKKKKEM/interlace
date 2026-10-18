@@ -1111,3 +1111,44 @@ def test_observer_contributions_need_only_the_observation_protocol() -> None:
     host.close()
     hub.publish(event)
     assert observed == [event, event]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "error"),
+    [
+        ({"id": "plain"}, ValueError),
+        ({"id": " a/b "}, ValueError),
+        ({"id": "a/b c"}, ValueError),
+        ({"version": "1.x"}, ValueError),
+        ({"version": "1.0.0\n"}, ValueError),
+        ({"requires": ("test/self",)}, ValueError),
+        ({"requires": ["test/other"]}, TypeError),
+        ({"provides": ("cap", "cap")}, ValueError),
+        ({"provides": ("cap",), "contributes": ("cap",)}, ValueError),
+        ({"provides": ("cap",), "requires_capabilities": ("cap",)}, ValueError),
+        ({"api_version": "0"}, ValueError),
+    ],
+)
+def test_plugin_descriptor_rejects_invalid_declarations(kwargs, error) -> None:
+    """插件声明在构造时拒绝非法标识、版本、依赖与 capability 组合。
+
+    Args:
+        kwargs: 覆盖默认声明的字段。
+        error: 期望的异常类型。
+    """
+
+    values = {"id": "test/self", "version": "1.0.0", **kwargs}
+    with pytest.raises(error):
+        PluginDescriptor(**values)
+
+
+def test_runtime_and_host_reject_non_plugins_and_duplicate_ids() -> None:
+    """非插件对象报告 TypeError，重复插件标识在装配前失败。"""
+
+    with pytest.raises(TypeError, match="PluginDescriptor"):
+        Runtime(plugins=[object()])
+    duplicate = ContributionPlugin(
+        "test/duplicate", observers={"observer": lambda event: None}
+    )
+    with pytest.raises(ValueError, match="duplicate plugin"):
+        PluginHost([duplicate, duplicate])

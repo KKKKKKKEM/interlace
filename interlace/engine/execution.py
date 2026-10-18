@@ -11,7 +11,7 @@ from collections.abc import AsyncIterator, Callable, Generator, Iterator, Mappin
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from threading import RLock
+from threading import TIMEOUT_MAX, RLock
 from types import TracebackType
 from typing import Any, NoReturn
 from uuid import uuid4
@@ -261,6 +261,7 @@ class Execution:
         _cancel_listeners: cancel 被接受时同步调用的内部回调，按订阅令牌索引。
         _stream_counter: 分配输出游标编号的计数器。
         _stream_cursors: 活跃输出流编号到下次读取索引的映射，参与背压计算。
+        _unbounded: 宿主关闭时置为 True，此后发布不再等待订阅读取，输出全部留在存储中；只置位不复位。
     """
 
     def __init__(
@@ -325,6 +326,7 @@ class Execution:
         self._cancel_listeners: dict[object, Callable[[], None]] = {}
         self._stream_counter = itertools.count()
         self._stream_cursors: dict[int, int] = {}
+        self._unbounded = False
 
     @property
     def status(self) -> ExecutionStatus:
@@ -443,7 +445,10 @@ class Execution:
                 remaining = None if deadline is None else deadline - time.monotonic()
                 if remaining is not None and remaining <= 0:
                     return False
-            self._notifier.wait(version, remaining)
+            # 超大有限时限超过线程等待上限时分段等待，循环会重新计算剩余时间。
+            self._notifier.wait(
+                version, None if remaining is None else min(remaining, TIMEOUT_MAX)
+            )
 
     def result(self, timeout: float | None = None) -> tuple[Output, ...]:
         """等待终态并返回完整 terminal Output；失败时重新抛出原始执行异常。
@@ -679,7 +684,8 @@ class Execution:
         """先执行 `checkpoint()`，再返回距最近的 Graph 或 Node deadline 的秒数。
 
         Returns:
-            剩余秒数（不小于 0）；没有生效的时限时返回 None。
+            剩余秒数（不小于 0，且不超过 threading.TIMEOUT_MAX，调用方循环重算）；
+            没有生效的时限时返回 None。
 
         Raises:
             ExecutionControlError: 同 `checkpoint()`。
@@ -698,7 +704,8 @@ class Execution:
                 remaining.append(
                     self._step_timeout - (now - self._node_started_monotonic)
                 )
-            return None if not remaining else max(0.0, min(remaining))
+            # 超大有限时限会让线程等待溢出；截断后等待方到期醒来重新计算，语义不变。
+            return None if not remaining else min(max(0.0, min(remaining)), TIMEOUT_MAX)
 
     def succeed(self) -> None:
         """执行宿主在执行器完成后标记成功；结果来自已发布的输出。
@@ -798,7 +805,11 @@ class Execution:
                 raise RuntimeError("output publication requires RUNNING status")
             # 订阅对象的 __del__ 可能在同线程内重入并删除游标，必须遍历快照。
             cursors = tuple(self._stream_cursors.values())
-            if cursors and len(self._store) - min(cursors) >= self.output_buffer:
+            if (
+                not self._unbounded
+                and cursors
+                and len(self._store) - min(cursors) >= self.output_buffer
+            ):
                 return False
             self._store.append(output)
             self._notifier.notify()
@@ -851,6 +862,18 @@ class Execution:
             except asyncio.TimeoutError:
                 self.checkpoint()
 
+    def _release_backpressure(self) -> None:
+        """供执行宿主关闭时调用：解除订阅背压，让阻塞的发布方继续并把剩余输出全部留在存储中。
+
+        订阅仍可从原游标完整读取；该操作不可撤销，对已结束的执行没有作用。
+        """
+
+        with self._condition:
+            if self._unbounded:
+                return
+            self._unbounded = True
+            self._notifier.notify()
+
     async def _await_result(self) -> tuple[Output, ...]:
         """异步等待终态并返回 `result(0)`；等待被取消时同时取消 execution。"""
 
@@ -901,14 +924,17 @@ class Execution:
 
         Returns:
             `(output, True)` 表示读到一项并前移游标；`(None, True)` 表示需要等待；
-            `(None, False)` 表示执行成功结束且已读完。
+            `(None, False)` 表示执行成功结束且已读完，或订阅已被其他线程或任务关闭。
 
         Raises:
             BaseException: 执行失败且已读完已发布输出时的执行异常。
         """
 
         with self._condition:
-            cursor = self._stream_cursors[stream_id]
+            cursor = self._stream_cursors.get(stream_id)
+            if cursor is None:
+                # 阻塞读取期间订阅被并发关闭：按已结束处理，读取方正常停止迭代。
+                return None, False
             if cursor < len(self._store):
                 output = self._store[cursor]
                 self._stream_cursors[stream_id] = cursor + 1

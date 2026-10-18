@@ -263,7 +263,7 @@ ExecutionNotifier 提供单调版本 `version`、`notify()`、`wait(version, tim
 
 | 接口 | 契约 |
 | --- | --- |
-| `slots.try_acquire()` | 立即申请一个根执行链引用，池耗尽时返回 `None` |
+| `slots.try_acquire()` | 立即申请一个根执行链引用，池耗尽时返回 `None`；已关闭时抛 `SlotProviderClosedError` |
 | `slots.acquire(timeout=None)` | 在调度控制线程中等待；超时抛 `TimeoutError`，零秒表示不等待 |
 | `slots.subscribe_available(callback)` | 订阅 Slot 归还通知，返回幂等取消函数；通知不预留资源 |
 | `lease.slot` | 读取执行链的 Slot，不转移引用所有权 |
@@ -273,6 +273,9 @@ ExecutionNotifier 提供单调版本 `version`、`notify()`、`wait(version, tim
 根 Work 在分配到 lease 后才可占用 Consumer 的执行线程；没有可用 Slot 时保留在待调度队列中，并继续调度已经
 携带 lease 的延续 Work。先注册可用通知，再尝试调度；通知只提示重新调用 `try_acquire()`，其他 Consumer 可能先取得
 资源。回调应快速返回，抛出的普通异常会被记录并隔离，不影响归还和其他订阅者。关闭 Consumer 时取消自己的订阅。
+`try_acquire()` 抛出 `SlotProviderClosedError`（同时是 `RuntimeError`）表示资源池已永久关闭：默认内存后端在通道全部消费者的
+资源池都已关闭时，把无法再分配的队首根 Work 记为失败并移出队列，`wait_idle()` 与关闭不会永久等待；其他异常视为暂时失败，
+Work 保留在队列中等待后续推进。
 
 取得引用后，交付和释放遵循下面的所有权规则：
 

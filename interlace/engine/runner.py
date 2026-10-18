@@ -6,7 +6,6 @@ import asyncio
 import concurrent.futures
 import inspect
 import logging
-from contextlib import suppress
 from threading import Event as ThreadEvent
 from threading import RLock, Thread, current_thread
 from typing import TYPE_CHECKING, Any
@@ -91,8 +90,13 @@ class LocalRunner:
             if not future.done():
                 task = scheduled.result()
                 self._loop.call_soon_threadsafe(task.cancel)
-                with suppress(BaseException):
+                try:
                     future.result()
+                except (concurrent.futures.CancelledError, asyncio.CancelledError):
+                    pass
+                except BaseException:
+                    # 清理失败不能替换原控制异常，但必须留下可见记录。
+                    _LOGGER.exception("awaitable cleanup failed after cancellation")
             raise
         finally:
             remove_listener()

@@ -85,6 +85,9 @@ join = KeyedJoin(max_pending=10_000)
 当前 execution 和 node binding 内。图静止时仍有未配对值会抛出 `IncompleteInputsError`，缓存超过 `max_pending`
 则抛出 `KeyedJoinOverflowError`（`ExecutionError` 子类），不会静默错配或无限增长。
 
+`KeyedJoin` 使用内建 `interlace.core/longest` 输入策略：每次 firing 消费一个值，优先取积压较多的一侧，
+平局按声明顺序。交错到达的左右输入因此及时配对，`max_pending` 反映真实的未配对积压，而不会因先排空一侧被提前触发。
+
 `InputPolicy.ANY` 适合“任一输入到达即可处理”的消费者；它按 Ports 声明顺序从第一个就绪端口取一个值，因此
 Node 必须能根据实际存在的 key 区分输入来源。
 

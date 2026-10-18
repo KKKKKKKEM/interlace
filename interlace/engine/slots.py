@@ -12,6 +12,7 @@ from typing import Any, Protocol, runtime_checkable
 from uuid import uuid4
 
 from .._validation import require_non_empty_string, validate_timeout
+from .errors import SlotProviderClosedError
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -75,6 +76,9 @@ class SlotProvider(Protocol):
 
         Returns:
             持有一个引用的 lease，调用方负责释放；池耗尽时为 None。
+
+        Raises:
+            SlotProviderClosedError: 已关闭，不会再提供 Slot；其他异常视为暂时申请失败。
         """
         ...
 
@@ -271,12 +275,12 @@ class SlotPool:
             持有一个引用的 lease；池耗尽时返回 None。
 
         Raises:
-            RuntimeError: 池已关闭。
+            SlotProviderClosedError: 池已关闭。
         """
 
         with self._condition:
             if self._closed:
-                raise RuntimeError("slot pool is closed")
+                raise SlotProviderClosedError("slot pool is closed")
             if not self._available:
                 return None
             return _SlotLease(self, self._available.popleft())
@@ -295,7 +299,7 @@ class SlotPool:
 
         Raises:
             TypeError: listener 不可调用。
-            RuntimeError: 池已关闭。
+            SlotProviderClosedError: 池已关闭。
         """
 
         if not callable(listener):
@@ -303,7 +307,7 @@ class SlotPool:
         token = object()
         with self._condition:
             if self._closed:
-                raise RuntimeError("slot pool is closed")
+                raise SlotProviderClosedError("slot pool is closed")
             self._listeners[token] = listener
 
         def unsubscribe() -> None:
@@ -324,7 +328,7 @@ class SlotPool:
             持有一个引用的 lease，调用方负责释放。
 
         Raises:
-            RuntimeError: 池已关闭或在等待期间关闭。
+            SlotProviderClosedError: 池已关闭或在等待期间关闭。
             TimeoutError: timeout 内没有可用 Slot。
         """
 
@@ -333,13 +337,13 @@ class SlotPool:
         with self._condition:
             while not self._available:
                 if self._closed:
-                    raise RuntimeError("slot pool is closed")
+                    raise SlotProviderClosedError("slot pool is closed")
                 remaining = None if deadline is None else deadline - time.monotonic()
                 if remaining is not None and remaining <= 0:
                     raise TimeoutError("slot pool did not provide a Slot")
                 self._condition.wait(remaining)
             if self._closed:
-                raise RuntimeError("slot pool is closed")
+                raise SlotProviderClosedError("slot pool is closed")
             return _SlotLease(self, self._available.popleft())
 
     def _release(self, slot: Slot) -> None:

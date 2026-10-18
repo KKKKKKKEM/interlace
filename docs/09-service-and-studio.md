@@ -96,7 +96,8 @@ app.mount("/interlace", service.create_app(token="application-provided-token"))
 攻击页面即使让 Host 与 Origin 一致（例如都指向 `evil.example`），也不在白名单中。`create_app()` 默认只接受
 `127.0.0.1`、`localhost` 与 `::1`；`serve()` 默认再加入实际监听地址。通过域名、局域网地址或反向代理访问时，
 显式传入 `allowed_hosts=["studio.example.com"]`；包含 `"*"` 表示不检查 Host，只应在前置代理已校验 Host 时使用。
-默认仅监听 `127.0.0.1`；`serve()` 监听非回环地址且没有设置令牌时记录警告。TLS、用户体系和多用户权限由应用或
+默认仅监听 `127.0.0.1`；`serve()` 监听非回环地址且没有设置令牌时记录警告。全部响应带 `X-Frame-Options: DENY`
+与 `Content-Security-Policy: frame-ancestors 'none'`，禁止第三方页面嵌入工作台诱导点击。TLS、用户体系和多用户权限由应用或
 反向代理承担。
 
 单个 HTTP 请求体默认最多 1 MiB，可通过 `create_app(max_request_bytes=...)` 或
@@ -210,8 +211,10 @@ curl http://127.0.0.1:8000/api/executions \
 
 观测 SSE 提供 `observation` 与 `finished` 消息，支持 `Last-Event-ID` 或 `after` 游标恢复。服务先读取执行状态再读取
 观测批次，只有在已观察到终态之后再读到空批次时才发送 `finished`，因此终态前写入的观测不会被跳过。
-输出 SSE 提供 `output`、`finished` 或 `failure` 消息，从首项重放。当前执行沿用原生异步输出迭代与背压，
-历史输出从数据库逐批读取，均不要求先构建全量结果。
+输出 SSE 提供 `output`、`finished` 或 `failure` 消息，从首项重放。当前执行由服务端任务及时读取原生异步输出并转交客户端，
+观察端不对业务执行施加背压；客户端未发送积压超过 10,000 项时以 `failure` 断开，执行结束后可再次请求历史重放。
+历史输出从数据库逐批读取，均不要求先构建全量结果。同一 Work.id 被重投递时，历史记录与输出只保留最新一次尝试，
+观测事件按追加顺序保留全部尝试。
 
 客户端断开只释放输出订阅，不自动取消执行；需要取消时调用取消接口。Graph timeout 约束业务执行，不等于
 HTTP 连接超时。已经交付的输出不会因后续失败撤回。同步 Node 仍需通过 checkpoint 协作式响应取消。
@@ -255,7 +258,8 @@ curl http://127.0.0.1:8000/rpc \
 诊断默认启用，可用 `GraphService(runtime, diagnostics=False)` 关闭参数、原始输出和日志采集，保留生命周期与终端结果。
 参数通过同一 Hook 贡献通道的同步 `NodeHook.inspect()` 采集：输入在全部 enter 转换之后，原始输出在 exit 转换之前。
 同一 firing 的诊断记录最多积累 64 条后批量提交，并在节点结束前冲刷剩余记录，减少文件 SQLite 的逐条事务开销。
-采集立即生成独立快照，不修改原对象，失败不改变业务结果。生命周期仍使用公开 Runtime Observer，
+采集立即生成独立快照，不修改原对象，失败不改变业务结果；生成器等一次性迭代器以 `$unavailable` 标记代替，不被读取。
+终端输出含一次性迭代器时编码明确失败，不消耗应用仍持有的对象。生命周期仍使用公开 Runtime Observer，
 `output.routed` 只记录 step、port 和目标端口集合，不携带业务对象。
 
 日志通过当前观测作用域的 execution、node 与 step 关联，不能按线程 ID 猜测归属。采集遵守应用已有日志级别与

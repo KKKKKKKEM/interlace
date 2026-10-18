@@ -56,17 +56,6 @@ class _Lifecycle:
             if self._state is not _LifecycleState.OPEN:
                 raise RuntimeClosedError(f"{self._name} is closed")
 
-    def ensure_active(self) -> None:
-        """允许 CLOSING 阶段的延续工作，只拒绝已完成关闭的组件。
-
-        Raises:
-            RuntimeClosedError: 组件已经 CLOSED。
-        """
-
-        with self._condition:
-            if self._state is _LifecycleState.CLOSED:
-                raise RuntimeClosedError(f"{self._name} is closed")
-
     def begin_close(self) -> bool:
         """原子进入 CLOSING，或等待其他线程完成的同一次关闭。
 
@@ -109,6 +98,8 @@ def _close_components(
 ) -> BaseException | None:
     """依次关闭去重后的组件，保留最先出现的失败。
 
+    控制异常同样只记录不中断，保证后续组件仍被关闭，最后由调用方重新抛出。
+
     Args:
         components: 需要依次关闭的组件集合。
         failure: 先前已经记录的失败，None 表示没有失败。
@@ -120,7 +111,7 @@ def _close_components(
     for component in components:
         try:
             component.close()
-        except Exception as exc:
+        except BaseException as exc:
             if failure is None:
                 failure = exc
     return failure

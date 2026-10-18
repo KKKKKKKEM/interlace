@@ -22,6 +22,7 @@ class _ExecutionHistory:
         _records: 按登记顺序保存的执行 ID 到 Execution 映射。
         _active: 已登记但执行宿主尚未收尾的执行，按 ID 索引。
         _condition: 保护记录，并在活跃执行归零时唤醒空闲等待方。
+        _unbounded: 宿主进入关闭后为 True，之后登记的执行同样解除输出背压；只置位不复位。
     """
 
     def __init__(self, limit: int) -> None:
@@ -43,6 +44,7 @@ class _ExecutionHistory:
         self._records: OrderedDict[str, Execution] = OrderedDict()
         self._active: dict[str, Execution] = {}
         self._condition = Condition()
+        self._unbounded = False
 
     @property
     def idle(self) -> bool:
@@ -66,6 +68,8 @@ class _ExecutionHistory:
             self._records.pop(execution.id, None)
             self._records[execution.id] = execution
             self._active[execution.id] = execution
+            if self._unbounded:
+                execution._release_backpressure()
             self._trim_locked()
 
     def finish(self, execution: Execution) -> None:
@@ -78,6 +82,15 @@ class _ExecutionHistory:
             self._trim_locked()
             if not self._active:
                 self._condition.notify_all()
+
+    def release_backpressure(self) -> None:
+        """解除全部活跃执行及此后登记执行的输出背压，使未读订阅不阻止关闭排空。"""
+
+        with self._condition:
+            self._unbounded = True
+            active = tuple(self._active.values())
+        for execution in active:
+            execution._release_backpressure()
 
     def get(self, execution_id: str) -> Execution:
         """按 ID 读取保留的执行。

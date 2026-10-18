@@ -324,6 +324,30 @@ def test_keyed_join_overflow_raises_interlace_execution_error() -> None:
     assert not isinstance(caught.value, OverflowError)
 
 
+def test_keyed_join_pairs_interleaved_batch_within_pending_limit() -> None:
+    """同一 firing 交错产出的左右值及时配对，未配对积压不会因先排空一侧而超限。"""
+
+    items = tuple(
+        (side, KeyedValue(index, f"{side}-{index}"))
+        for index in range(5)
+        for side in ("left", "right")
+    )
+    graph = (
+        Graph(entrypoint="source")
+        .add(source=PairSource(), join=KeyedJoin(max_pending=1))
+        .connect("source", "join", source_port="left", target_port="left")
+        .connect("source", "join", source_port="right", target_port="right")
+    )
+    with Runtime() as runtime:
+        runtime.register("join.graph", graph)
+        outputs = runtime.run("join.graph", items)
+
+    assert outputs == tuple(
+        Output(KeyedPair(index, f"left-{index}", f"right-{index}"), "joined")
+        for index in range(5)
+    )
+
+
 def test_policy_ref_compares_by_value_and_is_explicitly_unhashable() -> None:
     """PolicyRef 按名称与冻结配置比较；只读配置不能稳定哈希，因此显式不可哈希。"""
 

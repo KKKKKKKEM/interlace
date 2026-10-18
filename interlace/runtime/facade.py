@@ -27,6 +27,7 @@ from ..plugins import (
     CAP_GRAPH_WORKER,
     CAP_TASK_BACKEND,
     Plugin,
+    PluginDescriptor,
     PluginHost,
 )
 from ..spi import EventHandler, GraphCatalog, RouterRole, SlotProvider, WorkerRole
@@ -76,6 +77,12 @@ class Runtime:
         host: PluginHost | None = None
         if router is None:
             selected = () if plugins is None else tuple(plugins)
+            # 汇总 provides 之前先校验声明类型，非插件对象明确报 TypeError。
+            if any(
+                not isinstance(getattr(plugin, "descriptor", None), PluginDescriptor)
+                for plugin in selected
+            ):
+                raise TypeError("plugin must define a PluginDescriptor")
             provides = {
                 capability
                 for plugin in selected
@@ -660,11 +667,15 @@ class Runtime:
 
         if not self._lifecycle.begin_close():
             return
+        # 未读取的 iter/aiter 订阅不能阻止排空；剩余输出留在存储中，订阅方之后仍可完整读取。
+        for execution in self.worker.executions():
+            if not execution.status.terminal:
+                execution._release_backpressure()
         failure: BaseException | None = None
         try:
             try:
                 self.wait_idle()
-            except Exception as exc:
+            except BaseException as exc:
                 failure = exc
             if self._plugin_host is None:
                 failure = _close_components((self.worker, self.router), failure)

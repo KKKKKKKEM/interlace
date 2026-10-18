@@ -17,6 +17,8 @@ from interlace.engine.hooks import HookPhase, NodeCall, NodeHook, StopGraph
 from interlace.engine.observation import current_node_event
 from interlace.service import GraphService
 from interlace.service.diagnostics import redact_text, snapshot_value
+from interlace.service.errors import OutputEncodingError
+from interlace.service.service import encode
 
 # 通过传播到根处理器的标准日志验证采集，测试不替换全局日志工厂。
 _LOGGER = logging.getLogger("interlace.test.node")
@@ -396,6 +398,75 @@ def test_redaction_matches_key_fragments_and_credentials_in_text() -> None:
     assert "abc.def" not in redact_text("Authorization: Bearer abc.def")
     assert redact_text('{"refresh_token": "xyz"}') == '{"refresh_token": "[REDACTED]"}'
     assert redact_text("KeyError: 'missing'") == "KeyError: 'missing'"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Authorization: Token ghp_secretvalue",
+        "redis://:ab/secretvalue@host:6379/0",
+        "postgres://user:p@secretvalue@db/app",
+        "https://bucket.s3.amazonaws.com/a?X-Amz-Signature=secretvalue&x=1",
+        "https://acct.blob.core.windows.net/c?sv=1&sig=secretvalue",
+        "pwd=secretvalue passphrase: secretvalue",
+    ],
+)
+def test_redaction_covers_other_credential_shapes(text: str) -> None:
+    """非 Bearer 认证头、含 / 或 @ 的 userinfo、预签名参数和更多凭据名都被隐藏。
+
+    Args:
+        text: 含凭据的文本。
+    """
+
+    assert "secretvalue" not in redact_text(text)
+
+
+def test_redaction_masks_more_field_names_without_hiding_author() -> None:
+    """auth、session、signature 等字段被遮蔽，author 等普通字段保持可读。"""
+
+    assert snapshot_value(
+        {"auth": ["user", "pass"], "sessionid": "s", "signature": "x", "author": "me"}
+    ) == {
+        "auth": "[REDACTED]",
+        "sessionid": "[REDACTED]",
+        "signature": "[REDACTED]",
+        "author": "me",
+    }
+
+
+def test_snapshot_and_encode_do_not_consume_iterators() -> None:
+    """诊断快照用标记代替一次性迭代器，输出编码明确拒绝，原迭代器仍可完整读取。"""
+
+    values = iter([1, 2, 3])
+    snapshot = snapshot_value({"items": values, "output": Output(values)})
+    assert "$unavailable" in snapshot["items"]
+    with pytest.raises(OutputEncodingError, match="iterator"):
+        encode(Output(values))
+    assert list(values) == [1, 2, 3]
+
+
+def test_service_handler_keeps_last_resort_output(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """应用未配置日志时，安装诊断处理器后 WARNING 仍按标准库默认行为写到 stderr。"""
+
+    root = logging.getLogger()
+    handlers = tuple(root.handlers)
+    for handler in handlers:
+        root.removeHandler(handler)
+    try:
+        with Runtime() as runtime:
+            service = GraphService(runtime)
+            try:
+                logging.getLogger("interlace.test.unconfigured").warning(
+                    "still visible"
+                )
+            finally:
+                service.close()
+    finally:
+        for handler in handlers:
+            root.addHandler(handler)
+    assert "still visible" in capsys.readouterr().err
 
 
 def test_logs_exceptions_and_execution_errors_are_redacted() -> None:

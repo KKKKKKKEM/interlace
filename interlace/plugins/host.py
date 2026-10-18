@@ -46,15 +46,18 @@ class PluginDescriptor:
 
         Raises:
             TypeError: 任一声明集合不是 tuple，或元素不是字符串。
-            ValueError: 标识缺少命名空间、版本格式不合法、声明重复、依赖自身，或同一 capability
+            ValueError: 标识缺少命名空间或含空白、版本格式不合法、声明重复、依赖自身，或同一 capability
                 同时声明为单例与聚合、同时提供与依赖。
         """
 
         plugin_id = require_non_empty_string(self.id, "plugin id")
         if "/" not in plugin_id:
             raise ValueError("plugin id must be namespaced")
+        if any(char.isspace() for char in plugin_id):
+            raise ValueError("plugin id must not contain whitespace")
         version = require_non_empty_string(self.version, "plugin version")
-        if not _VERSION.match(version):
+        # fullmatch 拒绝 `$` 允许的末尾换行。
+        if not _VERSION.fullmatch(version):
             raise ValueError("plugin version must use a simple semantic version")
         api_version = require_non_empty_string(self.api_version, "plugin API version")
         if not api_version.isdigit() or int(api_version) < 1:

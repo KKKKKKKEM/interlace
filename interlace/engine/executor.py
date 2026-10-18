@@ -71,6 +71,15 @@ _UNRECOVERABLE_ERRORS = (
 _ERROR_DETAIL_LIMIT = 65536
 
 
+def _attribute(error: ExecutionError, graph: str, node: str) -> None:
+    """为缺少归属的 ExecutionError 补充 graph 与 node，已有归属保持不变。"""
+
+    if error.graph is None:
+        error.graph = graph
+    if error.node is None:
+        error.node = node
+
+
 @dataclass(slots=True)
 class _Run:
     """一次 Graph execution 的调度状态，只在执行线程内读写。
@@ -313,7 +322,11 @@ class Engine:
         if execution.status is not ExecutionStatus.RUNNING:
             raise RuntimeError("execution must be running")
         entrypoint = graph.entrypoint if plan is None else plan.entrypoint
-        prepared = self._coerce_inputs(graph, inputs, entrypoint=entrypoint)
+        try:
+            prepared = self._coerce_inputs(graph, inputs, entrypoint=entrypoint)
+        except ExecutionError as exc:
+            _attribute(exc, name, entrypoint)
+            raise
         run = self._prepare(
             name,
             graph,
@@ -474,6 +487,7 @@ class Engine:
         Raises:
             ExecutionControlError: 工厂内检测到取消或超时，原样传播。
             ExecutionError: 绑定或工厂失败、工厂未返回 Context；原异常为 __cause__。
+            HookExecutionError: 工厂抛出只允许 Hook 使用的 StopGraph 或 ShortCircuit。
         """
 
         try:
@@ -494,6 +508,12 @@ class Engine:
                 raise TypeError("context_factory must return a Context")
         except ExecutionControlError:
             raise
+        except HookSignal as signal:
+            raise HookExecutionError(
+                f"{type(signal).__name__} can only be raised by a hook",
+                graph=run.graph_name,
+                node=node_id,
+            ) from signal
         except Exception as exc:
             raise ExecutionError(
                 f"context factory failed: {exc}",
@@ -663,6 +683,7 @@ class Engine:
         Raises:
             ExecutionControlError: 回调前或回调内检测到取消或超时。
             ExecutionError: 回调失败；普通异常被包装并以原异常为 __cause__。
+            HookExecutionError: 回调抛出只允许 Hook 使用的 StopGraph 或 ShortCircuit。
         """
 
         index = 0
@@ -674,6 +695,11 @@ class Engine:
                 callback()
             except ExecutionControlError:
                 raise
+            except HookSignal as signal:
+                raise HookExecutionError(
+                    f"{type(signal).__name__} can only be raised by a hook",
+                    graph=run.graph_name,
+                ) from signal
             except ExecutionError as exc:
                 if exc.graph is None:
                     exc.graph = run.graph_name
@@ -698,7 +724,7 @@ class Engine:
 
         Raises:
             ExecutionError: 节点或 Hook 抛出普通异常时包装为带节点归属的错误；
-                ExecutionError 子类原样传播。
+                ExecutionError 子类原样传播，缺少归属时补充当前 graph 与 node。
             HookSignal: Hook 抛出的 ShortCircuit 或 StopGraph，由调用方解释。
         """
 
@@ -712,7 +738,10 @@ class Engine:
         )
         try:
             yield from self._invoke(firing, 0, firing.original)
-        except (ExecutionError, HookSignal):
+        except HookSignal:
+            raise
+        except ExecutionError as exc:
+            _attribute(exc, run.graph_name, node_id)
             raise
         except Exception as exc:
             raise ExecutionError(

@@ -936,3 +936,43 @@ def test_concurrent_close_waits_for_the_same_drain() -> None:
     with pytest.raises(RuntimeError, match="closed"):
         tasks.submit("queue", Work("graph"))
     tasks.close()
+
+
+def test_event_bus_logs_handler_failures_that_are_not_raised(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """多个订阅者失败时只抛出首个失败，其余失败写入 ERROR 日志而不是静默丢弃。"""
+
+    bus = memory.EventBus()
+
+    def failing(message: str) -> Callable[[Event], None]:
+        """构造抛出指定消息的订阅者。
+
+        Args:
+            message: 失败消息。
+
+        Returns:
+            总是失败的处理器。
+        """
+
+        def handler(event: Event) -> None:
+            """抛出测试失败。"""
+
+            del event
+            raise ValueError(message)
+
+        return handler
+
+    bus.subscribe("value", failing("first"))
+    bus.subscribe("value", failing("second"))
+    try:
+        with (
+            caplog.at_level(logging.ERROR, logger="interlace.adapters.memory"),
+            pytest.raises(ValueError, match="first"),
+        ):
+            bus.publish(Event("value", 1))
+    finally:
+        bus.close()
+    assert [
+        str(record.exc_info[1]) for record in caplog.records if record.exc_info
+    ] == ["second"]

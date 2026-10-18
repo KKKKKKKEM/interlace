@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import re
 import traceback
+from collections.abc import Iterator, Mapping
 from contextlib import suppress
 from datetime import datetime, timezone
 from threading import RLock
@@ -19,9 +21,11 @@ from interlace.engine.observation import RuntimeEvent, current_node_event
 
 from .store import ServiceStore
 
-# 字段名包含任一片段即视为凭据，按不区分大小写的子串匹配。
+# 字段名包含任一片段即视为凭据，按不区分大小写的子串匹配；auth 排除 author，sig 只匹配独立片段。
 _SECRET_KEY = re.compile(
-    r"secret|token|password|passwd|key|authorization|cookie|credential", re.IGNORECASE
+    r"secret|token|password|passwd|pwd|passphrase|key|authorization|auth(?!or)"
+    r"|cookie|credential|session|signature|(?:^|[_.-])sig(?:$|[_.-])",
+    re.IGNORECASE,
 )
 
 
@@ -33,11 +37,19 @@ def _redact_assignment(match: re.Match[str]) -> str:
     return f"{match.group(1)}{match.group(2)}{quote}[REDACTED]{quote}"
 
 
-# 自由文本中的凭据形态：URL userinfo、Bearer/Basic 凭据与“名称=值”或“名称: 值”。
-# 自由文本不使用单独的 key 片段，避免把 KeyError 等异常名称当成凭据。
+# 自由文本中的凭据形态：认证头整行值、URL userinfo、Bearer/Basic 凭据、签名查询参数与
+# “名称=值”或“名称: 值”。自由文本不使用单独的 key 片段，避免把 KeyError 等异常名称当成凭据。
 _TEXT_PATTERNS: tuple[tuple[re.Pattern[str], Any], ...] = (
     (
-        re.compile(r"\b([a-z][a-z0-9+.-]*://)[^\s/@]+@", re.IGNORECASE),
+        # 认证头可能使用 Token、Digest 等任意方案，值一直延续到行尾。
+        re.compile(
+            r"\b((?:proxy-)?authorization[\"']?\s*[=:]\s*)[^\r\n\"',;]+", re.IGNORECASE
+        ),
+        r"\1[REDACTED]",
+    ),
+    (
+        # userinfo 可能含 / 或 @，匹配到查询与片段之前的最后一个 @。
+        re.compile(r"\b([a-z][a-z0-9+.-]*://)[^\s?#]*@", re.IGNORECASE),
         r"\1[REDACTED]@",
     ),
     (
@@ -45,15 +57,81 @@ _TEXT_PATTERNS: tuple[tuple[re.Pattern[str], Any], ...] = (
         r"\1 [REDACTED]",
     ),
     (
+        # 预签名 URL 的签名与临时凭据参数本身即可授权访问。
         re.compile(
-            r"([\w.-]*(?:secret|token|password|passwd|api[_-]?key|access[_-]?key"
-            r"|private[_-]?key|authorization|cookie|credential)[\w.-]*)"
+            r"([?&](?:sig|x-amz-signature|x-amz-credential|x-amz-security-token"
+            r"|x-goog-signature|x-goog-credential)=)[^\s&#'\"]+",
+            re.IGNORECASE,
+        ),
+        r"\1[REDACTED]",
+    ),
+    (
+        re.compile(
+            r"([\w.-]*(?:secret|token|password|passwd|pwd|passphrase|api[_-]?key"
+            r"|access[_-]?key|private[_-]?key|authorization|cookie|credential"
+            r"|signature|session[_-]?id)[\w.-]*)"
             r"([\"']?\s*[=:]\s*)(\"[^\"]*\"|'[^']*'|[^\s,;&'\"]+)",
             re.IGNORECASE,
         ),
         _redact_assignment,
     ),
 )
+
+
+def protect_iterators(value: Any, depth: int = 0) -> Any:
+    """返回把一次性迭代器替换为不可用标记的副本，避免序列化耗尽并改变原对象。
+
+    递归处理映射、序列、集合与数据类字段；其他对象原样返回，由序列化器按自身规则处理。
+
+    Args:
+        value: 待序列化的参数、配置或 Output。
+        depth: 当前递归层数，调用方通常省略；超过 16 层不再展开。
+
+    Returns:
+        不包含一次性迭代器的结构；容器为新建副本，叶子对象沿用原引用。
+    """
+
+    if isinstance(value, Iterator):
+        return {"$unavailable": f"{type(value).__name__} 是一次性迭代器，不读取"}
+    if depth > 16:
+        return value
+    if isinstance(value, Mapping):
+        return {key: protect_iterators(item, depth + 1) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [protect_iterators(item, depth + 1) for item in value]
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return {
+            field.name: protect_iterators(getattr(value, field.name), depth + 1)
+            for field in dataclasses.fields(value)
+        }
+    return value
+
+
+def contains_iterator(value: Any, depth: int = 0) -> bool:
+    """判断值的映射、序列、集合或数据类字段中是否含有一次性迭代器。
+
+    Args:
+        value: 待编码的值。
+        depth: 当前递归层数，调用方通常省略；超过 16 层不再展开。
+
+    Returns:
+        含有迭代器时为 True。
+    """
+
+    if isinstance(value, Iterator):
+        return True
+    if depth > 16:
+        return False
+    if isinstance(value, Mapping):
+        return any(contains_iterator(item, depth + 1) for item in value.values())
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return any(contains_iterator(item, depth + 1) for item in value)
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return any(
+            contains_iterator(getattr(value, field.name), depth + 1)
+            for field in dataclasses.fields(value)
+        )
+    return False
 
 
 def redact_text(text: str) -> str:
@@ -84,7 +162,7 @@ def snapshot_value(value: Any) -> Any:
 
     try:
         normalized = to_jsonable_python(
-            value,
+            protect_iterators(value),
             fallback=lambda item: {
                 "$unavailable": f"{type(item).__name__} 无法编码为 JSON"
             },
@@ -306,10 +384,14 @@ class _NodeLogHandler(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
         """提取脱敏后的日志文字及异常堆栈，不拦截进程级 stdout。
 
+        挂在根 logger 上会让标准库认为已有处理器而跳过 logging.lastResort；
+        没有其他处理器会处理该记录时，本处理器代为交给 lastResort，保持应用原有输出。
+
         Args:
             record: 已经通过应用日志级别过滤的记录。
         """
 
+        self._fallback(record)
         event = current_node_event()
         if event is None:
             return
@@ -328,3 +410,22 @@ class _NodeLogHandler(logging.Handler):
                     else None,
                 },
             )
+
+    def _fallback(self, record: logging.LogRecord) -> None:
+        """应用未配置其他处理器时，把达到级别的记录交给 logging.lastResort。
+
+        Args:
+            record: 当前日志记录。
+        """
+
+        last_resort = logging.lastResort
+        if last_resort is None or record.levelno < last_resort.level:
+            return
+        logger: logging.Logger | None = logging.getLogger(record.name)
+        while logger is not None:
+            if any(handler is not self for handler in logger.handlers):
+                return
+            if not logger.propagate:
+                break
+            logger = logger.parent
+        last_resort.handle(record)

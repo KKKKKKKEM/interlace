@@ -1,5 +1,7 @@
 """共享传输的注册生命周期、失败回滚和交付清理契约。"""
 
+import threading
+import time
 from contextlib import AbstractContextManager
 from collections.abc import Callable
 from threading import Event as ThreadEvent
@@ -9,7 +11,11 @@ import pytest
 
 from interlace import Event, Graph, Node, Runtime, Slot, SlotPool
 from interlace.adapters import memory
-from interlace.engine.errors import RuntimeClosedError
+from interlace.engine.errors import (
+    ExecutionError,
+    RuntimeClosedError,
+    SlotProviderClosedError,
+)
 from interlace.runtime import EventRouter, GraphWorker, LocalRuntimePlugin
 from interlace.spi import Delivery, DeliveryResult, SlotLease, Work, WorkHandler
 
@@ -806,3 +812,148 @@ def test_concurrent_close_shares_one_drain_and_rejects_new_roots(target: str) ->
     with pytest.raises(RuntimeClosedError):
         owner.start("block")
     owner.close()
+
+
+def _close_in_thread(closable: object, timeout: float = 5) -> BaseException | None:
+    """在线程中关闭对象，断言按时返回并取回关闭抛出的异常。
+
+    Args:
+        closable: 提供 close() 的对象。
+        timeout: 最长等待秒数。
+
+    Returns:
+        close() 抛出的异常；正常返回时为 None。
+    """
+
+    raised: list[BaseException | None] = []
+
+    def close() -> None:
+        """执行关闭并记录结果。"""
+
+        try:
+            closable.close()  # type: ignore[attr-defined]
+        except BaseException as exc:
+            raised.append(exc)
+        else:
+            raised.append(None)
+
+    thread = Thread(target=close, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    assert not thread.is_alive(), "close() did not return"
+    return raised[0]
+
+
+def test_close_after_control_exception_still_closes_every_role() -> None:
+    """队列 Work 抛出控制异常后，Runtime.close 仍关闭全部角色再重新抛出原异常。"""
+
+    class Interrupt(Node):
+        """模拟进程级中断。"""
+
+        def execute(self, inputs, context) -> None:
+            """抛出 KeyboardInterrupt。
+
+            Args:
+                inputs: 忽略的输入。
+                context: 当前执行上下文。
+
+            Raises:
+                KeyboardInterrupt: 测试控制异常。
+            """
+
+            del inputs, context
+            raise KeyboardInterrupt("interrupt")
+
+    runtime = Runtime()
+    runtime.register("interrupt", Graph(entrypoint="node").add(node=Interrupt()))
+    runtime.on("go", graph="interrupt", queue="interrupt")
+    runtime.emit("go", None)
+    raised = _close_in_thread(runtime)
+    assert isinstance(raised, KeyboardInterrupt)
+    deadline = time.monotonic() + 5
+    while any(t.name.startswith("interlace") for t in threading.enumerate()):
+        assert time.monotonic() < deadline, "runtime threads were not stopped"
+        time.sleep(0.01)
+    with pytest.raises(RuntimeClosedError):
+        runtime.worker.start("interrupt")
+    with pytest.raises(RuntimeClosedError):
+        runtime.router.publish(Event("go", None))
+
+
+def test_worker_wait_idle_timeout_keeps_collected_delivery_failure() -> None:
+    """等待超时前已取出的交付失败不能丢失，应优先传播而不是只报超时。"""
+
+    release = ThreadEvent()
+
+    class Fail(Node):
+        """队列执行的业务失败。"""
+
+        def execute(self, inputs, context) -> None:
+            """抛出业务异常。
+
+            Args:
+                inputs: 忽略的输入。
+                context: 当前执行上下文。
+
+            Raises:
+                ValueError: 测试业务失败。
+            """
+
+            del inputs, context
+            raise ValueError("work failed")
+
+    class Slow(Node):
+        """直到测试放行才结束的直接执行。"""
+
+        def execute(self, inputs, context) -> None:
+            """等待放行。
+
+            Args:
+                inputs: 忽略的输入。
+                context: 当前执行上下文。
+            """
+
+            del inputs, context
+            assert release.wait(5)
+
+    with Runtime() as runtime:
+        runtime.register("fail", Graph(entrypoint="node").add(node=Fail()))
+        runtime.register("slow", Graph(entrypoint="node").add(node=Slow()))
+        runtime.on("go", graph="fail", queue="fail")
+        slow = runtime.start("slow")
+        runtime.emit("go", None)
+        try:
+            with pytest.raises(ExecutionError, match="work failed"):
+                runtime.worker.wait_idle(0.5)
+        finally:
+            release.set()
+        slow.result(5)
+        runtime.worker.wait_idle(5)
+
+
+def test_closed_slot_pool_rejects_queued_root_instead_of_hanging() -> None:
+    """消费者的 SlotPool 已关闭时，排队根 Work 以失败结束，等待与关闭不再永久阻塞。"""
+
+    class Noop(Node):
+        """不会被执行的节点。"""
+
+        def execute(self, inputs, context) -> None:
+            """无操作。
+
+            Args:
+                inputs: 忽略的输入。
+                context: 当前执行上下文。
+            """
+
+            del inputs, context
+
+    pool = SlotPool(1)
+    runtime = Runtime()
+    runtime.register("noop", Graph(entrypoint="node").add(node=Noop()))
+    runtime.on("go", graph="noop", queue="noop", slots=pool)
+    pool.close()
+    runtime.emit("go", None)
+    with pytest.raises(SlotProviderClosedError):
+        runtime.wait_idle(5)
+    assert _close_in_thread(runtime) is None
+    assert isinstance(SlotProviderClosedError("closed"), RuntimeError)

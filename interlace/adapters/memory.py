@@ -13,6 +13,7 @@ from functools import partial
 from threading import Condition, RLock
 
 from .._validation import require_non_empty_string, validate_timeout
+from ..engine.errors import SlotProviderClosedError
 from ..engine.events import Event
 from ..engine.slots import SlotPool
 from ..spi import (
@@ -156,6 +157,12 @@ class EventBus:
                     # 一个观察者失败不应阻断同一 Event 的其他订阅者。
                     if failure is None:
                         failure = exc
+                    else:
+                        _logger.error(
+                            "event handler failure not propagated; "
+                            "an earlier handler failure is raised",
+                            exc_info=exc,
+                        )
             if failure is not None:
                 raise failure
         finally:
@@ -526,7 +533,7 @@ class TaskBackend:
             ):
                 try:
                     release()
-                except Exception as exc:
+                except BaseException as exc:
                     if failure is None:
                         failure = exc
         finally:
@@ -699,7 +706,12 @@ class TaskBackend:
         self._next_channel = (start + 1) % len(channels)
 
     def _drain_channel(self, channel: _Channel) -> None:
-        """优先分配携带 Slot 的延续投递，再为队首根投递申请空闲 Slot。"""
+        """优先分配携带 Slot 的延续投递，再为队首根投递申请空闲 Slot。
+
+        全部消费者的 Slot 供应方都已关闭（抛出 SlotProviderClosedError）时，队首根投递再无可能
+        被分配，将其移出队列并记为待传播失败，避免 wait_idle 与 close 永久等待；其他申请异常
+        视为暂时失败，投递保留在队列中并由 _drain_safely 记录。
+        """
 
         while channel.queued and channel.consumers:
             available = self._available_consumers(channel)
@@ -723,12 +735,21 @@ class TaskBackend:
 
             delivery = channel.queued[0]
             assigned: tuple[_Consumer, Delivery] | None = None
+            closed: list[SlotProviderClosedError] = []
             for consumer in available:
-                lease = consumer.slots.try_acquire()
+                try:
+                    lease = consumer.slots.try_acquire()
+                except SlotProviderClosedError as exc:
+                    closed.append(exc)
+                    continue
                 if lease is not None:
                     assigned = (consumer, replace(delivery, slot_lease=lease))
                     break
             if assigned is None:
+                if closed and len(closed) == len(channel.consumers):
+                    channel.queued.popleft()
+                    self._record_failure(closed[0])
+                    continue
                 return
             channel.queued.popleft()
             consumer, delivery = assigned

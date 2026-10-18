@@ -140,6 +140,8 @@ Event、Context、Execution、ExecutionLimits、ExecutionStatus、Slot、SlotPoo
    宣称保留原进程的 Slot 连续性。
 7. 适配器通过 `interlace.spi.SlotProvider` 的公开申请和可用通知接口取得 `SlotLease`，通过 `Delivery.slot_lease` 传递；
    lease 提供引用管理和串行 execution 能力，不暴露内部锁。每个接管的引用必须释放，执行期间的引用由 lease 保护。
+   已关闭的 SlotProvider 申请时抛出 SlotProviderClosedError；Consumer 据此拒绝再也无法分配的根 Work，
+   其他申请异常视为暂时失败，Work 保留待推进。
 
 ## 第十一条：Execution 控制必须默认开放
 
@@ -154,7 +156,8 @@ Event、Context、Execution、ExecutionLimits、ExecutionStatus、Slot、SlotPoo
    ExecutionPlan 只约束当前执行，选中节点的 Event、外部写入及新 Work 不因计划而被屏蔽或自动继承计划。
 7. 已交给流消费者的 terminal Output 不因后续 Graph 失败而撤回。
 8. 输出存储与等待通知实现可替换；存储必须维持追加顺序和可重放性。完整结果按需读取，流式消费不得强制物化
-   全量结果；同步与异步交付共享背压、取消和超时约束。
+   全量结果；同步与异步交付共享背压、取消和超时约束。Runtime 或 Worker 进入关闭时解除未结束执行的订阅背压，
+   剩余输出留在存储中供订阅方读完，未读订阅不能阻止排空已接受工作。
 
 ## 第十二条：扩展点保持受控
 

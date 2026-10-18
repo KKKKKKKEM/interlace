@@ -577,6 +577,9 @@ class GraphWorker:
                 if failure is None:
                     failure = exc
             if not self._history.wait_idle(_remaining(deadline)):
+                # 已从消费者取出的失败不会再次上报，超时前优先传播，避免静默丢失。
+                if failure is not None:
+                    raise failure
                 raise TimeoutError("GraphWorker did not become idle")
             if self.idle:
                 if failure is not None:
@@ -594,6 +597,8 @@ class GraphWorker:
 
         if not self._lifecycle.begin_close():
             return
+        # 未读取的 iter/aiter 订阅不能阻止排空；剩余输出留在存储中，订阅方之后仍可完整读取。
+        self._history.release_backpressure()
         try:
             failure = self._drain_and_release()
         finally:
@@ -639,16 +644,21 @@ class GraphWorker:
         failure: BaseException | None = None
         try:
             self.wait_idle()
-        except Exception as exc:
+        except BaseException as exc:
+            # 控制异常同样先记录，确保后续组件全部关闭后再重新抛出。
             failure = exc
-        self._direct.close()
+        try:
+            self._direct.close()
+        except BaseException as exc:
+            if failure is None:
+                failure = exc
         with self._configure_lock:
             bindings = tuple(reversed(self._queues.values()))
             self._queues.clear()
             for binding in bindings:
                 try:
                     binding.unbind()
-                except Exception as exc:
+                except BaseException as exc:
                     if failure is None:
                         failure = exc
         components = (

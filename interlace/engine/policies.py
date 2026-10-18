@@ -18,6 +18,9 @@ ANY_POLICY = "interlace.core/any"  # InputPolicy.ANY 对应的内建 selector �
 ON_START_POLICY = (
     "interlace.core/on-start"  # InputPolicy.ON_START 对应的内建 selector 名称。
 )
+LONGEST_POLICY = (
+    "interlace.core/longest"  # 可用 token 最多的端口优先的内建 selector 名称。
+)
 
 _BUILTIN_NAMES: Mapping[InputPolicy, str] = MappingProxyType(
     {
@@ -195,6 +198,25 @@ class _AnySelector:
         return next(((port,) for port in ports if available[port]), None)
 
 
+class _LongestSelector:
+    """内建 longest 策略：每次只消费可用 token 最多的端口，相同时按声明顺序。
+
+    交错到达的多端口输入因此被交替消费，不会像 ANY 那样先排空声明顺序靠前的端口。
+    """
+
+    def select(
+        self,
+        ports: Sequence[str],
+        available: Mapping[str, int],
+        config: Mapping[str, Any],
+    ) -> tuple[str, ...] | None:
+        """返回可用 token 最多的非空端口组成的单元素元组；全部为空时返回 None。"""
+
+        del config
+        port = max(ports, key=lambda name: available[name], default=None)
+        return None if port is None or not available[port] else (port,)
+
+
 class _OnStartSelector:
     """内建 ON_START 策略：从不选择 token，由执行器在启动时单次触发节点。"""
 
@@ -213,17 +235,18 @@ class PolicyRegistry:
     """注册 namespaced selector；Graph freeze 会保存实现快照。
 
     Attributes:
-        _selectors: 名称到 selector 实现的映射，预置三种内建策略。
+        _selectors: 名称到 selector 实现的映射，预置 all、any、on-start 与 longest 内建策略。
         _lock: 保护 _selectors 的可重入锁。
     """
 
     def __init__(self) -> None:
-        """注册三种内建输入策略并初始化注册锁。"""
+        """注册内建输入策略并初始化注册锁。"""
 
         self._selectors: dict[str, InputSelector] = {
             ALL_POLICY: _AllSelector(),
             ANY_POLICY: _AnySelector(),
             ON_START_POLICY: _OnStartSelector(),
+            LONGEST_POLICY: _LongestSelector(),
         }
         self._lock = RLock()
 

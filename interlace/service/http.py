@@ -7,6 +7,7 @@ import json
 import logging
 import secrets
 from collections.abc import AsyncIterator, Iterable
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -43,6 +44,9 @@ from .models import (
 from .service import LOOPBACK_HOSTS, GraphService, encode
 
 _LOGGER = logging.getLogger(__name__)
+
+# 单个输出 SSE 允许积压的未发送条数；客户端落后超过该值即断开，观察端不得背压业务执行。
+FOLLOW_BACKLOG = 10_000
 
 # JSON-RPC 服务端错误码，与 HTTP 接口的状态码一一对应。
 RPC_EXECUTION_FAILED = -32000  # Graph 执行失败，HTTP /api/call 返回 409
@@ -205,11 +209,14 @@ class AccessMiddleware:
             return
 
         async def secured_send(message: Message) -> None:
-            """在响应头中加入 nosniff，受保护路径额外禁止缓存。"""
+            """加入 nosniff 与禁止嵌入的响应头，受保护路径额外禁止缓存。"""
 
             if message["type"] == "http.response.start":
                 response_headers = MutableHeaders(scope=message)
                 response_headers["X-Content-Type-Options"] = "nosniff"
+                # 禁止第三方页面以 iframe 嵌入工作台诱导点击发布、运行或删除。
+                response_headers["X-Frame-Options"] = "DENY"
+                response_headers["Content-Security-Policy"] = "frame-ancestors 'none'"
                 if protected:
                     response_headers["Cache-Control"] = "no-store"
             await send(message)
@@ -495,6 +502,74 @@ def _add_execution_routes(app: FastAPI, service: GraphService) -> None:
         return service.cancel(execution_id)
 
 
+async def _pump_outputs(
+    handle: Execution, pending: asyncio.Queue[tuple[str, Any]]
+) -> None:
+    """尽快读取执行输出放入连接的发送队列，积压超过 FOLLOW_BACKLOG 时停止订阅。
+
+    Args:
+        handle: 正在运行的执行。
+        pending: 本连接独占的发送队列，元素为事件类别与值。
+    """
+
+    iterator = handle.__aiter__()
+    try:
+        async for output in iterator:
+            if pending.qsize() >= FOLLOW_BACKLOG:
+                pending.put_nowait(("lagged", None))
+                return
+            pending.put_nowait(("output", output))
+        pending.put_nowait(("finished", None))
+    except Exception as exc:
+        pending.put_nowait(("failure", exc))
+    finally:
+        await iterator.aclose()
+
+
+async def _follow_outputs(
+    service: GraphService, handle: Execution
+) -> AsyncIterator[str]:
+    """由服务端任务及时读取输出再转交客户端，失败保留之前已经交付的项目。
+
+    输出订阅只由读取任务持有并持续读空，客户端读取快慢不会阻塞执行；积压超过
+    FOLLOW_BACKLOG 时停止订阅并以 failure 事件断开，执行结束后可经历史重放完整输出。
+
+    Args:
+        service: 提供快照的服务。
+        handle: 正在运行的执行。
+
+    Yields:
+        SSE 格式的 output、finished 或 failure 消息。
+    """
+
+    pending: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+    reader = asyncio.create_task(_pump_outputs(handle, pending))
+    try:
+        while True:
+            kind, value = await pending.get()
+            if kind == "output":
+                yield sse("output", encode(value))
+                continue
+            if kind == "finished":
+                yield sse("finished", service.snapshot(handle))
+                return
+            detail = (
+                "output subscriber fell behind; replay after the execution finishes"
+                if kind == "lagged"
+                else redact_text(str(value))
+            )
+            yield sse("failure", {**service.snapshot(handle), "detail": detail})
+            return
+    except Exception as exc:
+        yield sse(
+            "failure", {**service.snapshot(handle), "detail": redact_text(str(exc))}
+        )
+    finally:
+        reader.cancel()
+        with suppress(asyncio.CancelledError):
+            await reader
+
+
 def _add_stream_routes(app: FastAPI, service: GraphService) -> None:
     """注册执行观测与终端输出的 SSE 订阅接口。"""
 
@@ -558,24 +633,8 @@ def _add_stream_routes(app: FastAPI, service: GraphService) -> None:
             error = state.get("output_error") or state.get("error")
             yield sse("failure" if error else "finished", {**state, "detail": error})
 
-        async def follow(handle: Execution) -> AsyncIterator[str]:
-            """逐项等待当前执行的输出，失败保留之前已经交付的项目。"""
-
-            iterator = handle.__aiter__()
-            try:
-                async for output in iterator:
-                    yield sse("output", encode(output))
-                yield sse("finished", service.snapshot(handle))
-            except Exception as exc:
-                yield sse(
-                    "failure",
-                    {**service.snapshot(handle), "detail": redact_text(str(exc))},
-                )
-            finally:
-                await iterator.aclose()
-
         return StreamingResponse(
-            replay() if handle is None else follow(handle),
+            replay() if handle is None else _follow_outputs(service, handle),
             media_type="text/event-stream",
             headers={"X-Accel-Buffering": "no"},
         )
