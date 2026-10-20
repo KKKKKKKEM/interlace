@@ -6,10 +6,10 @@ SSE，并提供图编辑发布、项目管理与运行历史接口。服务只�
 
 ## 安装与启动
 
-当前通过 Git 安装：
+从 PyPI 安装服务 extra：
 
 ```bash
-uv pip install "interlace-py[service] @ git+https://github.com/KKKKKKKEM/interlace.git"
+uv pip install "interlace-py[service]"
 ```
 
 在仓库中运行完整示例：

@@ -8,23 +8,22 @@ Interlace 是一个可扩展的 Python 编排微内核：Graph 内以 `Output` �
 
 ## 安装
 
-发行包名为 `interlace-py`，导入名为 `interlace`。当前通过 Git 安装，尚未发布到 PyPI：
+发行包名为 `interlace-py`，导入名为 `interlace`：
 
 ```bash
-uv pip install "interlace-py @ git+https://github.com/KKKKKKKEM/interlace.git"
+uv pip install interlace-py
 ```
 
-生产项目应将 Git 依赖固定到经过验证的提交。开发本仓库可使用 `uv sync`。
+开发本仓库可使用 `uv sync`。
 
 ### 发布到 PyPI
 
 仓库的 `.github/workflows/python-publish.yml` 在 GitHub Release 发布后运行完整 CI、构建 wheel/sdist、
-检查发行元数据，并通过 PyPI Trusted Publishing 上传同一批已验证产物。Release 标签必须与项目版本一致：
-当前版本为 `0.2.0`，对应标签 `v0.2.0`。尚未完成首次上传，不能把上述 Git 安装命令改成索引安装。
+检查发行元数据，并通过 PyPI Trusted Publishing 上传同一批已验证产物。Release 标签必须是 `v` 加
+`pyproject.toml` 中的版本号，例如 `v0.2.0`；同一版本号在 PyPI 上只能上传一次。
 
-首次发布前，在 PyPI 的 Publishing 页面添加 pending publisher：
+PyPI 项目 `interlace-py`（`interlace` 在 PyPI 禁用名单中）的 Trusted Publisher 绑定：
 
-- PyPI 项目：`interlace-py`（`interlace` 在 PyPI 禁用名单中）
 - GitHub owner：`KKKKKKKEM`
 - GitHub repository：`interlace`
 - Workflow filename：`python-publish.yml`
@@ -101,7 +100,7 @@ with Runtime() as runtime:
 服务只提供数据接口，不托管前端页面；基础安装仍保持零运行时依赖，不自动启动服务。
 
 ```bash
-uv pip install "interlace-py[service] @ git+https://github.com/KKKKKKKEM/interlace.git"
+uv pip install "interlace-py[service]"
 uv run --extra service python examples/service.py
 ```
 
