@@ -1,6 +1,6 @@
 [project]
-name = "interlace"
-version = "0.1.0"
+name = "interlace-py"
+version = "0.2.0"
 description = "An extensible microkernel for typed graphs and event workflows"
 readme = "README.md"
 license = { text = "MIT" }

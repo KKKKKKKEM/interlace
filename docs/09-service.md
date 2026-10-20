@@ -9,7 +9,7 @@ SSE，并提供图编辑发布、项目管理与运行历史接口。服务只�
 当前通过 Git 安装：
 
 ```bash
-uv pip install "interlace[service] @ git+https://github.com/KKKKKKKEM/interlace.git"
+uv pip install "interlace-py[service] @ git+https://github.com/KKKKKKKEM/interlace.git"
 ```
 
 在仓库中运行完整示例：

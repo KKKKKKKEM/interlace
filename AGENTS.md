@@ -239,7 +239,7 @@ Graph、Node、Output、Runtime、Context、Event
 
 ## 第十六条：官方服务按需启用
 
-1. RPC 与图编辑服务属于官方 `interlace.service` 扩展层，通过 `interlace[service]` 安装；基础包保持零运行时依赖，
+1. RPC 与图编辑服务属于官方 `interlace.service` 扩展层，通过 `interlace-py[service]` 安装；基础包保持零运行时依赖，
    导入 `interlace` 不加载服务依赖或监听端口。
 2. 服务仅通过 Runtime、Execution、冻结 Graph 与公开 GraphCatalog 能力调用和检查图，不读取运行角色私有状态；
    服务的观察与诊断登记以运行期插件安装，随服务关闭或 Runtime 关闭卸载。
