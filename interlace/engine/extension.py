@@ -71,7 +71,11 @@ class _Point:
 
 
 class NoticePoint(_Point, Generic[T]):
-    """只读通知点：处理函数签名为 ``fn(value) -> None``，失败被记录并隔离。"""
+    """只读通知点：处理函数签名为 ``fn(value) -> None``，失败被记录并隔离。
+
+    处理函数在触发方的调用路径上依次同步执行；慢速观察者可经 `interlace.plugins.Background`
+    移出调用路径。
+    """
 
     __slots__ = ()
 
@@ -85,9 +89,11 @@ class WrapPoint(_Point, Generic[T, R]):
 
     Attributes:
         value_type: 到达最内层操作的值必须满足的 isinstance 类型；None 表示不检查。
+        required: 是否必须有处理函数；为 True 时调用作用域内没有生效的处理函数则拒绝本次操作，
+            而不是直接执行最内层操作。
     """
 
-    __slots__ = ("value_type",)
+    __slots__ = ("required", "value_type")
 
     def __init__(
         self,
@@ -95,6 +101,7 @@ class WrapPoint(_Point, Generic[T, R]):
         *,
         scope: tuple[str, ...] = (),
         value_type: type | tuple[type, ...] | None = None,
+        required: bool = False,
     ) -> None:
         """定义中间件点。
 
@@ -102,10 +109,17 @@ class WrapPoint(_Point, Generic[T, R]):
             id: 带命名空间的标识。
             scope: 作用域键名元组。
             value_type: 中间件改写后交给最内层操作的值须满足的类型；None 表示不检查。
+            required: 没有生效的处理函数时是否拒绝调用，默认放行。
+
+        Raises:
+            TypeError: required 不是 bool。
         """
 
         super().__init__(id, scope=scope)
+        if not isinstance(required, bool):
+            raise TypeError("required must be a bool")
         self.value_type = value_type
+        self.required = required
 
 
 AnyPoint = NoticePoint[Any] | WrapPoint[Any, Any]
@@ -382,12 +396,16 @@ class HookBus:
 
         Raises:
             ValueError: scope 含未声明的键或缺少已声明的键。
+            LookupError: required 的 WrapPoint 在该作用域下没有生效的处理函数。
         """
 
         _check_scope(point, scope, full=True)
         with self._lock:
             entries = self._entries.get(point, ())
-        return tuple(entry.value for entry in entries if entry.matches(scope))
+        handlers = tuple(entry.value for entry in entries if entry.matches(scope))
+        if not handlers and isinstance(point, WrapPoint) and point.required:
+            raise LookupError(f"{point.id} requires a registered handler")
+        return handlers
 
     def detach_owner(self, owner: str) -> None:
         """注销某个插件登记的全部钩子与具名值。"""
@@ -426,6 +444,7 @@ class HookBus:
 
         Raises:
             TypeError: 处理函数返回 awaitable，或到达 call 的值不满足 point.value_type。
+            LookupError: point 是 required 且没有生效的处理函数；此时不调用 call。
         """
 
         handlers = self.handlers(point, **scope)
@@ -467,7 +486,11 @@ class HookBus:
         /,
         **scope: Any,
     ) -> R:
-        """异步版 wrap：call 与中间件可以是同步函数或协程函数，call_next 总是返回 awaitable。"""
+        """异步版 wrap：call 与中间件可以是同步函数或协程函数，call_next 总是返回 awaitable。
+
+        Raises:
+            LookupError: point 是 required 且没有生效的处理函数；此时不调用 call。
+        """
 
         handlers = self.handlers(point, **scope)
 

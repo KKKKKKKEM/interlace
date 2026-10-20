@@ -20,7 +20,25 @@ Interlace 的扩展只有一套机制，由两类扩展物组成，核心与插�
 | `WrapPoint` | `fn(value, call_next) -> result` | 中间件：先登记者在外层，可改参、短路、重试、改写结果，抛出异常即拒绝本次操作 |
 
 只改值的中间件写成 `lambda value, call_next: call_next(change(value))`。`WrapPoint(value_type=...)` 声明交给最内层操作
-的值必须满足的类型，中间件传错类型时立即失败。
+的值必须满足的类型，中间件传错类型时立即失败。`WrapPoint(required=True)` 声明该操作必须由处理函数承接：调用作用域内
+没有生效的处理函数时 `wrap/awrap` 以 `LookupError` 拒绝，不执行最内层操作；默认 `required=False` 直接放行。核心钩子点
+都是放行的。
+
+Notice 处理函数在触发方的调用路径上同步依次执行，慢速观察者会拖慢 Graph 执行。`Background(handler, maxsize=1024)`
+把同步处理函数移到专属后台线程：它本身就是普通 Notice 处理函数，触发方只把值放入有界队列；队列已满或已关闭时
+丢弃该值并计入 `dropped`，从不阻塞触发方。处理函数按入队顺序执行，失败写入日志后继续。插件以 `api.defer(adapter.close)`
+登记排空，卸载或关闭时等待已入队的值处理完毕：
+
+```python
+from interlace.plugins import Background
+
+
+@plugin("acme/metrics")
+def metrics(api):
+    observer = Background(exporter.record)
+    api.defer(observer.close)
+    api.on(RUNTIME_EVENT, observer)
+```
 
 全部登记都保存在 Runtime 唯一的 `HookBus`（`runtime.hooks`）上。登记随时可以进行，返回统一的 `Registration`，
 它可调用、可作上下文管理器，注销是幂等的。每次调用读取当时的登记快照，进行中的调用不受并发登记或注销影响；
@@ -73,7 +91,7 @@ class Download(Node):
         return Output(response, "response")
 
 
-@plugin("acme/retry", requires=("acme/http",))
+@plugin("acme/retry")
 def retry(api):
     api.on(DOWNLOAD, retry_on_timeout, site="example.com")
 ```
@@ -86,7 +104,7 @@ def retry(api):
 装饰一个 `setup(api)` 函数即可。需要在关闭时释放的资源，创建后立即用 `api.defer` 登记清理：
 
 ```python
-@plugin("acme/tracing", requires=("acme/metrics",))
+@plugin("acme/tracing")
 def tracing(api):
     exporter = make_exporter()
     api.defer(exporter.close)  # 关闭或启动回滚时逆序执行
@@ -102,20 +120,72 @@ def tracing(api):
 | `provide(name, value)` | 提供具名值；名称在 `provides` 中声明时是单例 capability | capability 只在 setup；其他名称随时 |
 | `wrap(capability, decorator)` | 装饰已在 `wraps` 声明的单例，`decorator(inner) -> outer` | setup |
 | `require(name)` | 取得具名值，capability 返回经全部装饰后的实现 | 随时 |
-| `defer(cleanup)` | 登记关闭或启动回滚时逆序执行的清理函数 | 宿主关闭前 |
+| `defer(cleanup)` | 登记关闭、启动回滚或卸载时逆序执行的清理函数 | 宿主关闭前 |
 
-另有只读属性 `hooks`，返回 Runtime 的钩子总线，用于构造需要触发钩子点的替代组件。
+另有只读属性 `hooks`，返回 Runtime 的钩子总线，用于构造需要触发钩子点的替代组件；只读属性 `settings` 返回宿主为
+本插件校验后的设置实例。运行期安装的插件卸载后，`on`、`provide`、`defer` 以 `RuntimeError` 拒绝。
 
-`PluginDescriptor(id, version="1.0.0", *, requires, provides, wraps, requires_capabilities, api_version="4")` 中，插件 ID
-与具名值名称都必须带命名空间。`requires` 声明插件依赖，`requires_capabilities` 声明单例依赖；宿主据此拓扑
-排序，并保证 capability 的提供者先于全部装饰者、全部装饰者先于其余依赖方，同一 capability 的多个装饰者按传入
-顺序装配，后装配者位于外层。缺失或循环依赖、API 版本不兼容、能力冲突、装饰无人提供的能力，以及 setup 后未兑现
-`provides` 或 `wraps` 声明，都会在 Runtime 构造期间失败。只有声明者能提供已声明的 capability；未声明的名称（例如
-输入 selector）任何插件都可以在任何时候提供，同名重复提供立即失败。插件以 `api.on`/`api.provide` 登记的内容
-属于该插件，宿主关闭或启动回滚时统一注销。
+`PluginDescriptor(id, version="1.0.0", *, provides, wraps, requires_capabilities, api_version="5", settings=None)` 中，
+插件 ID 与具名值名称都必须带命名空间。插件之间只按 capability 名称依赖，从不引用其他插件的 ID：`requires_capabilities`
+声明单例依赖，宿主据此拓扑排序，并保证 capability 的提供者先于全部装饰者、全部装饰者先于其余依赖方，同一
+capability 的多个装饰者按传入顺序装配，后装配者位于外层。缺失或循环依赖、API 版本不兼容、能力冲突、装饰无人提供
+的能力，以及 setup 后未兑现 `provides` 或 `wraps` 声明，都会在 Runtime 构造期间失败。只有声明者能提供已声明的
+capability；未声明的名称（例如输入 selector）任何插件都可以在任何时候提供，同名重复提供立即失败。插件以
+`api.on`/`api.provide` 登记的内容属于该插件，宿主关闭或启动回滚时统一注销。
 
 `PluginHost` 只装配显式传入的可信 Python 插件，不扫描环境，也不在 import 时自动执行第三方代码。需要配置驱动
 发现时，应在应用 composition root 中完成包发现和白名单选择，再把实例交给 Runtime。
+
+### 插件设置
+
+插件配置是宿主可见的普通数据，而不是藏在构造参数里。`settings=` 声明一个冻结 dataclass：每个字段必须有普通
+默认值，类型只允许 `bool`、`int`、`float`、`str` 或由同一种标量组成的 `Literal`；字段元数据可写 `title`、`description`，
+数值字段另可写 `minimum`、`maximum`。声明在 `PluginDescriptor` 构造时校验。
+
+```python
+import dataclasses
+from typing import Literal
+
+from interlace.plugins import plugin, settings_schema
+
+
+@dataclasses.dataclass(frozen=True)
+class CrawlSettings:
+    mode: Literal["fast", "safe"] = "safe"
+    limit: int = dataclasses.field(default=4, metadata={"minimum": 1, "title": "并发上限"})
+
+
+@plugin("acme/crawl", settings=CrawlSettings)
+def crawl(api):
+    limiter = make_limiter(api.settings.limit)
+    ...
+
+
+runtime = Runtime(plugins=(crawl,), settings={"acme/crawl": {"limit": 8}})
+settings_schema(CrawlSettings)  # JSON Schema，供配置界面渲染表单
+```
+
+`Runtime(settings=...)` 与 `PluginHost(settings=...)` 接收插件 ID 到覆盖值的映射，未列出的插件取默认值。宿主在任何
+插件 setup 之前校验全部配置：指向未知插件或未声明设置的插件、出现未声明的键、类型不符（`bool` 不能冒充数字，
+`int` 可提升为 `float`）、超出候选值或范围、非有限浮点数，都会让 Runtime 构造失败，不存在静默回退到默认值。
+
+### 运行期安装与卸载
+
+`runtime.plugin_host.install(plugin, settings=None)` 在宿主运行期间安装插件，返回卸载该插件的 `Registration`。运行期
+插件与启动插件使用同一个 `setup(api)`，但不参与单例装配：声明 `provides` 或 `wraps` 会被拒绝，`requires_capabilities`
+必须已由启动插件提供，插件 ID 不能与已有插件重复。
+
+```python
+handle = runtime.plugin_host.install(metrics)
+...
+handle()  # 注销该插件的钩子与具名值，再逆序执行它 defer 的清理
+```
+
+卸载只影响这一个插件，与关闭使用同一顺序：先注销登记，再逆序执行清理；首个清理失败抛给句柄调用方，其余写入日志。
+setup 失败时按同一流程回滚并重新抛出原始失败，插件 ID 仍可再次安装。同一 ID 卸载后重新安装，旧句柄不会卸载新实例。
+宿主关闭时，运行期插件先于启动插件卸载；关闭后句柄调用不产生作用，`install` 以 `RuntimeError` 拒绝。已经发布的
+`runtime.started` 不会补发给运行期插件。`plugin_host.descriptors` 先列启动插件，再按安装顺序列出运行期插件。
+官方 `GraphService` 就以这种方式接入 Runtime。
 
 ## 默认装配与替换
 

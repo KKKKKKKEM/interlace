@@ -174,9 +174,11 @@ Graph、Node、Output、Runtime、Context、Event
 
 1. 扩展物只有两类：钩子点与具名值。核心与插件以同一方式定义和使用它们；新增扩展能力优先定义钩子点或约定具名值
    名称，不得增加互不相干的全局注册表或专用贡献通道。
-2. 钩子点只有 Notice（只读通知）与 Wrap（中间件）两种模式，模式、作用域键与可选的内层值类型在定义时固定；
+2. 钩子点只有 Notice（只读通知）与 Wrap（中间件）两种模式，模式、作用域键、可选的内层值类型以及 Wrap 是否必须
+   有处理函数在定义时固定；必须有处理函数的 Wrap 在调用作用域内无人承接时拒绝操作，核心钩子点均为放行。
    只改值的扩展以 Wrap 改写传给 call_next 的值。登记保存在每个 Runtime 唯一的 HookBus。登记随时可以进行，
-   调用读取登记快照，进行中的调用不受影响。
+   调用读取登记快照，进行中的调用不受影响。Notice 在触发方路径上同步执行；移出路径的投递是普通 Notice 处理函数，
+   使用有界队列、满时丢弃计数，不阻塞触发方。
 3. Notice 处理函数失败记录后隔离，不得改变业务执行结果或 `emit()` 结果；Wrap 中间件的失败按所在操作的
    错误契约传播。Wrap 中间件吞掉或替换 call_next 抛出的执行控制异常、非 Exception 的 BaseException、节点层的
    Engine 契约错误或 StopGraph 时，宿主在交付替代结果之前重新抛出原异常。同步入口拒绝返回 awaitable 的处理函数。
@@ -200,7 +202,8 @@ Graph、Node、Output、Runtime、Context、Event
 1. Graph 冻结与执行约束必须有失败测试。
 2. Event 提交、跨图连接、并发和错误传播必须有契约测试。
 3. 三个替换协议必须有非默认实现组合测试。
-4. 插件依赖、冲突、装饰顺序、API 兼容、失败回滚、defer 逆序清理和默认装配路径必须有契约测试。
+4. 插件依赖、冲突、装饰顺序、API 兼容、失败回滚、defer 逆序清理、运行期安装与卸载、设置校验、包依赖方向和默认
+   装配路径必须有契约测试。
 5. 示例只通过公开 API 组合，优先使用顶层名字，并覆盖核心编排方式。
 6. 文档不得把计划能力写成已实现能力。
 
@@ -209,14 +212,16 @@ Graph、Node、Output、Runtime、Context、Event
 1. Graph、Node、端口声明、Edge、Output、Event、Execution 的基本语义、冻结校验规则和错误契约属于微内核，插件不得
    改写这些契约；满足相同契约的核心实现可以通过公开协议替换。
 2. 部署能力和非本质策略通过声明为单例 capability 的具名值扩展；默认实现必须与第三方实现经过同一 PluginHost 装配路径。
-3. 插件只有声明与 `setup(api)`，函数与类形式能力相同。声明包含 namespaced ID、插件版本、SPI 主版本、依赖、提供与
-   装饰的 capability；宿主按依赖顺序 setup。capability 的提供者先于全部装饰者装配，全部装饰者先于其余依赖方，
-   后装配的装饰者位于外层。
-4. 单例 capability 冲突、缺失依赖、循环依赖、SPI 不兼容、装饰无人提供的 capability，以及未兑现的 provides 或
-   wraps 声明必须在 Runtime 可用前失败。
-5. 扩展接口只有 on、provide、wrap、require、defer。声明的 capability 只能由声明者在 setup 期提供并冻结，其他具名值
-   与钩子随时登记；资源清理以 defer 登记。宿主关闭和启动回滚时先逆序注销各插件的登记，再按登记逆序执行全部清理，
-   setup 中途失败前登记的清理同样执行。
+3. 插件只有声明与 `setup(api)`，函数与类形式能力相同。声明包含 namespaced ID、插件版本、SPI 主版本、依赖的
+   capability、提供与装饰的 capability 以及可选的设置类型；插件之间只按 capability 名称依赖，不引用其他插件 ID。
+   宿主按依赖顺序 setup。capability 的提供者先于全部装饰者装配，全部装饰者先于其余依赖方，后装配的装饰者位于外层。
+4. 单例 capability 冲突、缺失依赖、循环依赖、SPI 不兼容、装饰无人提供的 capability、未兑现的 provides 或
+   wraps 声明，以及不合法或指向未知插件的设置必须在 Runtime 可用前失败。设置是冻结 dataclass 声明的标量数据，
+   由宿主校验后经只读 `api.settings` 交给插件，不静默回退默认值。
+5. 扩展接口只有 on、provide、wrap、require、defer 与只读的 settings。声明的 capability 只能由声明者在 setup 期提供
+   并冻结，其他具名值与钩子随时登记；资源清理以 defer 登记。宿主关闭和启动回滚时先逆序注销各插件的登记，再按
+   登记逆序执行全部清理，setup 中途失败前登记的清理同样执行。宿主运行期间可安装不提供、不装饰 capability 的插件，
+   返回 Registration；卸载、安装失败回滚与关闭对该插件使用同一清理顺序，运行期插件先于启动插件卸载。
 6. 插件不得访问 Runtime 私有状态；替代组件需要钩子能力时以插件扩展接口取得的钩子总线构造。
 
 ## 第十五条：Pythonic 实现与中文注释
@@ -234,17 +239,19 @@ Graph、Node、Output、Runtime、Context、Event
 
 ## 第十六条：官方服务按需启用
 
-1. RPC 与可视化属于官方 `interlace.service` 扩展层，通过 `interlace[service]` 安装；基础包保持零运行时依赖，
+1. RPC 与图编辑服务属于官方 `interlace.service` 扩展层，通过 `interlace[service]` 安装；基础包保持零运行时依赖，
    导入 `interlace` 不加载服务依赖或监听端口。
-2. 服务仅通过 Runtime、Execution、冻结 Graph 与公开 GraphCatalog 能力调用和检查图，不读取运行角色私有状态。
-3. HTTP/JSON、JSON-RPC 与可视化共享执行服务和 Execution 契约；协议适配器不实现第二套执行器。
-4. 可视化节点只能由应用显式登记的工厂与配置模型构建；草稿可不完整，发布必须经过核心冻结校验。
+2. 服务仅通过 Runtime、Execution、冻结 Graph 与公开 GraphCatalog 能力调用和检查图，不读取运行角色私有状态；
+   服务的观察与诊断登记以运行期插件安装，随服务关闭或 Runtime 关闭卸载。
+3. HTTP/JSON、JSON-RPC 与图编辑接口共享执行服务和 Execution 契约；协议适配器不实现第二套执行器。服务只提供
+   数据接口，不托管前端页面。
+4. 可编辑节点只能由应用显式登记的工厂与配置模型构建；草稿可不完整，发布必须经过核心冻结校验。
 5. 发布版本不可变，执行记录保存当时的图结构；草稿更新比较修订号。任意 Python 构造代码不隐式转换为编辑文档。
 6. 生命周期观测不携带节点业务输入对象；服务可通过 NODE_INSPECT 独立快照输入、配置和原始输出，并通过
    观测作用域关联 Python logging。诊断记录按 execution、node 与 firing 隔离，允许关闭采集，不改变原对象或业务结果。
    诊断快照按字段名片段与文本凭据形态脱敏；服务以 execution.finished 事件记录终态。
 7. 服务历史、诊断与终端输出存储不代表任务恢复、broker 持久化或跨进程 Slot 延续；执行历史按 retention 上限清理。
-8. 项目属于服务管理层，按“项目、逻辑定义、版本与运行实例”组织界面；不改变 Runtime 注册名与执行语义。
+8. 项目属于服务管理层，按“项目、逻辑定义、版本与运行实例”组织管理接口；不改变 Runtime 注册名与执行语义。
    已有定义通过数据迁移归入默认项目，移动定义时其草稿、版本与历史保持整体归属，定义标识仍全局唯一。
 
 ## 验证要求
@@ -260,8 +267,7 @@ uv run ruff format --check interlace tests examples
 
 文档变更还应检查本地链接、Markdown 围栏和发生变化的 Mermaid 图。
 
-服务变更运行 `uv run --extra service pytest tests/service -q`；界面变更在 `web/` 中运行 `npm ci`、
-`npm run build` 与 `npm test`。内置静态资源随 Python 分发包交付，安装用户不需要 Node.js。
+服务变更运行 `uv run --extra service pytest tests/service -q`。
 
 发布使用与 `pyproject.toml` 版本一致的 `v<version>` Release 标签，完整 CI 通过后构建并严格检查 wheel/sdist 元数据。
 PyPI 上传通过 `python-publish.yml` 和 `pypi` environment 的 Trusted Publisher 授权，只在上传作业授予 OIDC 权限。

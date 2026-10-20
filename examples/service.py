@@ -1,4 +1,4 @@
-"""启动自带 RPC 与可视化工作台：uv run --extra service python examples/service.py。"""
+"""启动自带 HTTP 与 JSON-RPC 的图服务：uv run --extra service python examples/service.py。"""
 
 from __future__ import annotations
 
@@ -101,9 +101,9 @@ class SplitNode(Node):
 def main() -> None:
     """创建示例节点目录并启动可选服务。"""
 
-    parser = argparse.ArgumentParser(description="Interlace Studio")
+    parser = argparse.ArgumentParser(description="Interlace graph service")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--database", default=".interlace/studio.sqlite3")
+    parser.add_argument("--database", default=".interlace/service.sqlite3")
     args = parser.parse_args()
     catalog = NodeCatalog().register(
         "text.transform", TextNode, config=TextConfig, title="文本转换"

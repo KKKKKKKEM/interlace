@@ -19,7 +19,7 @@ from ..engine.extension import HookBus, Registration
 from ..engine.observation import RuntimeEvent, RuntimeEventKind
 from ..engine.points import RUNTIME_EVENT
 from ..spi import EventBus, LocalTaskPublisher, SlotLease, TaskPublisher, Work
-from .points import EVENT_EMIT, WORK_ROUTE
+from ..plugins.points import EVENT_EMIT, WORK_ROUTE
 from ._utils import _close_components, _Lifecycle, _unique
 
 EventHandler = Callable[[Event], None]

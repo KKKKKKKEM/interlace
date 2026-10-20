@@ -1,7 +1,8 @@
-# 第九章：RPC 与可视化工作台
+# 第九章：RPC 与图服务
 
 `interlace.service` 是官方维护、按需启用的服务层。它把已注册的 Graph 接入 HTTP/JSON、JSON-RPC 2.0 和
-SSE，并提供同一服务下的可视化编辑与运行工作台。基础包依旧没有第三方运行时依赖，也不会隐式监听端口。
+SSE，并提供图编辑发布、项目管理与运行历史接口。服务只提供数据接口，不托管前端页面。基础包依旧没有第三方
+运行时依赖，也不会隐式监听端口。
 
 ## 安装与启动
 
@@ -17,34 +18,21 @@ uv pip install "interlace[service] @ git+https://github.com/KKKKKKKEM/interlace.
 uv run --extra service python examples/service.py --port 8000
 ```
 
-打开 `http://127.0.0.1:8000`。示例注册一张文本处理图和两个可编辑节点类型，数据库保存在
-`.interlace/studio.sqlite3`。改用 `--database :memory:` 可仅在本次进程中保存编辑与运行记录。
-
-工作台静态资源随 Python wheel 和 sdist 一起交付，安装使用者不需要 Node.js 或联网加载前端 CDN。
+服务启动后可在 `http://127.0.0.1:8000/docs` 查看 OpenAPI 文档。示例注册一张文本处理图和两个可编辑节点类型，
+数据库保存在 `.interlace/service.sqlite3`。改用 `--database :memory:` 可仅在本次进程中保存编辑与运行记录。
 
 ## 项目与定义管理
 
-工作台入口是项目列表。进入项目后查看定义列表，点击单条定义进入详情，默认展示概览：
+管理接口按“项目 → 定义 → 草稿、发布版本与运行实例”组织。项目可以创建、修改名称和描述，空的非默认项目可以
+删除。项目内的定义摘要给出来源、发布状态、最新版本、草稿修订号、节点数量、运行次数和最近运行；定义详情给出
+草稿、全部发布版本与运行记录。项目级运行记录只包含该项目内定义的执行。
 
-1. 项目列表支持创建、搜索和进入项目；项目设置可修改名称和描述，空的非默认项目可以删除。
-2. 定义列表展示来源、发布状态、最新版本、节点数量和最近运行，可搜索、筛选、新建或导入定义。
-3. 定义详情分为“概览”“图编排”“运行记录”。概览展示定义信息和版本；图编排复用原有画布，运行记录可进入实例
-   查看节点参数、输出、日志与异常。项目级运行记录只展示该项目内定义的执行。
-
-一条逻辑定义只在列表中占一行，其草稿和多个发布版本在详情中选择。定义标识继续在服务中全局唯一，Runtime
+一条逻辑定义只对应一条摘要，其草稿和多个发布版本在详情中给出。定义标识继续在服务中全局唯一，Runtime
 注册名仍是原代码名称或 `name@vN`，不因所属项目改变。项目是管理分组，不是独立 Runtime、租户权限或资源隔离。
 
 已有数据库在首次升级时创建项目表，并将原草稿和发布版本迁入“默认项目”，保留原文档、修订号与运行历史。
-已有和之后首次发现的代码图也进入默认项目；可以在定义详情中通过“移动到项目”调整归属，之后重启不会重置。
+已有和之后首次发现的代码图也进入默认项目；可以通过移动定义接口调整归属，之后重启不会重置。
 移动操作同时调整整条定义的草稿、版本和运行记录的管理归属，不重写原 Graph 或执行事实。
-
-页面使用稳定的 hash 路由，例如 `#/projects/{project_id}/definitions/{name}?tab=overview`，支持刷新、直接打开和浏览器
-前进后退，也支持挂载在已有 Web 应用的子路径。未保存的图编辑会在离开页面时提示确认。仅进入图编排或运行详情
-时加载画布代码。
-
-桌面端进入图编排或运行详情时，项目侧栏默认收起为图标导航，可通过顶部按钮展开。图操作集中在标题区，画布提供
-缩放比例与适应视图工具。运行详情的节点诊断在右侧独立滚动；底部运行面板可收起，也可拖动分隔线调整高度，聚焦
-分隔线后可用上下方向键调整。移动端通过导航抽屉和节点详情浮层保留相同操作。
 
 管理接口与图调用接口共用服务鉴权：
 
@@ -69,17 +57,20 @@ RPC 的图注册名与调用参数保持独立，不需要添加项目字段。
 from interlace.service import GraphService
 
 # runtime 已由应用创建并注册 Graph；离开 with 时关闭服务，不关闭 Runtime。
-with GraphService(runtime, database=".interlace/studio.sqlite3") as service:
+with GraphService(runtime, database=".interlace/service.sqlite3") as service:
     service.serve(host="127.0.0.1", port=8000)
 ```
 
 服务通过 `Runtime.graphs()` 自动取得已有及之后注册的代码图，无需重复注册到服务。默认 GraphWorker 提供
 公开的 `interlace.spi.GraphCatalog`；自定义 Worker 实现同一窄协议即可接入图查看。
 
-所有权保持明确：Runtime 由应用管理，GraphService 只拥有自己的观察注册、归档线程与数据库。
-`service.close()` 幂等，不关闭 Runtime、不撤销已接受的执行；关闭时等待已排队的输出归档完成。服务由创建它的
-一方关闭：`create_app()` 返回的 ASGI 应用和 `serve()` 都不在退出时关闭服务，因此独立启动与挂载到已有应用的
-行为一致；挂载时在父应用生命周期结束处调用 `service.close()`。
+所有权保持明确：Runtime 由应用管理，GraphService 只拥有自己的服务插件、归档线程与数据库。服务以
+`runtime.plugin_host.install()` 安装一个运行期插件（ID 形如 `interlace.service/graph-service-1`），由它登记
+`RUNTIME_EVENT` 观察、可选的 `NODE_INSPECT` 诊断采集，并以 `defer` 登记诊断器的关闭；同一 Runtime 可以接入多个服务。
+`service.close()` 幂等：先卸载服务插件，再等待已排队的输出归档完成并关闭数据库，不关闭 Runtime、不撤销已接受的
+执行。Runtime 先关闭时，插件宿主一并卸载服务插件，随后的 `service.close()` 只关闭归档与数据库；已关闭的 Runtime
+不能再接入新服务。服务由创建它的一方关闭：`create_app()` 返回的 ASGI 应用和 `serve()` 都不在退出时关闭服务，
+因此独立启动与挂载到已有应用的行为一致；挂载时在父应用生命周期结束处调用 `service.close()`。
 
 ```python
 from fastapi import FastAPI
@@ -88,16 +79,15 @@ app = FastAPI()
 app.mount("/interlace", service.create_app(token="application-provided-token"))
 ```
 
-`token` 是可选 Bearer 令牌，保护 HTTP、JSON-RPC、SSE 和 OpenAPI 数据接口。工作台可在令牌对话框中输入，
-保存在当前浏览器标签页的 sessionStorage，随后放入 Authorization 请求头，不写入 URL。令牌按字节比较，
-非 ASCII 的 Authorization 头同样返回 401。
+`token` 是可选 Bearer 令牌，保护 HTTP、JSON-RPC、SSE 和 OpenAPI 数据接口。客户端通过 Authorization 请求头传递，
+不写入 URL。令牌按字节比较，非 ASCII 的 Authorization 头同样返回 401。
 
 每个 HTTP 与 WebSocket 请求的 Host 头必须在 `allowed_hosts` 中，否则返回 HTTP 400，用于阻止 DNS rebinding：
 攻击页面即使让 Host 与 Origin 一致（例如都指向 `evil.example`），也不在白名单中。`create_app()` 默认只接受
 `127.0.0.1`、`localhost` 与 `::1`；`serve()` 默认再加入实际监听地址。通过域名、局域网地址或反向代理访问时，
-显式传入 `allowed_hosts=["studio.example.com"]`；包含 `"*"` 表示不检查 Host，只应在前置代理已校验 Host 时使用。
+显式传入 `allowed_hosts=["graphs.example.com"]`；包含 `"*"` 表示不检查 Host，只应在前置代理已校验 Host 时使用。
 默认仅监听 `127.0.0.1`；`serve()` 监听非回环地址且没有设置令牌时记录警告。全部响应带 `X-Frame-Options: DENY`
-与 `Content-Security-Policy: frame-ancestors 'none'`，禁止第三方页面嵌入工作台诱导点击。TLS、用户体系和多用户权限由应用或
+与 `Content-Security-Policy: frame-ancestors 'none'`，禁止第三方页面嵌入服务响应诱导点击。TLS、用户体系和多用户权限由应用或
 反向代理承担。
 
 单个 HTTP 请求体默认最多 1 MiB，可通过 `create_app(max_request_bytes=...)` 或
@@ -105,13 +95,14 @@ app.mount("/interlace", service.create_app(token="application-provided-token"))
 `GraphService(max_active_executions=...)` 默认把当前 Runtime 的同时活跃执行限制为 128，达到上限返回 HTTP 429。
 反向代理仍应设置自己的连接数、请求大小和速率限制。
 
-服务启动时先读取并编译全部已保存版本、标记中断记录、安装诊断与观察，最后才向 Runtime 注册恢复的版本。
-注册之前的任何失败都会卸载已安装的观察与诊断并关闭数据库，同一 Runtime 可以直接重新创建服务。Runtime 没有
-注销接口，若注册阶段本身失败（例如 Runtime 并发关闭），已注册的版本会保留在该 Runtime 中。
+服务启动时先读取并编译全部已保存版本、标记中断记录、安装服务插件，最后才向 Runtime 注册恢复的版本。
+注册之前的任何失败都会卸载服务插件（插件 setup 失败时由安装回滚完成）并关闭数据库，同一 Runtime 可以直接
+重新创建服务。Runtime 没有注销接口，若注册阶段本身失败（例如 Runtime 并发关闭），已注册的版本会保留在该
+Runtime 中。
 
 ## 节点目录与编辑边界
 
-普通 Python Graph 可以直接查看和运行，构造器不会被反射成编辑表单。希望在画布上创建节点时，应用显式登记
+普通 Python Graph 可以直接查看和运行，构造器不会被反射成编辑表单。希望通过编辑文档创建节点时，应用显式登记
 节点工厂和 Pydantic 配置模型：
 
 ```python
@@ -128,8 +119,9 @@ service = GraphService(runtime, nodes=catalog)
 资源仍由应用注入工厂或 Node，不能放入 JSON 配置。工厂应只构造可重入的节点定义，不在构造期间启动网络任务；
 节点预览、图校验、发布和恢复定义都可能调用工厂，工厂捕获的外部资源由应用管理。
 
-工作台支持节点添加、删除、标识修改、拖拽、端口连线、入口选择、配置表单、撤销重做、定义导入导出和校验。
-复杂配置字段使用 JSON 编辑。端口预览通过真实工厂读取，因此允许端口随配置变化；服务端冻结校验始终为最终依据。
+`GET /api/nodes` 返回已登记节点类型及其配置 JSON Schema；`POST /api/nodes/preview` 通过真实工厂读取单节点端口，
+因此允许端口随配置变化。`POST /api/validate` 以核心冻结逻辑校验完整图文档，`POST /api/definitions/parse` 校验
+导入文档格式并补齐默认值；服务端冻结校验始终为最终依据。
 编译图文档时使用 Runtime 钩子总线上当前提供的具名值查找 selector，自定义 selector 应在发布或恢复图定义之前提供。
 
 ## 草稿与发布版本
@@ -243,16 +235,15 @@ curl http://127.0.0.1:8000/rpc \
 
 本版实现 HTTP/JSON、JSON-RPC 2.0 和 SSE；没有把 gRPC、Thrift 或其他协议写成已实现能力。
 
-## 运行可视化与历史
+## 运行历史与诊断
 
-工作台展示图结构、节点状态、每次 firing 的序号与耗时、失败类型、已交付输出的端口，以及 terminal Outputs。
-同一节点在循环中多次执行时，时间线分别保留每次 firing，画布展示最新节点状态与累计触发次数。
+`GET /api/executions/{id}` 返回执行状态、步数、错误以及执行时的图结构快照。观测 SSE 逐条交付节点 firing 的
+生命周期事件与诊断记录，每条记录按 execution、node 与 step 关联；同一节点在循环中多次执行时分别保留每次 firing。
+启用诊断时，每次 firing 记录：
 
-选中运行实例后，点击画布节点或时间线中的某一步，可打开该节点的运行详情，并切换不同触发记录：
-
-- 参数：实际传给 Node.execute 的端口输入和当前 Context.options；发布图还显示已保存的节点构造配置。
-- 输出：Node 原始输出逐项记录，后续出口 Hook 改写后的终端结果在“终端输出”中查看。
-- 日志：Python logging 的时间、级别、logger、消息和可选堆栈，支持级别筛选与文字搜索。
+- 参数：实际传给 Node.execute 的端口输入和当前 Context.options；发布图的执行快照另含已保存的节点构造配置。
+- 输出：Node 原始输出逐项记录，出口 Hook 改写后的终端结果通过输出接口读取。
+- 日志：Python logging 的时间、级别、logger、消息和可选堆栈。
 - 异常：调用或迭代失败的类型、消息和堆栈；取消与超时仍沿用现有执行语义。
 
 诊断默认启用，可用 `GraphService(runtime, diagnostics=False)` 关闭参数、原始输出和日志采集，保留生命周期与终端结果。
@@ -276,7 +267,7 @@ authorization、cookie 或 credential 时整体替换为 `[REDACTED]`。快照�
 才能提供同等诊断粒度；仅提供生命周期的实现可关闭 diagnostics 后接入。
 
 服务启动后的直接调用和队列执行都可记录；服务接入前已经结束的执行只有 Runtime 仍保留的状态，没有补造历史
-节点事件。每次执行保存当时的图结构，防止代码图在下一次部署改变后误画旧运行。
+节点事件。每次执行保存当时的图结构，防止代码图在下一次部署改变后误读旧运行。
 
 Worker 在写入 Execution 终态之前发布 `execution.finished`，服务因此直接按该事件的 status 与 error_type 记录终态，
 不读取此刻可能仍为 running 的句柄状态。终端输出由服务的归档线程在执行真正终止后通过公开迭代接口逐项保存，
@@ -289,7 +280,7 @@ SQLite 保存草稿、发布版本、运行元数据、启用诊断后采集的�
 SQLite `user_version` 中，旧版本在启动时逐级迁移，高于当前代码支持版本的数据库会被拒绝打开。
 
 服务重启后把历史在途记录标记为中断，不恢复任务，不提供 broker ack、重试、exactly-once 或跨进程 Slot 连续性。
-跨图事件的业务关联键仍属于领域 payload；当前工作台不推断远程调用链。
+跨图事件的业务关联键仍属于领域 payload；服务不推断远程调用链。
 
 ## 开发与验证
 
@@ -300,31 +291,5 @@ uv run --extra service mypy interlace
 uv run --extra service ruff check interlace tests examples
 uv run --extra service ruff format --check interlace tests examples
 ```
-
-工作台源码位于 `web/`，使用 React Flow 的图交互与 Lucide 图标。修改界面后在该目录运行：
-
-```bash
-npm ci
-npm run build
-npx playwright install chromium
-npm test
-```
-
-构建输出位于 `interlace/service/static/`。浏览器测试启动自己的示例服务，验证建图、连线、配置、发布、运行查看
-以及桌面和手机布局。普通使用者只需安装 Python extra。
-
-### 主题与 Tokens
-
-右上角外观菜单提供浅色、深色和跟随系统三种模式。偏好保存在浏览器的 `interlace.theme` localStorage 项中，
-跟随系统模式会实时响应系统变化。页面在应用加载前应用偏好，切换主题不重新创建当前图或运行实例。
-
-主题统一定义在 [`web/src/tokens.css`](../web/src/tokens.css)，按三层组织：
-
-- 基础层定义调色板、字体、字号、圆角、动效时长与模糊参数。
-- 语义层按 `data-theme="light"` 和 `data-theme="dark"` 指定背景、文字、边框、交互、状态及磨砂颜色。
-- 组件层定义按钮、输入框、节点、连线、弹窗和表格的用途映射；React Flow 通过其公开 CSS 变量使用相同 tokens。
-
-调整配色优先修改语义层；单独调整组件时修改组件层。布局尺寸与响应式规则保留在组件样式中，业务样式不写颜色
-字面量。减少透明效果的系统偏好也由 tokens 切换为当前主题的实色表面。
 
 [上一章：编排模式](08-patterns.md)

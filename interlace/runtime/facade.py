@@ -58,6 +58,7 @@ class Runtime:
         *,
         plugins: Iterable[Plugin] | None = None,
         hooks: HookBus | None = None,
+        settings: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> None:
         """装配插件，补齐缺少的默认角色与基础设施，并发布 ``runtime.started`` 生命周期事实。
 
@@ -65,11 +66,13 @@ class Runtime:
             plugins: 待装配的插件；可以只提供 Router 或 Worker 中的一个。
             hooks: 预先创建的钩子总线，供在 Runtime 之外构造、需要共享总线的组件使用（例如注入的
                 Engine）；None 时新建。
+            settings: 插件标识到该插件设置覆盖值的映射，由 PluginHost 按插件声明校验；未列出的插件
+                使用默认设置。
 
         Raises:
-            TypeError: 插件缺少 PluginDescriptor，hooks 不是 HookBus，或提供的角色不满足
-                RouterRole/WorkerRole 协议。
-            ValueError: 插件声明冲突或依赖缺失。
+            TypeError: 插件缺少 PluginDescriptor，hooks 不是 HookBus，settings 不是映射，设置值类型不符，
+                或提供的角色不满足 RouterRole/WorkerRole 协议。
+            ValueError: 插件声明冲突、依赖缺失，或设置指向未知插件、未声明设置的插件或不合法的值。
         """
 
         selected = () if plugins is None else tuple(plugins)
@@ -96,7 +99,7 @@ class Runtime:
         infrastructure = (needed & set(INFRASTRUCTURE)) - provides
         if infrastructure:
             defaults.append(LocalInfrastructurePlugin(provides=infrastructure))
-        host = PluginHost((*defaults, *selected), hooks=hooks)
+        host = PluginHost((*defaults, *selected), hooks=hooks, settings=settings)
         try:
             host.start()
             router = host.require(CAP_EVENT_ROUTER)

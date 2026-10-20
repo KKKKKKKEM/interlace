@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import partial
+from threading import RLock
 from typing import Any, Protocol
 
 from .._validation import require_namespaced, require_non_empty_string
 from ..engine.extension import AnyPoint, HookBus, Registration
+from .settings import build_settings, check_settings_type
 
 _VERSION = re.compile(r"^[0-9]+(?:\.[0-9]+){0,2}(?:[-+][A-Za-z0-9.-]+)?$")
 _logger = logging.getLogger(__name__)
@@ -22,31 +26,31 @@ class PluginDescriptor:
     Attributes:
         id: 含 ``/`` 的命名空间插件标识。
         version: 插件自身的简单语义化版本，默认 ``"1.0.0"``。
-        requires: 必须先 setup 的插件标识。
         provides: 插件必须在 setup 中提供的单例 capability。
         wraps: 插件必须在 setup 中装饰的单例 capability；宿主保证提供者先于全部装饰者、全部装饰者先于其余依赖方。
         requires_capabilities: 必须由其他插件提供的单例 capability，提供者与装饰者先于本插件装配。
         api_version: 插件兼容的扩展 SPI 主版本字符串，必须与宿主一致。
+        settings: 插件设置的冻结 dataclass 类型；宿主据此校验配置并交给插件，None 表示没有设置。
     """
 
     id: str
     version: str = "1.0.0"
-    requires: tuple[str, ...] = ()
     provides: tuple[str, ...] = ()
     wraps: tuple[str, ...] = ()
     requires_capabilities: tuple[str, ...] = ()
-    api_version: str = "4"
+    api_version: str = "5"
+    settings: type | None = None
 
     def __post_init__(self) -> None:
         """校验标识、版本格式和各 capability 声明之间的一致性。
 
         Raises:
-            TypeError: 任一声明集合不是 tuple，或元素不是字符串。
-            ValueError: 标识或 capability 缺少命名空间、版本格式不合法、声明重复、依赖自身，
+            TypeError: 任一声明集合不是 tuple，元素不是字符串，或 settings 不是合法的设置类型。
+            ValueError: 标识或 capability 缺少命名空间、版本格式不合法、声明重复，
                 或同一 capability 在 provides、wraps、requires_capabilities 中出现多次。
         """
 
-        plugin_id = require_namespaced(self.id, "plugin id")
+        require_namespaced(self.id, "plugin id")
         version = require_non_empty_string(self.version, "plugin version")
         # fullmatch 拒绝 `$` 允许的末尾换行。
         if not _VERSION.fullmatch(version):
@@ -55,7 +59,6 @@ class PluginDescriptor:
         if not api_version.isdigit() or int(api_version) < 1:
             raise ValueError("plugin API version must be a positive integer")
         for label, values in (
-            ("plugin requirement", self.requires),
             ("required capability", self.requires_capabilities),
             ("provided capability", self.provides),
             ("wrapped capability", self.wraps),
@@ -65,14 +68,14 @@ class PluginDescriptor:
             normalized = tuple(require_namespaced(value, label) for value in values)
             if len(set(normalized)) != len(normalized):
                 raise ValueError(f"duplicate {label}")
-        if plugin_id in self.requires:
-            raise ValueError("plugin must not require itself")
         declared = (*self.provides, *self.wraps, *self.requires_capabilities)
         if len(set(declared)) != len(declared):
             raise ValueError(
                 "a capability can appear only once across provides, wraps "
                 "and requires_capabilities"
             )
+        if self.settings is not None:
+            check_settings_type(self.settings)
 
 
 class Plugin(Protocol):
@@ -96,17 +99,19 @@ class Plugin(Protocol):
 
 
 class ExtensionAPI:
-    """绑定单个插件身份的扩展接口：on、provide、wrap、require 与 defer。
+    """绑定单个插件身份的扩展接口：on、provide、wrap、require、defer 与只读的 settings。
 
     以插件身份进行的全部登记在关闭或启动回滚时由宿主统一注销，随后逆序执行 defer 登记的清理函数。
+    运行期安装的插件卸载时同样注销其登记并执行其清理，此后扩展接口拒绝新的登记。
 
     Attributes:
         __slots__: 限制实例只保存下列字段。
         _host: 所属的插件宿主。
         _plugin: 绑定的插件标识，所有登记以该身份进行。
+        _live: 插件是否仍处于安装状态；运行期安装的插件卸载或宿主关闭后为 False。
     """
 
-    __slots__ = ("_host", "_plugin")
+    __slots__ = ("_host", "_live", "_plugin")
 
     def __init__(self, host: PluginHost, plugin: str) -> None:
         """把插件标识绑定到宿主。
@@ -118,6 +123,7 @@ class ExtensionAPI:
 
         self._host = host
         self._plugin = plugin
+        self._live = True
 
     @property
     def plugin(self) -> str:
@@ -131,6 +137,12 @@ class ExtensionAPI:
 
         return self._host.hooks
 
+    @property
+    def settings(self) -> Any:
+        """返回宿主为本插件校验后的设置实例；插件未声明 settings 时为 None。"""
+
+        return self._host._settings.get(self._plugin)
+
     def on(
         self, point: AnyPoint, handler: Callable[..., Any], /, **scope: Any
     ) -> Registration:
@@ -138,9 +150,13 @@ class ExtensionAPI:
 
         Returns:
             撤销本次登记的句柄；宿主关闭时自动注销。
+
+        Raises:
+            RuntimeError: 插件已经卸载。
         """
 
-        return self._host.hooks.on(point, handler, owner=self._plugin, **scope)
+        with self._registering():
+            return self._host.hooks.on(point, handler, owner=self._plugin, **scope)
 
     def provide(self, name: str, value: Any) -> Registration:
         """以插件身份提供一项具名值。
@@ -156,11 +172,12 @@ class ExtensionAPI:
             撤销本次提供的句柄；宿主关闭时自动撤销。capability 只能在 setup 期或关闭期间撤销。
 
         Raises:
-            RuntimeError: 在 setup 期之外提供已声明的 capability。
+            RuntimeError: 在 setup 期之外提供已声明的 capability，或插件已经卸载。
             ValueError: 名称已被提供，或是其他插件声明的 capability。
         """
 
-        return self._host._provide(self._plugin, name, value)
+        with self._registering():
+            return self._host._provide(self._plugin, name, value)
 
     def wrap(self, capability: str, decorator: Callable[[Any], Any]) -> None:
         """装饰一项已在 descriptor.wraps 声明的单例 capability。
@@ -204,10 +221,24 @@ class ExtensionAPI:
 
         Raises:
             TypeError: cleanup 不可调用。
-            RuntimeError: 宿主已经关闭。
+            RuntimeError: 宿主已经关闭，或插件已经卸载。
         """
 
-        self._host._defer(self._plugin, cleanup)
+        with self._registering():
+            self._host._defer(self._plugin, cleanup)
+
+    @contextmanager
+    def _registering(self) -> Iterator[None]:
+        """持有宿主锁并确认插件仍处于安装状态，使登记不与卸载交错。
+
+        Raises:
+            RuntimeError: 运行期安装的插件已经卸载。
+        """
+
+        with self._host._lock:
+            if not self._live:
+                raise RuntimeError(f"plugin {self._plugin!r} is uninstalled")
+            yield
 
 
 class _FunctionPlugin:
@@ -247,10 +278,10 @@ def plugin(
     id: str,
     *,
     version: str = "1.0.0",
-    requires: tuple[str, ...] = (),
     provides: tuple[str, ...] = (),
     wraps: tuple[str, ...] = (),
     requires_capabilities: tuple[str, ...] = (),
+    settings: type | None = None,
 ) -> Callable[[Callable[[ExtensionAPI], None]], Plugin]:
     """把 ``setup(api)`` 函数声明为插件的装饰器。
 
@@ -259,10 +290,10 @@ def plugin(
     Args:
         id: 含 ``/`` 的命名空间插件标识。
         version: 插件自身的简单语义化版本。
-        requires: 必须先装配的插件标识。
         provides: setup 中必须提供的单例 capability。
         wraps: setup 中必须装饰的单例 capability。
         requires_capabilities: 必须由其他插件提供的单例 capability。
+        settings: 插件设置的冻结 dataclass 类型；None 表示没有设置。
 
     Returns:
         接收 setup 函数并返回插件对象的装饰器。
@@ -275,10 +306,10 @@ def plugin(
     descriptor = PluginDescriptor(
         id,
         version,
-        requires=requires,
         provides=provides,
         wraps=wraps,
         requires_capabilities=requires_capabilities,
+        settings=settings,
     )
 
     def decorate(setup: Callable[[ExtensionAPI], None]) -> Plugin:
@@ -296,7 +327,8 @@ class PluginHost:
 
     启动失败或关闭时先逆序注销各插件的钩子与具名值，再逆序执行 defer 登记的清理函数；单项失败不跳过后续清理。
     关闭时抛出首个失败，其余失败写入 ``interlace.plugins.host`` 的 ERROR 日志；启动回滚时重新抛出原始
-    启动失败，清理失败全部写入日志。
+    启动失败，清理失败全部写入日志。宿主运行期间可经 `install` 安装只登记钩子、具名值与清理函数的插件，
+    并单独卸载。
 
     Attributes:
         API_VERSION: 宿主支持的扩展 SPI 主版本字符串。
@@ -310,23 +342,32 @@ class PluginHost:
         _cleanups: defer 登记的 (插件标识, 清理函数)，按登记顺序保存，逆序执行。
         _frozen: setup 阶段是否已结束；结束后拒绝提供 capability 与 wrap。
         _closed: 是否已开始关闭或启动回滚；开始后允许撤销 capability，拒绝再次启动与 defer。
+        _settings: 插件标识到已校验设置实例的映射，只含声明了 settings 的插件。
+        _installed: 运行期安装插件的标识到 (声明, 扩展接口) 的映射，按安装顺序保存。
+        _lock: 串行化安装、卸载、登记与关闭的可重入锁。
     """
 
-    API_VERSION = "4"
+    API_VERSION = "5"
 
     def __init__(
-        self, plugins: Iterable[Plugin], *, hooks: HookBus | None = None
+        self,
+        plugins: Iterable[Plugin],
+        *,
+        hooks: HookBus | None = None,
+        settings: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> None:
-        """校验插件声明并按依赖关系确定装配顺序。
+        """校验插件声明与设置，并按依赖关系确定装配顺序。
 
         Args:
             plugins: 待装配的插件。
             hooks: 所属 Runtime 的钩子总线；None 时新建。
+            settings: 插件标识到该插件设置覆盖值的映射；未列出的插件使用默认设置。
 
         Raises:
-            TypeError: plugins 不可迭代，插件缺少 PluginDescriptor 或 setup，或 hooks 不是 HookBus。
+            TypeError: plugins 不可迭代，插件缺少 PluginDescriptor 或 setup，hooks 不是 HookBus，
+                settings 不是映射，或设置值类型不符。
             ValueError: 插件重复、SPI 版本不兼容、单例 capability 冲突、装饰或依赖的 capability 无人提供、
-                依赖缺失或循环依赖。
+                依赖缺失、循环依赖，设置指向未知插件或未声明设置的插件，或设置值不合法。
         """
 
         if hooks is None:
@@ -347,12 +388,30 @@ class PluginHost:
         self._cleanups: list[tuple[str, Callable[[], object]]] = []
         self._frozen = False
         self._closed = False
+        if settings is None:
+            settings = {}
+        elif not isinstance(settings, Mapping):
+            raise TypeError("plugin settings must be a mapping")
+        unknown = set(settings) - set(self._apis)
+        if unknown:
+            raise ValueError(
+                f"settings for unknown plugins {sorted(unknown, key=str)!r}"
+            )
+        self._settings: dict[str, Any] = {}
+        for descriptor, _ in self._plugins:
+            value = _settings_for(descriptor, settings.get(descriptor.id))
+            if value is not None:
+                self._settings[descriptor.id] = value
+        self._installed: dict[str, tuple[PluginDescriptor, ExtensionAPI]] = {}
+        self._lock = RLock()
 
     @property
     def descriptors(self) -> tuple[PluginDescriptor, ...]:
-        """返回按装配顺序排列的插件声明快照。"""
+        """返回声明快照：启动插件按装配顺序在前，运行期安装的插件按安装顺序在后。"""
 
-        return tuple(descriptor for descriptor, _ in self._plugins)
+        with self._lock:
+            installed = tuple(descriptor for descriptor, _ in self._installed.values())
+        return (*(descriptor for descriptor, _ in self._plugins), *installed)
 
     def start(self) -> PluginHost:
         """依次 setup 全部插件并核对声明；已启动时直接返回。
@@ -417,12 +476,102 @@ class PluginHost:
             BaseException: 清理中出现的首个失败；其余失败已写入日志。
         """
 
-        if self._closed:
-            return
-        self._closed = True
-        failure = self._cleanup()
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            failure = self._cleanup()
         if failure is not None:
             raise failure
+
+    def install(
+        self, plugin: Plugin, *, settings: Mapping[str, Any] | None = None
+    ) -> Registration:
+        """在宿主运行期间安装插件，返回卸载该插件的句柄。
+
+        运行期安装的插件只能登记钩子、具名值与清理函数，不能提供或装饰单例 capability；依赖的
+        capability 必须已由启动插件提供。setup 失败时注销其已有登记并执行其清理，再重新抛出原始失败。
+        卸载先注销该插件的登记，再逆序执行它登记的清理；宿主关闭时一并卸载。已发布的
+        ``runtime.started`` 不会补发给运行期安装的插件。
+
+        Args:
+            plugin: 待安装的插件。
+            settings: 插件设置的覆盖值；None 表示全部使用默认值。
+
+        Returns:
+            卸载插件的句柄；重复调用或宿主关闭后调用不产生作用，卸载清理的首个失败抛给调用方。
+
+        Raises:
+            TypeError: 插件缺少 PluginDescriptor 或 setup，或设置值类型不符。
+            ValueError: SPI 版本不兼容，插件声明了 provides 或 wraps，标识已被占用，依赖的 capability
+                无人提供，或设置不合法。
+            RuntimeError: 宿主尚未启动或已经关闭。
+            BaseException: 插件 setup 抛出的原始异常。
+        """
+
+        ((descriptor, item),) = _collect((plugin,)).values()
+        if descriptor.provides or descriptor.wraps:
+            raise ValueError(
+                f"installed plugin {descriptor.id!r} cannot provide or wrap capabilities"
+            )
+        values = _settings_for(descriptor, settings)
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("plugin host is closed")
+            if not self._frozen:
+                raise RuntimeError("plugin host has not started")
+            if descriptor.id in self._apis or descriptor.id in self._installed:
+                raise ValueError(f"duplicate plugin {descriptor.id!r}")
+            for capability in descriptor.requires_capabilities:
+                if capability not in self._capabilities:
+                    raise ValueError(
+                        f"missing required capability {capability!r} "
+                        f"for plugin {descriptor.id!r}"
+                    )
+            api = ExtensionAPI(self, descriptor.id)
+            self._installed[descriptor.id] = (descriptor, api)
+            if values is not None:
+                self._settings[descriptor.id] = values
+            try:
+                item.setup(api)
+            except BaseException:
+                failure = self._release(descriptor.id)
+                if failure is not None:
+                    _logger.error("plugin install rollback failed", exc_info=failure)
+                raise
+        return Registration(partial(self._uninstall, descriptor.id, api))
+
+    def _uninstall(self, plugin: str, api: ExtensionAPI) -> None:
+        """卸载仍处于安装状态的同一个插件实例；宿主已关闭或该实例已卸载时不产生作用。
+
+        Raises:
+            BaseException: 卸载清理中的首个失败；其余失败已写入日志。
+        """
+
+        with self._lock:
+            installed = self._installed.get(plugin)
+            if self._closed or installed is None or installed[1] is not api:
+                return
+            failure = self._release(plugin)
+        if failure is not None:
+            raise failure
+
+    def _release(self, plugin: str) -> BaseException | None:
+        """注销运行期安装插件的登记并逆序执行其清理；调用方持有宿主锁。
+
+        Returns:
+            首个失败，全部成功时为 None；其余失败已写入 ERROR 日志。
+        """
+
+        _, api = self._installed.pop(plugin)
+        api._live = False
+        self._settings.pop(plugin, None)
+        cleanups = [cleanup for owner, cleanup in self._cleanups if owner == plugin]
+        self._cleanups = [entry for entry in self._cleanups if entry[0] != plugin]
+        return _run_all(
+            (partial(self.hooks.detach_owner, plugin), *reversed(cleanups)),
+            "plugin uninstall failed",
+        )
 
     def _provide(self, plugin: str, name: str, value: Any) -> Registration:
         """以插件身份提供具名值；自身声明的 capability 走 setup 期单例路径。
@@ -533,43 +682,78 @@ class PluginHost:
 
         if not callable(cleanup):
             raise TypeError("cleanup must be callable")
-        if self._closed:
-            raise RuntimeError("plugin host is closed")
-        self._cleanups.append((plugin, cleanup))
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("plugin host is closed")
+            self._cleanups.append((plugin, cleanup))
 
     def _cleanup(self) -> BaseException | None:
         """逆序注销各插件的钩子与具名值，再逆序执行清理函数，最后清空 capability。
+
+        运行期安装的插件晚于启动插件 setup，因此先于启动插件注销。
 
         Returns:
             首个清理失败，全部成功时为 None；其余失败已写入 ERROR 日志。
         """
 
-        failure: BaseException | None = None
-
-        def record(exc: BaseException) -> None:
-            """保留首个清理失败，其余失败写入日志。"""
-
-            nonlocal failure
-            if failure is None:
-                failure = exc
-            else:
-                _logger.error("plugin host cleanup failed", exc_info=exc)
-
-        for plugin_id in reversed(self._entered):
-            try:
-                self.hooks.detach_owner(plugin_id)
-            except BaseException as exc:
-                record(exc)
-        while self._cleanups:
-            _, cleanup = self._cleanups.pop()
-            try:
-                cleanup()
-            except BaseException as exc:
-                record(exc)
+        for _, api in self._installed.values():
+            api._live = False
+        owners = (*self._entered, *self._installed)
+        cleanups = [cleanup for _, cleanup in reversed(self._cleanups)]
+        self._cleanups.clear()
+        failure = _run_all(
+            (
+                *(
+                    partial(self.hooks.detach_owner, owner)
+                    for owner in reversed(owners)
+                ),
+                *cleanups,
+            ),
+            "plugin host cleanup failed",
+        )
         self._entered.clear()
+        self._installed.clear()
         self._capabilities.clear()
         self._wrapped.clear()
         return failure
+
+
+def _settings_for(
+    descriptor: PluginDescriptor, values: Mapping[str, Any] | None
+) -> Any:
+    """按插件声明构造设置实例；未声明设置的插件返回 None。
+
+    Raises:
+        TypeError: 设置值类型不符。
+        ValueError: 插件未声明设置却收到设置，或设置值不合法。
+    """
+
+    if descriptor.settings is None:
+        if values is not None:
+            raise ValueError(f"plugin {descriptor.id!r} declares no settings")
+        return None
+    return build_settings(descriptor.settings, values)
+
+
+def _run_all(
+    actions: Iterable[Callable[[], object]], message: str
+) -> BaseException | None:
+    """依次执行全部动作，单项失败不跳过后续动作。
+
+    Returns:
+        首个失败，全部成功时为 None；其余失败以 message 写入 ERROR 日志。
+    """
+
+    failure: BaseException | None = None
+    for action in actions:
+        try:
+            action()
+        except BaseException as exc:
+            if failure is None:
+                failure = exc
+            else:
+                _logger.error(message, exc_info=exc)
+    return failure
 
 
 def _collect(plugins: Iterable[Plugin]) -> dict[str, tuple[PluginDescriptor, Plugin]]:
@@ -642,12 +826,12 @@ def _order(
     candidates: dict[str, tuple[PluginDescriptor, Plugin]],
     providers: dict[str, str],
 ) -> tuple[tuple[PluginDescriptor, Plugin], ...]:
-    """按插件依赖、capability 提供者与装饰者拓扑排序，同层保持传入顺序。
+    """按 capability 提供者、装饰者与依赖方拓扑排序，同层保持传入顺序。
 
     装饰者排在提供者之后；依赖某 capability 的插件排在其提供者与全部装饰者之后。
 
     Raises:
-        ValueError: 依赖的插件缺失或存在循环依赖。
+        ValueError: 存在循环的 capability 依赖。
     """
 
     wrappers: dict[str, list[str]] = {}
@@ -665,13 +849,8 @@ def _order(
             raise ValueError(f"cyclic plugin dependency involving {plugin_id!r}")
         if plugin_id in visited:
             return
-        try:
-            descriptor, item = candidates[plugin_id]
-        except KeyError as exc:
-            raise ValueError(f"missing required plugin {plugin_id!r}") from exc
+        descriptor, item = candidates[plugin_id]
         visiting.add(plugin_id)
-        for required in descriptor.requires:
-            visit(required)
         for capability in descriptor.wraps:
             visit(providers[capability])
         for capability in descriptor.requires_capabilities:

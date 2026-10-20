@@ -204,8 +204,8 @@ def test_host_allowlist_rejects_dns_rebinding_and_accepts_configured_hosts(
     with (
         GraphService(runtime) as service,
         TestClient(
-            service.create_app(allowed_hosts=["Studio.Example"]),
-            base_url="http://studio.example",
+            service.create_app(allowed_hosts=["Graphs.Example"]),
+            base_url="http://graphs.example",
         ) as client,
     ):
         assert client.get("/api/graphs").status_code == 200
@@ -242,7 +242,6 @@ def test_token_compares_bytes_and_rejects_non_ascii_authorization(
             ).status_code
             == 200
         )
-        assert client.get("/").status_code == 200
         authorized = client.get(
             "/api/graphs", headers={"Authorization": "Bearer secret"}
         )
@@ -644,11 +643,57 @@ def test_constructor_failure_before_registration_allows_rebuild(
             GraphService(runtime, nodes=catalog(), database=database)
         assert "saved@v1" not in runtime.graphs()
         assert tuple(root.handlers) == handlers
+        assert not [
+            descriptor
+            for descriptor in runtime.plugin_host.descriptors
+            if descriptor.id.startswith("interlace.service/")
+        ]
         monkeypatch.setattr(runtime.hooks, "on", original)
         service = GraphService(runtime, nodes=catalog(), database=database)
         assert runtime.run("saved@v1", 5)[0].value == 5
         runtime.wait_idle()
         service.close()
+
+
+def test_service_is_a_runtime_installed_plugin_released_by_either_side() -> None:
+    """服务以运行期插件接入：关闭服务卸载插件并移除诊断日志处理器；Runtime 先关闭时宿主一并卸载，服务随后关闭不报错。"""
+
+    root = logging.getLogger()
+    handlers = tuple(root.handlers)
+
+    def service_plugins(runtime: Runtime) -> list[str]:
+        """返回服务插件标识。
+
+        Args:
+            runtime: 被检查的运行时。
+
+        Returns:
+            以 ``interlace.service/`` 开头的已安装插件标识。
+        """
+
+        return [
+            descriptor.id
+            for descriptor in runtime.plugin_host.descriptors
+            if descriptor.id.startswith("interlace.service/")
+        ]
+
+    with Runtime() as runtime:
+        first = GraphService(runtime)
+        second = GraphService(runtime, diagnostics=False)
+        assert len(set(service_plugins(runtime))) == 2
+        first.close()
+        assert len(service_plugins(runtime)) == 1
+        second.close()
+        assert service_plugins(runtime) == []
+        assert tuple(root.handlers) == handlers
+
+    runtime = Runtime()
+    service = GraphService(runtime)
+    runtime.close()
+    assert tuple(root.handlers) == handlers
+    service.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        GraphService(runtime)
 
 
 def test_newer_database_schema_is_rejected(tmp_path: Path) -> None:

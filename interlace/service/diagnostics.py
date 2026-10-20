@@ -15,9 +15,7 @@ from typing import Any
 
 from pydantic_core import to_jsonable_python
 
-from interlace import Runtime
 from interlace.plugins.points import (
-    NODE_INSPECT,
     HookPhase,
     NodeInspection,
     RuntimeEvent,
@@ -209,24 +207,22 @@ def redact_value(value: Any, depth: int = 0) -> Any:
 
 
 class NodeDiagnostics:
-    """经 NODE_INSPECT 钩子点采集节点调用数据的诊断器，不转换输入输出。
+    """采集节点调用数据的诊断器，不转换输入输出；由服务插件把 `inspect` 登记到 NODE_INSPECT。
 
     Attributes:
         store: 调用方管理的服务历史存储。
         _active: 当前正在运行的执行标识、节点和 firing 序号。
         _lock: 保护并发 firing 的采集范围。
-        _hook: 本次诊断独立拥有的 NODE_INSPECT 登记。
         _handler: 本次诊断独立拥有的标准日志处理器。
         _pending: 按 firing 暂存、等待批量写入的诊断事件。
         _batch_size: 单次事务最多积累的诊断事件数量。
         _closed: 是否已停止采集。
     """
 
-    def __init__(self, runtime: Runtime, store: ServiceStore) -> None:
-        """为指定 Runtime 登记诊断采集并安装带作用域的日志处理器。
+    def __init__(self, store: ServiceStore) -> None:
+        """安装带作用域的日志处理器。
 
         Args:
-            runtime: 提供钩子总线的运行时。
             store: 保存采集结果的服务存储。
         """
 
@@ -240,11 +236,9 @@ class NodeDiagnostics:
         self._lock = RLock()
         self._closed = False
         self._handler = _NodeLogHandler(self)
-        self._hook = runtime.hooks.on(NODE_INSPECT, self.inspect)
         try:
             logging.getLogger().addHandler(self._handler)
         except BaseException:
-            self._hook.detach()
             self._handler.close()
             raise
 
@@ -351,7 +345,7 @@ class NodeDiagnostics:
             self.store.append_events(entries)
 
     def close(self) -> None:
-        """注销本次采集登记和日志处理器，不改变其他日志配置。"""
+        """停止采集并卸载日志处理器，不改变其他日志配置。"""
 
         with self._lock:
             if self._closed:
@@ -363,7 +357,6 @@ class NodeDiagnostics:
             )
             self._pending.clear()
         self._flush(pending)
-        self._hook.detach()
         logging.getLogger().removeHandler(self._handler)
         self._handler.close()
 

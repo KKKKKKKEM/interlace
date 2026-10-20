@@ -49,7 +49,7 @@ from ..spi import (
 from ._utils import _close_components, _Lifecycle, _remaining, _unique
 from .direct import _DirectRunner
 from .history import _ExecutionHistory
-from .points import EXECUTION_RUN, WORK_DELIVER, ExecutionCall
+from ..plugins.points import EXECUTION_RUN, WORK_DELIVER, ExecutionCall
 
 # 交付结果写入 WORK_FINISHED 的状态字符串。
 _DELIVERY_STATUS = {

@@ -51,7 +51,6 @@ class RecordingPlugin:
         plugin_id: str,
         events: list[str],
         *,
-        requires: tuple[str, ...] = (),
         requires_capabilities: tuple[str, ...] = (),
         capability: str | None = None,
     ) -> None:
@@ -60,14 +59,12 @@ class RecordingPlugin:
         Args:
             plugin_id: 插件标识。
             events: 追加生命周期记录的共享列表。
-            requires: 依赖的插件标识。
             requires_capabilities: 依赖的单例能力。
             capability: 需要在 setup 中提供的能力；None 表示不提供。
         """
 
         self.descriptor = PluginDescriptor(
             plugin_id,
-            requires=requires,
             requires_capabilities=requires_capabilities,
             provides=() if capability is None else (capability,),
         )
@@ -170,9 +167,7 @@ def test_function_and_class_plugins_extend_the_same_runtime() -> None:
             descriptor: 插件声明。
         """
 
-        descriptor = PluginDescriptor(
-            "example/features", requires=("example/selectors",)
-        )
+        descriptor = PluginDescriptor("example/features")
 
         def setup(self, api: Any) -> None:
             """登记节点中间件与生命周期观察者。"""
@@ -191,8 +186,8 @@ def test_function_and_class_plugins_extend_the_same_runtime() -> None:
         assert [descriptor.id for descriptor in runtime.plugin_host.descriptors] == [
             "interlace.core/local-infrastructure",
             "interlace.core/local-runtime",
-            "example/selectors",
             "example/features",
+            "example/selectors",
         ]
     assert [event.status for event in observed] == ["succeeded"]
 
@@ -224,7 +219,7 @@ def test_plugin_registrations_are_removed_on_close_and_rollback() -> None:
         api.on(TRACE, lambda value: seen.append(f"plugin:{value}"))
         api.provide("example.plugin/any", AnySelector())
 
-    @plugin("example/broken", requires=("example/trace",))
+    @plugin("example/broken")
     def broken(api: Any) -> None:
         """在 setup 中失败。"""
 
@@ -381,7 +376,7 @@ def test_failed_runtime_construction_does_not_leave_runner_threads(stage) -> Non
     broken = Broken(
         "example/broken",
         [],
-        requires=("example/missing",) if stage == "validation" else (),
+        requires_capabilities=("example/missing",) if stage == "validation" else (),
     )
 
     def runner_threads() -> set[int | None]:
@@ -397,7 +392,7 @@ def test_failed_runtime_construction_does_not_leave_runner_threads(stage) -> Non
     for _ in range(3):
         with pytest.raises(
             (ValueError, RuntimeError),
-            match=r"missing required plugin|setup failed",
+            match=r"missing required capability|setup failed",
         ):
             Runtime(plugins=(broken,))
     assert runner_threads() == before
@@ -442,7 +437,9 @@ def test_host_orders_dependencies_and_cleans_up_in_reverse() -> None:
 
     events: list[str] = []
     base = RecordingPlugin("example/base", events, capability="example/base-value")
-    feature = RecordingPlugin("example/feature", events, requires=("example/base",))
+    feature = RecordingPlugin(
+        "example/feature", events, requires_capabilities=("example/base-value",)
+    )
 
     host = PluginHost((feature, base)).start()
 
@@ -471,17 +468,22 @@ def test_host_orders_capability_dependencies_and_rejects_missing_provider() -> N
         PluginHost((consumer,))
 
 
-def test_host_rejects_missing_cycle_and_capability_conflict() -> None:
-    """宿主拒绝缺失依赖、循环依赖和能力冲突。"""
+def test_host_rejects_capability_cycle_and_conflict() -> None:
+    """宿主拒绝循环的 capability 依赖和能力冲突。"""
 
     events: list[str] = []
-    with pytest.raises(ValueError, match="missing required plugin"):
-        PluginHost(
-            (RecordingPlugin("example/feature", events, requires=("example/base",)),)
-        )
-
-    left = RecordingPlugin("example/left", events, requires=("example/right",))
-    right = RecordingPlugin("example/right", events, requires=("example/left",))
+    left = RecordingPlugin(
+        "example/left",
+        events,
+        capability="example/left-value",
+        requires_capabilities=("example/right-value",),
+    )
+    right = RecordingPlugin(
+        "example/right",
+        events,
+        capability="example/right-value",
+        requires_capabilities=("example/left-value",),
+    )
     with pytest.raises(ValueError, match="cyclic plugin dependency"):
         PluginHost((left, right))
 
@@ -491,7 +493,7 @@ def test_host_rejects_missing_cycle_and_capability_conflict() -> None:
         PluginHost((first, second))
 
 
-@pytest.mark.parametrize("api_version", ["3", "5"])
+@pytest.mark.parametrize("api_version", ["4", "6"])
 def test_host_rejects_incompatible_plugin_api(api_version: str) -> None:
     """宿主同时拒绝旧版和未来的扩展 SPI。
 
@@ -832,8 +834,7 @@ def test_provide_registration_detach_follows_host_phase() -> None:
         ({"id": "a/b c"}, ValueError),
         ({"version": "1.x"}, ValueError),
         ({"version": "1.0.0\n"}, ValueError),
-        ({"requires": ("test/self",)}, ValueError),
-        ({"requires": ["test/other"]}, TypeError),
+        ({"requires_capabilities": ["a/cap"]}, TypeError),
         ({"provides": ("plain",)}, ValueError),
         ({"provides": ("a/cap", "a/cap")}, ValueError),
         ({"provides": ("a/cap",), "wraps": ("a/cap",)}, ValueError),

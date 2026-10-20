@@ -13,7 +13,7 @@
 | 运行角色 | `interlace.runtime` | EventRouter、GraphWorker | 分别处理 Event -> Work 与 Work -> Graph execution |
 | 能力端口 | `interlace.spi` | RouterRole、WorkerRole（即 ExecutionHost）、EventBus、任务传输、GraphExecutor、SlotProvider、执行资源协议 | 隔离编排、传输、执行和资源实现 |
 | 默认适配器 | `interlace.adapters.memory`、`interlace.engine.executor` | EventBus、TaskBackend、Engine | 提供单进程内存运行时 |
-| 可选官方服务 | `interlace.service` | GraphService、NodeCatalog、Studio | 提供 RPC、图编辑发布与观测历史，按 extra 安装 |
+| 可选官方服务 | `interlace.service` | GraphService、NodeCatalog | 提供 RPC、图编辑发布与观测历史，按 extra 安装 |
 
 Runtime 是面向应用的稳定门面，PluginHost 是系统装配根。普通应用不需要看到后四层。
 
@@ -45,21 +45,19 @@ interlace/
 │   ├── worker.py            # GraphWorker：注册、消费与执行宿主编排
 │   ├── history.py           # Execution 记录保留与活跃计数
 │   ├── direct.py            # 直接执行线程池
-│   ├── points.py            # Router、Worker 与 Runtime 生命周期的核心钩子点
 │   ├── plugin.py            # LocalInfrastructurePlugin、LocalRuntimePlugin
 │   └── _utils.py            # 私有生命周期状态机与关闭辅助函数
-├── plugins/                 # PluginHost、ExtensionAPI、descriptor、capability 与 points 重导出
+├── plugins/                 # PluginHost、ExtensionAPI、descriptor、capability、插件设置、Background 与核心钩子点
 ├── spi/                     # EventBus、任务传输、GraphExecutor 等窄协议
 ├── adapters/                # 随包提供的具体部署适配器
 │   └── memory.py            # memory.EventBus、memory.TaskBackend
 ├── nodes/                   # 可复用的非内核 Node，例如 KeyedJoin
-└── service/                 # 按需安装的官方 RPC 与 Studio
+└── service/                 # 按需安装的官方 RPC 与图服务
     ├── catalog.py           # 显式节点工厂与图文档编译
     ├── models.py            # JSON 传输和编辑文档模型
     ├── service.py           # 协议共用的图服务
     ├── store.py             # 草稿、版本、观测与输出历史
-    ├── http.py              # HTTP、JSON-RPC、SSE 与 ASGI 装配
-    └── static/              # 随 Python 包交付的已构建工作台
+    └── http.py              # HTTP、JSON-RPC、SSE 与 ASGI 装配
 ```
 
 `interlace.engine` 不再充当高级 API 聚合入口。普通应用只从 `interlace` 导入；插件、SPI 和基础设施作者根据职责从
@@ -95,7 +93,7 @@ flowchart LR
 - `plugins` 管理装配元数据、钩子总线与生命周期，只依赖公开 capability，不读取 Runtime 私有状态；
 - `runtime` 可以依赖前述各层并完成组合，但不得把部署算法重新实现到门面中；
 - `nodes` 只放可复用的非内核 Node，只依赖内核公共语义，不能成为 Runtime 的隐式前置条件。
-- `service` 依赖公开 Runtime、Graph、Execution 及观察模型；核心不导入服务或 Web 依赖。`web/` 保存工作台源代码。
+- `service` 依赖公开 Runtime、Graph、Execution 及观察模型；核心不导入服务或 Web 依赖。
 
 服务通过 `Runtime.graphs()` 读取已注册图的只读快照；默认 GraphWorker 实现 `interlace.spi.GraphCatalog`。
 替代 Worker 若需启用图检查与服务，同样实现该窄协议。服务不回退读取默认 Worker 的私有注册表。
@@ -251,8 +249,9 @@ emit 开始新的 Slot 链。同一个 Slot 使用 execution lock 保证 Graph �
 
 Runtime 关闭时先发布 `runtime.closing`，调用 Worker 的 `begin_close()` 解除未读订阅的背压并排空工作，关闭角色后发布
 `runtime.closed`，最后关闭 PluginHost。宿主先逆序注销各插件经 `api.on`/`api.provide` 的登记，再按登记的逆序执行
-`api.defer` 清理函数；`setup()` 中途失败也按同一清理流程回滚，单项清理失败不跳过后续步骤并写入日志，回滚
-最终重新抛出原始失败。内建插件关闭它们创建的角色与底层组件；注入组件默认由调用方管理，`close_injected=True`
+`api.defer` 清理函数；运行期经 `plugin_host.install()` 安装的插件晚于启动插件 setup，因此先注销。`setup()` 中途失败
+也按同一清理流程回滚，单项清理失败不跳过后续步骤并写入日志，回滚最终重新抛出原始失败；单个运行期插件的卸载
+只对该插件执行同一流程。内建插件关闭它们创建的角色与底层组件；注入组件默认由调用方管理，`close_injected=True`
 才转移所有权。selector 撤销只影响后续 Graph 冻结，已经绑定的 Graph 保留原 selector 快照。
 
 组件所有权与注册所有权分别管理。`EventBus.subscribe()`、`TaskConsumer.bind()` 返回仅撤销本次注册的幂等函数；

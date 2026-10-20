@@ -1,4 +1,4 @@
-"""HTTP、JSON-RPC 与 SSE 协议适配，内置 Studio 静态资源。"""
+"""HTTP、JSON-RPC 与 SSE 协议适配。"""
 
 from __future__ import annotations
 
@@ -8,13 +8,11 @@ import logging
 import secrets
 from collections.abc import AsyncIterator, Iterable
 from contextlib import suppress
-from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from fastapi.staticfiles import StaticFiles
 from jsonrpcserver import Error, Result, Success, async_dispatch
 from pydantic import ValidationError
 from starlette.concurrency import run_in_threadpool
@@ -155,7 +153,7 @@ class AccessMiddleware:
     """纯 ASGI 访问控制：Host 白名单、Bearer 令牌、浏览器同源写入与安全响应头。
 
     Host 检查作用于全部 HTTP 与 WebSocket 请求，用于抵御 DNS rebinding；令牌与 Origin
-    检查只作用于 API、RPC 和 OpenAPI 路径，Studio 静态资源无需令牌即可加载。
+    检查只作用于 API、RPC 和 OpenAPI 路径。
 
     Attributes:
         app: 下游 ASGI 应用。
@@ -214,7 +212,7 @@ class AccessMiddleware:
             if message["type"] == "http.response.start":
                 response_headers = MutableHeaders(scope=message)
                 response_headers["X-Content-Type-Options"] = "nosniff"
-                # 禁止第三方页面以 iframe 嵌入工作台诱导点击发布、运行或删除。
+                # 禁止第三方页面以 iframe 嵌入服务页面诱导点击发布、运行或删除。
                 response_headers["X-Frame-Options"] = "DENY"
                 response_headers["Content-Security-Policy"] = "frame-ancestors 'none'"
                 if protected:
@@ -278,7 +276,7 @@ def create_app(
             包含 `*` 时不限制。
 
     Returns:
-        带 OpenAPI、JSON-RPC 和 Studio 的 FastAPI 应用。
+        带 OpenAPI 与 JSON-RPC 的 FastAPI 应用。
 
     Raises:
         ValueError: max_request_bytes 不是正整数。
@@ -298,9 +296,6 @@ def create_app(
     _add_execution_routes(app, service)
     _add_stream_routes(app, service)
     _add_rpc_route(app, service)
-    static = Path(__file__).with_name("static")
-    if static.is_dir():
-        app.mount("/", StaticFiles(directory=static, html=True), name="studio")
     return app
 
 

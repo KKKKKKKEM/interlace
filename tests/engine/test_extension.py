@@ -247,3 +247,38 @@ def test_detach_owner_removes_only_that_owner() -> None:
     bus.notify(NOTICE, 0)
     assert seen == ["b"]
     assert dict(bus.provided()) == {"acme/b": 2}
+
+
+def test_required_wrap_rejects_calls_without_matching_handler() -> None:
+    """required 点在调用作用域内没有生效的处理函数时拒绝调用且不执行内层操作，有处理函数时照常包裹。"""
+
+    required: WrapPoint[int, int] = WrapPoint(
+        "test/required", scope=("site",), required=True
+    )
+    bus = HookBus()
+    calls: list[int] = []
+
+    def inner(value: int) -> int:
+        """记录内层调用。"""
+
+        calls.append(value)
+        return value
+
+    with pytest.raises(LookupError, match="test/required"):
+        bus.wrap(required, 1, inner, site="a")
+    with pytest.raises(LookupError, match="test/required"):
+        asyncio.run(bus.awrap(required, 1, inner, site="a"))
+    registration = bus.on(
+        required, lambda value, call_next: call_next(value + 1), site="b"
+    )
+    with pytest.raises(LookupError):
+        bus.wrap(required, 1, inner, site="a")
+    assert bus.wrap(required, 1, inner, site="b") == 2
+    registration.detach()
+    with pytest.raises(LookupError):
+        bus.wrap(required, 1, inner, site="b")
+    assert calls == [2]
+    assert bus.wrap(WRAP, 5, inner) == 5
+
+    with pytest.raises(TypeError, match="bool"):
+        WrapPoint("test/bad", required=1)  # type: ignore[arg-type]

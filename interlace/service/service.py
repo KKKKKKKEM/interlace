@@ -1,4 +1,4 @@
-"""协议与工作台共用的官方图服务。"""
+"""HTTP 与 JSON-RPC 协议共用的官方图服务。"""
 
 from __future__ import annotations
 
@@ -6,6 +6,8 @@ import json
 import logging
 from collections.abc import Iterable
 from dataclasses import dataclass
+from functools import partial
+from itertools import count
 from pathlib import Path
 from queue import SimpleQueue
 from threading import Lock, RLock, Thread
@@ -18,8 +20,9 @@ from pydantic_core import to_jsonable_python
 from interlace import Graph, Runtime
 from interlace.engine import Execution
 from interlace.engine.errors import InterlaceRuntimeError
-from interlace.plugins import Registration
+from interlace.plugins import ExtensionAPI, Registration, plugin
 from interlace.plugins.points import (
+    NODE_INSPECT,
     RUNTIME_EVENT,
     RuntimeEvent,
     RuntimeEventKind,
@@ -47,6 +50,8 @@ from .store import ServiceStore, registered_name
 _LOGGER = logging.getLogger(__name__)
 # 默认 Host 白名单中的本机名称；serve() 另外加入实际监听地址。
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+# 同一 Runtime 可以接入多个服务，每个服务以独立插件标识安装。
+_SERVICE_IDS = count(1)
 
 
 def encode(value: Any) -> Any:
@@ -118,7 +123,7 @@ class _Publication:
 
 
 class GraphService:
-    """按需启用 RPC 和 Studio，共用调用方的 Runtime。
+    """按需启用 HTTP 与 RPC，共用调用方的 Runtime。
 
     Attributes:
         runtime: 调用方管理生命周期的运行时。
@@ -131,7 +136,7 @@ class GraphService:
         _publications: 注册名到发布版本索引项，在启动恢复和发布时维护。
         _descriptions: 注册名到图结构描述的缓存；注册名在 Runtime 生命周期内不变。
         _diagnostics: 节点参数与日志采集器，关闭采集时为 None。
-        _observer: 服务持有的 RUNTIME_EVENT 登记，安装前为 None。
+        _plugin: 服务插件的卸载句柄；插件登记 RUNTIME_EVENT 观察与诊断采集，安装前为 None。
         _adapters: 端口类型到 TypeAdapter 的缓存，避免每次请求重建校验器。
         _archive_queue: 等待终态后归档输出的执行，None 通知归档线程退出。
         _archiver: 在 Worker 线程之外等待执行终止并归档输出的线程。
@@ -151,11 +156,12 @@ class GraphService:
         allowed_options: Iterable[str] | None = None,
         retention: int | None = 1000,
     ) -> None:
-        """接入已有 Runtime，并恢复已发布的图定义。
+        """接入已有 Runtime，以运行期插件安装观察与诊断，并恢复已发布的图定义。
 
-        恢复的发布版本最后注册：之前任何步骤失败都会卸载观察、诊断并关闭数据库，
+        恢复的发布版本最后注册：之前任何步骤失败都会卸载服务插件并关闭数据库，
         Runtime 不留下服务注册，可以直接重建。Runtime 不提供注销接口，注册阶段本身失败
-        （例如 Runtime 并发关闭）时已注册的版本保留在该 Runtime 中。
+        （例如 Runtime 并发关闭）时已注册的版本保留在该 Runtime 中。Runtime 先于服务关闭时，
+        插件宿主一并卸载服务插件。
 
         Args:
             runtime: 已有运行时，必须提供公开 GraphCatalog 能力。
@@ -173,7 +179,7 @@ class GraphService:
             InvalidRequestError: 已保存版本引用了未登记的节点类型。
             pydantic.ValidationError: 已保存版本的节点配置不再符合配置模型。
             GraphError: 已保存版本无法通过冻结校验。
-            RuntimeError: 数据库结构版本高于当前代码支持的版本。
+            RuntimeError: 数据库结构版本高于当前代码支持的版本，或 Runtime 的插件宿主已经关闭。
         """
 
         if type(max_active_executions) is not int or max_active_executions < 1:
@@ -193,7 +199,7 @@ class GraphService:
         self._descriptions: dict[str, dict[str, Any]] = {}
         self._adapters: dict[Any, TypeAdapter[Any]] = {}
         self._diagnostics: NodeDiagnostics | None = None
-        self._observer: Registration | None = None
+        self._plugin: Registration | None = None
         self._archive_queue: SimpleQueue[Execution | None] = SimpleQueue()
         self._archiver = Thread(
             target=self._archive_loop, name="interlace-service-archive", daemon=True
@@ -221,9 +227,11 @@ class GraphService:
             self.store.interrupt_unfinished("服务已重启，运行未恢复")
             self.store.adopt_definitions(registered)
             self._archiver.start()
-            if diagnostics:
-                self._diagnostics = NodeDiagnostics(runtime, self.store)
-            self._observer = runtime.hooks.on(RUNTIME_EVENT, self._observe)
+            self._plugin = runtime.plugin_host.install(
+                plugin(f"interlace.service/graph-service-{next(_SERVICE_IDS)}")(
+                    partial(self._setup, diagnostics)
+                )
+            )
             for name, publication, graph in restored:
                 self._publications[name] = publication
                 runtime.register(name, graph)
@@ -942,13 +950,25 @@ class GraphService:
             self._descriptions[graph] = description
         return description
 
-    def _release(self) -> None:
-        """按安装逆序卸载观察与诊断，等待归档线程处理完已排队执行，再关闭数据库。"""
+    def _setup(self, diagnostics: bool, api: ExtensionAPI) -> None:
+        """服务插件 setup：按需登记诊断采集，再登记生命周期观察；诊断器随插件卸载关闭。
 
-        if self._observer is not None:
-            self._observer.detach()
-        if self._diagnostics is not None:
-            self._diagnostics.close()
+        Args:
+            diagnostics: 是否采集节点输入、原始输出与 Python 日志。
+            api: 服务插件的扩展接口。
+        """
+
+        if diagnostics:
+            self._diagnostics = NodeDiagnostics(self.store)
+            api.defer(self._diagnostics.close)
+            api.on(NODE_INSPECT, self._diagnostics.inspect)
+        api.on(RUNTIME_EVENT, self._observe)
+
+    def _release(self) -> None:
+        """卸载服务插件，等待归档线程处理完已排队执行，再关闭数据库。"""
+
+        if self._plugin is not None:
+            self._plugin.detach()
         if self._archiver.is_alive():
             self._archive_queue.put(None)
             self._archiver.join()
@@ -987,7 +1007,7 @@ class GraphService:
         max_request_bytes: int = 1_048_576,
         allowed_hosts: Iterable[str] | None = None,
     ) -> Any:
-        """创建包含 RPC 与 Studio 的 ASGI 应用。
+        """创建包含 HTTP 与 JSON-RPC 的 ASGI 应用。
 
         Args:
             token: 可选 Bearer 令牌，保护 API、RPC、SSE 与 OpenAPI。

@@ -521,17 +521,14 @@ def test_schema_and_preview_follow_node_configuration(api: Any) -> None:
     assert response.json() == {"inputs": {"text": "str"}, "outputs": {"text": "str"}}
 
 
-def test_service_assets_and_openapi_are_packaged(api: Any) -> None:
-    """服务提供可打开的工作台及调用协议文档。
+def test_service_openapi_is_published(api: Any) -> None:
+    """服务发布调用协议文档与执行查询接口。
 
     Args:
         api: 测试客户端与服务。
     """
 
     client, _ = api
-    index = client.get("/")
-    assert index.status_code == 200
-    assert "Interlace Studio" in index.text
     assert "/api/call" in client.get("/openapi.json").json()["paths"]
     assert client.get("/api/executions/missing").status_code == 404
     assert json.loads(client.get("/api/executions").text) == []
@@ -545,12 +542,12 @@ def test_mounted_service_keeps_authentication() -> None:
     with Runtime() as runtime:
         service = GraphService(runtime)
         parent = FastAPI()
-        parent.mount("/studio", service.create_app(token="secret"))
+        parent.mount("/interlace", service.create_app(token="secret"))
         with TestClient(parent, base_url=LOCAL) as client:
-            assert client.get("/studio/api/graphs").status_code == 401
+            assert client.get("/interlace/api/graphs").status_code == 401
             assert (
                 client.get(
-                    "/studio/api/graphs", headers={"Authorization": "Bearer secret"}
+                    "/interlace/api/graphs", headers={"Authorization": "Bearer secret"}
                 ).status_code
                 == 200
             )

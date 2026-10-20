@@ -31,7 +31,7 @@
    两种钩子点、具名值与 capability 装饰链、`setup(api)` 与 `defer` 清理、后端协议与节点中间件。
 8. [编排模式](08-patterns.md)
    线性、分支汇聚、KeyedJoin、循环、事件路由、异步和输出流。
-9. [RPC 与可视化工作台](09-service-and-studio.md)
+9. [RPC 与图服务](09-service.md)
    可选服务安装、节点目录、图编辑发布、远程调用与运行历史。
 
 ## 如何使用这本手册
