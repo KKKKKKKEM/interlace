@@ -21,7 +21,8 @@ ALLOWED: dict[str, frozenset[str]] = {
     "plugins": frozenset({"_validation", "engine", "spi"}),
     "nodes": frozenset({"_validation", "engine"}),
     "runtime": frozenset({"_validation", "engine", "spi", "plugins", "adapters"}),
-    "service": frozenset({"", "engine", "plugins", "spi"}),
+    "metrics": frozenset({"engine", "plugins"}),
+    "service": frozenset({"", "engine", "metrics", "plugins", "spi"}),
 }
 
 

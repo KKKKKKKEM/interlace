@@ -85,6 +85,7 @@ class ExecutionHost(Protocol):
         max_queued: int = 0,
         output_buffer: int = 64,
         options: Mapping[str, Any] | None = None,
+        slots: SlotProvider | None = None,
     ) -> Execution:
         """提交 Graph 执行并返回统一 Execution 句柄。
 
@@ -97,6 +98,8 @@ class ExecutionHost(Protocol):
             max_queued: Graph 内待消费输入 token 总数上限，0 表示不限制。
             output_buffer: 每个活跃输出流允许积压的输出条数。
             options: 本次执行的领域配置，提交时深复制，不随跨图事件继承。
+            slots: 为本次执行申请 Slot 的提供方；None 时不使用 Slot。给定时等待 Slot 不占用执行线程，
+                期间取消结束为 CANCELLED，申请失败结束为 FAILED，整次执行在该 Slot 内串行运行。
 
         Returns:
             本次提交的 Execution。
@@ -114,6 +117,7 @@ class ExecutionHost(Protocol):
         max_queued: int = 0,
         output_buffer: int = 64,
         options: Mapping[str, Any] | None = None,
+        slots: SlotProvider | None = None,
     ) -> Iterator[Output]:
         """先建立输出订阅再启动 Graph，返回同步终端输出流。
 
@@ -126,6 +130,8 @@ class ExecutionHost(Protocol):
             max_queued: Graph 内待消费输入 token 总数上限，0 表示不限制。
             output_buffer: 输出流允许积压的输出条数，满时对执行施加背压。
             options: 本次执行的领域配置，提交时深复制，不随跨图事件继承。
+            slots: 为本次执行申请 Slot 的提供方；None 时不使用 Slot。给定时等待 Slot 不占用执行线程，
+                期间取消结束为 CANCELLED，申请失败结束为 FAILED，整次执行在该 Slot 内串行运行。
 
         Returns:
             按产生顺序交付终端 Output 的迭代器。
@@ -143,6 +149,7 @@ class ExecutionHost(Protocol):
         max_queued: int = 0,
         output_buffer: int = 64,
         options: Mapping[str, Any] | None = None,
+        slots: SlotProvider | None = None,
     ) -> AsyncIterator[Output]:
         """先建立输出订阅再启动 Graph，返回异步终端输出流。
 
@@ -155,6 +162,8 @@ class ExecutionHost(Protocol):
             max_queued: Graph 内待消费输入 token 总数上限，0 表示不限制。
             output_buffer: 输出流允许积压的输出条数，满时对执行施加背压。
             options: 本次执行的领域配置，提交时深复制，不随跨图事件继承。
+            slots: 为本次执行申请 Slot 的提供方；None 时不使用 Slot。给定时等待 Slot 不占用执行线程，
+                期间取消结束为 CANCELLED，申请失败结束为 FAILED，整次执行在该 Slot 内串行运行。
 
         Returns:
             按产生顺序交付终端 Output 的异步迭代器。

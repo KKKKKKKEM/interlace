@@ -47,7 +47,7 @@ from ..spi import (
     Work,
 )
 from ._utils import _close_components, _Lifecycle, _remaining, _unique
-from .direct import _DirectRunner
+from .direct import _DirectRunner, _SlotWait
 from .history import _ExecutionHistory
 from ..plugins.points import EXECUTION_RUN, WORK_DELIVER, ExecutionCall
 
@@ -80,8 +80,9 @@ class GraphWorker:
     """注册 Graph、消费队列 Work，并作为执行宿主运行完整 Graph。
 
     生命周期为 OPEN -> CLOSING -> CLOSED。首个 `close()` 进入 CLOSING：拒绝新的直接执行和配置变更，
-    已绑定通道中的 Work 及其延续继续排空；排空后注销消费者、释放自有组件并进入 CLOSED。并发的
-    `close()` 等待同一次关闭完成。交付经 WORK_DELIVER 包裹，执行外层经 EXECUTION_RUN 包裹。
+    已绑定通道中的 Work 及其延续、已接受的直接执行（含等待 Slot 的执行）继续排空；排空后注销消费者、
+    释放自有组件并进入 CLOSED。并发的 `close()` 等待同一次关闭完成。交付经 WORK_DELIVER 包裹，
+    执行外层经 EXECUTION_RUN 包裹。
 
     Attributes:
         _consumer: 绑定命名通道并交付 Work 的任务消费能力。
@@ -310,8 +311,14 @@ class GraphWorker:
         max_queued: int = 0,
         output_buffer: int = 64,
         options: Mapping[str, Any] | None = None,
+        slots: SlotProvider | None = None,
     ) -> Execution:
         """在直接执行线程池中启动已注册 Graph，并立即返回 Execution。
+
+        给定 slots 时先不占用直接执行线程地等待一个根执行链 lease，整次执行在该 Slot 内串行运行，
+        结束后归还；等待期间 Execution 保持 PENDING，取消即结束为 CANCELLED，申请失败（含
+        SlotProviderClosedError）即以该异常结束为 FAILED，直接执行没有重投递。timeout 从取得 Slot
+        后开始执行时计时。
 
         Args:
             graph: 已注册 Graph 的名称。
@@ -322,11 +329,13 @@ class GraphWorker:
             max_queued: Graph 内待消费输入 token 总数上限，0 表示不限制。
             output_buffer: 每个活跃输出流允许积压的 Output 条数。
             options: 本次执行的领域配置，提交前深复制，不随跨图事件继承。
+            slots: 为本次执行申请 Slot 的提供方；None 时不使用 Slot。
 
         Returns:
             可等待、迭代和取消的 Execution。
 
         Raises:
+            TypeError: slots 未实现 SlotProvider。
             UnknownGraphError: graph 未注册。
             RuntimeClosedError: Worker 已开始关闭。
         """
@@ -338,8 +347,9 @@ class GraphWorker:
             timeout=timeout,
             max_queued=max_queued,
             output_buffer=output_buffer,
+            slots=slots,
         )
-        self._submit_direct(execution, inputs, plan, prepared_options)
+        self._submit_direct(execution, inputs, plan, prepared_options, slots)
         return execution
 
     def iter(
@@ -353,6 +363,7 @@ class GraphWorker:
         max_queued: int = 0,
         output_buffer: int = 64,
         options: Mapping[str, Any] | None = None,
+        slots: SlotProvider | None = None,
     ) -> Iterator[Output]:
         """启动 Graph，并返回在提交前已订阅的同步 terminal Output 流。
 
@@ -365,11 +376,13 @@ class GraphWorker:
             max_queued: Graph 内待消费输入 token 总数上限，0 表示不限制。
             output_buffer: 每个活跃输出流允许积压的 Output 条数。
             options: 本次执行的领域配置，提交前深复制，不随跨图事件继承。
+            slots: 为本次执行申请 Slot 的提供方，语义同 `start()`；None 时不使用 Slot。
 
         Returns:
             按产生顺序交付 terminal Output 的迭代器。
 
         Raises:
+            TypeError: slots 未实现 SlotProvider。
             UnknownGraphError: graph 未注册。
             RuntimeClosedError: Worker 已开始关闭。
         """
@@ -381,9 +394,10 @@ class GraphWorker:
             timeout=timeout,
             max_queued=max_queued,
             output_buffer=output_buffer,
+            slots=slots,
         )
         stream = iter(execution)
-        self._submit_direct(execution, inputs, plan, prepared_options)
+        self._submit_direct(execution, inputs, plan, prepared_options, slots)
         return stream
 
     def aiter(
@@ -397,6 +411,7 @@ class GraphWorker:
         max_queued: int = 0,
         output_buffer: int = 64,
         options: Mapping[str, Any] | None = None,
+        slots: SlotProvider | None = None,
     ) -> AsyncIterator[Output]:
         """启动 Graph，并返回在提交前已订阅的异步 terminal Output 流。
 
@@ -409,11 +424,13 @@ class GraphWorker:
             max_queued: Graph 内待消费输入 token 总数上限，0 表示不限制。
             output_buffer: 每个活跃输出流允许积压的 Output 条数。
             options: 本次执行的领域配置，提交前深复制，不随跨图事件继承。
+            slots: 为本次执行申请 Slot 的提供方，语义同 `start()`；None 时不使用 Slot。
 
         Returns:
             按产生顺序交付 terminal Output 的异步迭代器。
 
         Raises:
+            TypeError: slots 未实现 SlotProvider。
             UnknownGraphError: graph 未注册。
             RuntimeClosedError: Worker 已开始关闭。
         """
@@ -425,9 +442,10 @@ class GraphWorker:
             timeout=timeout,
             max_queued=max_queued,
             output_buffer=output_buffer,
+            slots=slots,
         )
         stream = execution.__aiter__()
-        self._submit_direct(execution, inputs, plan, prepared_options)
+        self._submit_direct(execution, inputs, plan, prepared_options, slots)
         return stream
 
     def get_execution(self, execution_id: str) -> Execution:
@@ -700,14 +718,18 @@ class GraphWorker:
         timeout: float | None,
         max_queued: int,
         output_buffer: int,
+        slots: SlotProvider | None,
     ) -> Execution:
-        """为直接执行创建并登记 Execution。
+        """校验直接执行的 Slot 提供方，然后创建并登记 Execution。
 
         Raises:
+            TypeError: slots 未实现 SlotProvider。
             RuntimeClosedError: Worker 已开始关闭。
             UnknownGraphError: graph 未注册。
         """
 
+        if slots is not None and not isinstance(slots, SlotProvider):
+            raise TypeError("slots must implement SlotProvider or be None")
         self._lifecycle.ensure_open()
         with self._lock:
             if not self._accepting:
@@ -760,21 +782,58 @@ class GraphWorker:
         inputs: Any,
         plan: ExecutionPlan | None,
         options: Mapping[str, Any],
+        slots: SlotProvider | None,
     ) -> None:
-        """把已登记的 Execution 交给直接执行线程池；提交失败时把失败写入 Execution 并结束登记。
+        """把已登记的 Execution 交给直接执行线程池；给定 slots 时先不占线程地等待 lease。
+
+        等待中的 Execution 仍计为活跃执行，关闭排空会等待它取得 Slot 或被取消、申请失败。
+
+        Raises:
+            RuntimeClosedError: 直接执行线程池已经关闭。
+        """
+
+        run = partial(self._run_direct, execution, inputs, plan, options)
+        if slots is None:
+            self._dispatch_direct(execution, run, None)
+            return
+        _SlotWait(
+            execution,
+            slots,
+            partial(self._dispatch_direct, execution, run),
+            partial(self._abandon_direct, execution),
+        ).begin()
+
+    def _dispatch_direct(
+        self,
+        execution: Execution,
+        run: Callable[[SlotLease | None], None],
+        lease: SlotLease | None,
+    ) -> None:
+        """把 `run(lease)` 提交给直接执行线程池；提交失败时释放 lease、把失败写入 Execution 并结束登记。
 
         Raises:
             RuntimeClosedError: 直接执行线程池已经关闭。
         """
 
         try:
-            self._direct.submit(
-                partial(self._run_direct, execution, inputs, plan, options)
-            )
+            self._direct.submit(partial(run, lease))
         except BaseException as exc:
-            execution.fail(exc)
-            self._history.finish(execution)
+            try:
+                if lease is not None:
+                    lease.release()
+            finally:
+                execution.fail(exc)
+                self._history.finish(execution)
             raise
+
+    def _abandon_direct(
+        self, execution: Execution, error: BaseException | None
+    ) -> None:
+        """Slot 等待因取消或申请失败结束：失败写入 Execution，然后结束登记。"""
+
+        if error is not None:
+            execution.fail(error)
+        self._history.finish(execution)
 
     def _run_direct(
         self,
@@ -782,22 +841,39 @@ class GraphWorker:
         inputs: Any,
         plan: ExecutionPlan | None,
         options: Mapping[str, Any],
+        lease: SlotLease | None,
     ) -> None:
-        """在直接执行线程中运行 Graph；失败只写入 Execution，不向线程池传播。"""
+        """在直接执行线程中运行 Graph；失败只写入 Execution，不向线程池传播。
+
+        持有 lease 时在其串行区间内执行，跨图事件携带 lease 延续 Slot 链，结束后释放本次接管的引用，
+        再结束登记，使空闲时 Slot 已归还。
+        """
 
         try:
-            self._execute(
-                execution,
-                self._get_graph(execution.graph),
-                inputs,
-                self._emit,
-                plan=plan,
-                options=options,
-            )
+            graph = self._get_graph(execution.graph)
+            if lease is None:
+                self._execute(
+                    execution, graph, inputs, self._emit, plan=plan, options=options
+                )
+            else:
+                with lease.execution() as slot:
+                    self._execute(
+                        execution,
+                        graph,
+                        inputs,
+                        partial(self._emit_with_lease, lease),
+                        plan=plan,
+                        slot=slot,
+                        options=options,
+                    )
         except BaseException as exc:
             execution.fail(exc)
         finally:
-            self._history.finish(execution)
+            try:
+                if lease is not None:
+                    lease.release()
+            finally:
+                self._history.finish(execution)
 
     def _execute(
         self,
@@ -822,7 +898,7 @@ class GraphWorker:
             inputs: 入口数据，或多入口端口名到数据的映射。
             emit: Node 发出跨图事件时使用的回调。
             plan: 限定执行范围的计划，必须属于 graph；None 执行完整 Graph。
-            slot: 当前逻辑执行链的 Slot；直接执行为 None。
+            slot: 当前逻辑执行链的 Slot；未申请 Slot 的直接执行为 None。
             options: 本次执行配置的快照。
             work: 触发本次执行的 Work；直接执行为 None。
 

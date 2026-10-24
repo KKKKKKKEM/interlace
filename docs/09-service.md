@@ -80,7 +80,8 @@ app.mount("/interlace", service.create_app(token="application-provided-token"))
 ```
 
 `token` 是可选 Bearer 令牌，保护 HTTP、JSON-RPC、SSE 和 OpenAPI 数据接口。客户端通过 Authorization 请求头传递，
-不写入 URL。令牌按字节比较，非 ASCII 的 Authorization 头同样返回 401。
+不写入 URL。令牌按字节比较，非 ASCII 的 Authorization 头同样返回 401。传入 `create_app(metrics=...)` 或
+`serve(metrics=...)` 时额外提供受同一令牌保护的 `GET /metrics`，见[第十章](10-metrics.md)。
 
 每个 HTTP 与 WebSocket 请求的 Host 头必须在 `allowed_hosts` 中，否则返回 HTTP 400，用于阻止 DNS rebinding：
 攻击页面即使让 Host 与 Origin 一致（例如都指向 `evil.example`），也不在白名单中。`create_app()` 默认只接受
@@ -99,6 +100,24 @@ app.mount("/interlace", service.create_app(token="application-provided-token"))
 注册之前的任何失败都会卸载服务插件（插件 setup 失败时由安装回滚完成）并关闭数据库，同一 Runtime 可以直接
 重新创建服务。Runtime 没有注销接口，若注册阶段本身失败（例如 Runtime 并发关闭），已注册的版本会保留在该
 Runtime 中。
+
+### 在调用方 Slot 内执行
+
+节点依赖 Slot 中的会话、下载器等进程内资源时，把应用管理的 SlotProvider 交给服务：
+
+```python
+from interlace.engine import SlotPool
+
+sessions = SlotPool(size=4)
+with GraphService(runtime, slots=sessions) as service:
+    service.serve()
+```
+
+`/api/call`、`/api/executions` 与 JSON-RPC `graph.call` 提交的每次执行都经 `Runtime.start(slots=...)` 在租用的
+Slot 内运行，语义见[第五章](05-execution.md#直接执行使用-slot)：等待 Slot 时执行保持 `pending` 且计入
+`max_active_executions`，可以经取消接口取消；提供方关闭后提交的执行以 `SlotProviderClosedError` 失败。服务不拥有也不关闭
+该提供方。等待中被取消或申请失败的执行不会发布 `execution.finished`，其历史记录停留在提交时的快照，可通过
+`GET /api/executions/{id}` 读取当前句柄的终态。
 
 ## 节点目录与编辑边界
 
@@ -292,4 +311,4 @@ uv run --extra service ruff check interlace tests examples
 uv run --extra service ruff format --check interlace tests examples
 ```
 
-[上一章：编排模式](08-patterns.md)
+[上一章：编排模式](08-patterns.md) · [下一章：指标与监控](10-metrics.md)

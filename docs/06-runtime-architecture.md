@@ -14,6 +14,7 @@
 | 能力端口 | `interlace.spi` | RouterRole、WorkerRole（即 ExecutionHost）、EventBus、任务传输、GraphExecutor、SlotProvider、执行资源协议 | 隔离编排、传输、执行和资源实现 |
 | 默认适配器 | `interlace.adapters.memory`、`interlace.engine.executor` | EventBus、TaskBackend、Engine | 提供单进程内存运行时 |
 | 可选官方服务 | `interlace.service` | GraphService、NodeCatalog | 提供 RPC、图编辑发布与观测历史，按 extra 安装 |
+| 可选指标 | `interlace.metrics` | Metric、METRIC、Metrics | 进程内计数与直方图聚合、Prometheus 文本与 OTel 桥接（otel extra），见[第十章](10-metrics.md) |
 
 Runtime 是面向应用的稳定门面，PluginHost 是系统装配根。普通应用不需要看到后四层。
 
@@ -44,13 +45,14 @@ interlace/
 │   ├── router.py            # EventRouter
 │   ├── worker.py            # GraphWorker：注册、消费与执行宿主编排
 │   ├── history.py           # Execution 记录保留与活跃计数
-│   ├── direct.py            # 直接执行线程池
+│   ├── direct.py            # 直接执行线程池与不占线程的 Slot 等待
 │   ├── plugin.py            # LocalInfrastructurePlugin、LocalRuntimePlugin
 │   └── _utils.py            # 私有生命周期状态机与关闭辅助函数
 ├── plugins/                 # PluginHost、ExtensionAPI、descriptor、capability、插件设置、Background 与核心钩子点
 ├── spi/                     # EventBus、任务传输、GraphExecutor 等窄协议
 ├── adapters/                # 随包提供的具体部署适配器
 │   └── memory.py            # memory.EventBus、memory.TaskBackend
+├── metrics/                 # 零依赖指标：METRIC 钩子点、聚合插件与 OTel 桥接
 ├── nodes/                   # 可复用的非内核 Node，例如 KeyedJoin
 └── service/                 # 按需安装的官方 RPC 与图服务
     ├── catalog.py           # 显式节点工厂与图文档编译
@@ -83,6 +85,9 @@ flowchart LR
     Plugins --> SPI
     Nodes[interlace.nodes] --> Engine
     Service[interlace.service] --> Public
+    Metrics[interlace.metrics] --> Engine
+    Metrics --> Plugins
+    Service --> Metrics
 ```
 
 这里的关键约束是：
@@ -94,6 +99,7 @@ flowchart LR
 - `runtime` 可以依赖前述各层并完成组合，但不得把部署算法重新实现到门面中；
 - `nodes` 只放可复用的非内核 Node，只依赖内核公共语义，不能成为 Runtime 的隐式前置条件。
 - `service` 依赖公开 Runtime、Graph、Execution 及观察模型；核心不导入服务或 Web 依赖。
+- `metrics` 只依赖 engine 与 plugins，导入 `interlace` 不加载它；OTel 依赖仅在 `interlace.metrics.otel` 导入。
 
 服务通过 `Runtime.graphs()` 读取已注册图的只读快照；默认 GraphWorker 实现 `interlace.spi.GraphCatalog`。
 替代 Worker 若需启用图检查与服务，同样实现该窄协议。服务不回退读取默认 Worker 的私有注册表。
@@ -150,6 +156,27 @@ GraphWorker 管理注册表、Execution 句柄和直接执行线程；GraphExecu
 直接执行线程池大小由 `GraphWorker(direct_workers=...)` 指定，None 使用标准库 ThreadPoolExecutor 的默认值。Worker 最多保留
 `history_limit`（默认 1000）条 Execution 记录，超出时按登记顺序淘汰已结束的记录，尚未收尾的执行始终保留；两个参数均可经
 `LocalRuntimePlugin(history_limit=..., direct_workers=...)` 传入。`idle` 与 `wait_idle()` 只统计尚未收尾的执行，不随历史记录数增长。
+
+直接执行传入 `slots=` 时，Worker 在登记 Execution 后先申请 lease，而不是先占用直接执行线程：
+
+```mermaid
+flowchart LR
+    Start[start / run / iter] --> Record[登记 PENDING Execution]
+    Record --> Try{try_acquire}
+    Try -->|lease| Submit[提交直接执行线程]
+    Try -->|None| Wait[subscribe_available 等待通知]
+    Wait -->|归还或关闭| Try
+    Wait -->|cancel| Cancelled[CANCELLED，注销订阅]
+    Try -->|异常| Failed[FAILED]
+    Submit --> Run["lease.execution() 内 _execute(slot=...)"]
+    Run --> Release[释放 lease，结束登记]
+```
+
+等待只登记取消监听与提供方的可用订阅；可用通知在归还或关闭 Slot 的线程上重试申请，取得 lease 后才把执行提交给
+线程池。申请与取消在同一把锁下只结束一次；取消晚于取得 lease 时，`execution.start()` 返回 False，线程随即释放
+lease。执行期间 emit 使用携带 lease 的本地发布，与队列 Work 相同，下游 Work 延续同一 Slot 链。等待中的 Execution
+计入活跃执行，关闭排空等待它结束。`execution.started` 在取得 Slot 后才发布；等待中被取消或申请失败的执行与开始前
+取消的执行一样，不发布 `execution.started` 或 `execution.finished`。
 
 执行宿主在调用 `succeed()`/`fail()` 唤醒等待方之前发布 `execution.finished`，状态由 `terminal_status(error)` 计算；因此
 `run()` 返回或 `Execution.wait()` 醒来时，观察者已经收到终态事件，而观察者回调内读到的 `execution.status` 可能仍为 RUNNING，

@@ -329,6 +329,27 @@ SlotPool 的生命周期由创建者管理；自动池由 GraphWorker 关闭。
 `wait_idle(timeout)` 会交替等待事件总线和任务后端，直到由事件继续产生的工作也已完成。传 `0` 可以进行即时
 空闲检查。
 
+### 直接执行使用 Slot
+
+`start()`、`run()`、`arun()`、`iter()` 和 `aiter()` 默认不使用 Slot，`context.slot` 为 `None`。领域节点依赖
+Slot 中的会话或下载器时，传入调用方管理的 SlotProvider，整次执行在其中租用的一个 Slot 内运行：
+
+```python
+from interlace.engine import SlotPool
+
+sessions = SlotPool(size=4)
+outputs = runtime.run("crawl", seed, slots=sessions)
+```
+
+- 取得 Slot 之前 Execution 保持 `PENDING`，等待不占用直接执行线程；不需要 Slot 的直接执行照常推进。
+- 同一个 Slot 上的直接执行与队列 Work 串行执行；容量为 1 的池让多次直接执行依次运行。
+- 等待期间 `cancel()` 立即结束为 `CANCELLED`，不会遗留订阅或 lease；取消恰好与 Slot 同时到达时 Slot 立即归还。
+- 直接执行没有重投递：已关闭的提供方以 `SlotProviderClosedError` 失败，等待期间关闭同样立即失败；其他申请
+  异常也以原异常结束为 `FAILED`。
+- `timeout` 从取得 Slot 后开始执行时计时，等待 Slot 的时间不计入执行时限。
+- 节点 `context.emit()` 产生的本地路由 Work 延续同一个 Slot 链，Slot 在整条链结束后归还给提供方。
+- 等待 Slot 的执行属于已接受工作，`wait_idle()` 与 `close()` 会等待它取得 Slot 后完成，或被取消、失败。
+
 ## 失败传播
 
 | 发生位置 | 调用方看到的结果 |
@@ -346,6 +367,7 @@ SlotPool 的生命周期由创建者管理；自动池由 GraphWorker 关闭。
 | 静止回调失败 | `ExecutionError`（或回调抛出的 `ExecutionError` 子类），带有 `graph` 信息 |
 | 事件传输或 route 投递失败 | 发布点抛出 `EventDispatchError` |
 | `observe()` 观察者失败 | 记录日志，不影响 `emit()` 或业务结果 |
+| 直接执行申请 Slot 失败 | Execution 以申请异常（如 `SlotProviderClosedError`）结束为 `FAILED` |
 | 队列中异步 Graph 失败 | 下一次 `wait_idle()` 抛出该失败 |
 
 `NODE_CALL` 中间件可以恢复 Node 或内层中间件的业务异常；执行控制异常、Engine 契约错误（`HookExecutionError`、

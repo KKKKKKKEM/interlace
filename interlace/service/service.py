@@ -12,7 +12,7 @@ from pathlib import Path
 from queue import SimpleQueue
 from threading import Lock, RLock, Thread
 from types import TracebackType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import TypeAdapter
 from pydantic_core import to_jsonable_python
@@ -27,6 +27,7 @@ from interlace.plugins.points import (
     RuntimeEvent,
     RuntimeEventKind,
 )
+from interlace.spi import SlotProvider
 
 from .catalog import NodeCatalog, describe_graph
 from .diagnostics import (
@@ -46,6 +47,9 @@ from .errors import (
 )
 from .models import DraftRequest, GraphDefinition, NodeDefinition, RunRequest
 from .store import ServiceStore, registered_name
+
+if TYPE_CHECKING:
+    from interlace.metrics import Metrics
 
 _LOGGER = logging.getLogger(__name__)
 # 默认 Host 白名单中的本机名称；serve() 另外加入实际监听地址。
@@ -131,6 +135,7 @@ class GraphService:
         store: 当前服务独占的文档和观测数据库。
         max_active_executions: 通过服务提交时允许 Runtime 同时存在的活跃执行数量。
         allowed_options: 远程请求允许携带的 options 顶层键；空集合表示拒绝非空 options。
+        slots: 服务提交的每次执行申请 Slot 的提供方，由调用方管理生命周期；None 时不使用 Slot。
         _closed: 服务是否已关闭。
         _start_lock: 串行执行容量检查与提交，避免并发请求越过上限。
         _publications: 注册名到发布版本索引项，在启动恢复和发布时维护。
@@ -155,6 +160,7 @@ class GraphService:
         max_active_executions: int = 128,
         allowed_options: Iterable[str] | None = None,
         retention: int | None = 1000,
+        slots: SlotProvider | None = None,
     ) -> None:
         """接入已有 Runtime，以运行期插件安装观察与诊断，并恢复已发布的图定义。
 
@@ -171,10 +177,12 @@ class GraphService:
             max_active_executions: 服务允许的活跃执行上限，默认 128。
             allowed_options: 远程 RunRequest.options 允许的顶层键，None 拒绝任何非空 options。
             retention: 数据库最多保留的执行记录数，默认 1000，None 表示不清理。
+            slots: 服务提交的每次执行申请 Slot 的提供方，经 `Runtime.start(slots=...)` 传入；
+                None 时执行不使用 Slot。服务不关闭该提供方。
 
         Raises:
             ValueError: max_active_executions 或 retention 不是正整数。
-            TypeError: allowed_options 是字符串，或 Worker 不支持公开图目录。
+            TypeError: allowed_options 是字符串，slots 未实现 SlotProvider，或 Worker 不支持公开图目录。
             ConflictError: 已保存版本的注册名已被 Runtime 占用。
             InvalidRequestError: 已保存版本引用了未登记的节点类型。
             pydantic.ValidationError: 已保存版本的节点配置不再符合配置模型。
@@ -188,11 +196,14 @@ class GraphService:
             )
         if isinstance(allowed_options, str):
             raise TypeError("allowed_options must be an iterable of option keys")
+        if slots is not None and not isinstance(slots, SlotProvider):
+            raise TypeError("slots must implement SlotProvider or be None")
         registered = runtime.graphs()
         self.runtime = runtime
         self.nodes = nodes or NodeCatalog()
         self.max_active_executions = max_active_executions
         self.allowed_options = frozenset(allowed_options or ())
+        self.slots = slots
         self._closed = False
         self._start_lock = RLock()
         self._publications: dict[str, _Publication] = {}
@@ -656,6 +667,7 @@ class GraphService:
                 max_steps=request.max_steps,
                 timeout=request.timeout,
                 max_queued=request.max_queued,
+                slots=self.slots,
             )
         self.store.record_execution(self.snapshot(execution))
         if execution.done:
@@ -1006,13 +1018,15 @@ class GraphService:
         token: str | None = None,
         max_request_bytes: int = 1_048_576,
         allowed_hosts: Iterable[str] | None = None,
+        metrics: Metrics | None = None,
     ) -> Any:
         """创建包含 HTTP 与 JSON-RPC 的 ASGI 应用。
 
         Args:
-            token: 可选 Bearer 令牌，保护 API、RPC、SSE 与 OpenAPI。
+            token: 可选 Bearer 令牌，保护 API、RPC、SSE、OpenAPI 与指标接口。
             max_request_bytes: 单个 HTTP 请求体允许的最大字节数。
             allowed_hosts: 允许的 Host 头主机名，None 只允许本机回环名称；`*` 允许任意主机。
+            metrics: 提供 ``GET /metrics`` Prometheus 文本的聚合器；None 时不注册该路径。
 
         Returns:
             可由 ASGI 服务器或现有应用挂载的 FastAPI 应用。
@@ -1025,6 +1039,7 @@ class GraphService:
             token=token,
             max_request_bytes=max_request_bytes,
             allowed_hosts=allowed_hosts,
+            metrics=metrics,
         )
 
     def serve(
@@ -1035,6 +1050,7 @@ class GraphService:
         token: str | None = None,
         max_request_bytes: int = 1_048_576,
         allowed_hosts: Iterable[str] | None = None,
+        metrics: Metrics | None = None,
     ) -> None:
         """在当前进程启动官方服务入口，阻塞直到服务器退出；返回后不关闭服务，由调用方负责 `close()`。
 
@@ -1046,6 +1062,7 @@ class GraphService:
             token: 可选 API Bearer 令牌。
             max_request_bytes: 单个 HTTP 请求体允许的最大字节数。
             allowed_hosts: 允许的 Host 头主机名；None 使用本机回环名称加上 host。
+            metrics: 提供 ``GET /metrics`` Prometheus 文本的聚合器；None 时不注册该路径。
         """
 
         import uvicorn
@@ -1063,6 +1080,7 @@ class GraphService:
                 token=token,
                 max_request_bytes=max_request_bytes,
                 allowed_hosts=allowed_hosts,
+                metrics=metrics,
             ),
             host=host,
             port=port,

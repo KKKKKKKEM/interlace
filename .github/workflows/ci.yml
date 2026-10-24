@@ -49,7 +49,7 @@ jobs:
       - name: Run Ruff
         run: uv run --with ruff ruff check interlace tests examples
       - name: Run mypy
-        run: uv run --extra service mypy interlace
+        run: uv run --extra service --extra otel mypy interlace
       - name: Check formatting
         run: uv run --with ruff ruff format --check interlace tests examples
       - name: Build distributions
@@ -63,8 +63,43 @@ jobs:
 
           import interlace
 
-          loaded = {"fastapi", "pydantic", "uvicorn", "jsonrpcserver", "starlette"}
+          loaded = {
+              "fastapi", "pydantic", "uvicorn", "jsonrpcserver", "starlette",
+              "opentelemetry", "interlace.metrics",
+          }
           leaked = sorted(loaded & set(sys.modules))
           if leaked:
-              raise SystemExit(f"base import loaded service dependencies: {leaked}")
+              raise SystemExit(f"base import loaded optional modules: {leaked}")
           PY
+
+  downstream-bricks:
+    name: Downstream Bricks contracts
+    runs-on: ubuntu-latest
+    # 下游信号不阻塞本仓库发布：Bricks 仍锁定已发布版本，此任务只提前暴露对它的契约破坏。
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: interlace
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: KKKKKKKEM/bricks
+          ref: ${{ vars.BRICKS_REF || 'codex/extract-interlace' }}
+          path: bricks
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          version: "0.13.1"
+          enable-cache: true
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Install Bricks with this Interlace checkout
+        working-directory: bricks
+        run: |
+          uv sync --locked --python 3.12
+          uv pip install --python .venv -e ../interlace
+      - name: Run Bricks tests
+        working-directory: bricks
+        run: uv run --no-sync pytest -q --ignore=tests/crawler/test_browsers.py

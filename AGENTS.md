@@ -24,7 +24,7 @@
 4. 新能力能由 Graph、Event、Runtime 和领域组件组合时，不进入核心。
 5. 新用户概念必须证明不能由现有概念承担，且至少服务两个不同领域。
 6. 概念按层暴露：写业务与编排只用顶层名字及其方法参数；汇聚策略、显式连接、执行计划、执行句柄与共享 Slot 池位于
-   `interlace.engine`；插件位于 `interlace.plugins`；适配器协议位于 `interlace.spi`。
+   `interlace.engine`；插件位于 `interlace.plugins`；适配器协议位于 `interlace.spi`；指标位于 `interlace.metrics`。
 
 顶层 API 固定为：
 
@@ -151,8 +151,12 @@ Graph、Node、Output、Runtime、Context、Event
    宣称保留原进程的 Slot 连续性。
 7. 适配器通过 `interlace.spi.SlotProvider` 的公开申请和可用通知接口取得 `SlotLease`，通过 `Delivery.slot_lease` 传递；
    lease 提供引用管理和串行 execution 能力，不暴露内部锁。每个接管的引用必须释放，执行期间的引用由 lease 保护。
-   已关闭的 SlotProvider 申请时抛出 SlotProviderClosedError；Consumer 据此拒绝再也无法分配的根 Work，
-   其他申请异常视为暂时失败，Work 保留待推进。
+   可用通知在 Slot 归还与提供方关闭时触发。已关闭的 SlotProvider 申请时抛出 SlotProviderClosedError；Consumer
+   据此拒绝再也无法分配的根 Work，其他申请异常视为暂时失败，Work 保留待推进。
+8. 直接执行（start/run/arun/iter/aiter）可经 `slots=` 接受调用方的 SlotProvider，在整次执行期间租用一个根 Slot，
+   缺省不使用 Slot。等待 Slot 不占用直接执行线程，Execution 保持 PENDING 并计为已接受工作；等待中取消即为
+   CANCELLED 且不泄漏 lease。直接执行没有重投递，任何申请异常（含 SlotProviderClosedError）都以该异常结束为
+   FAILED。执行在 lease 串行区间内运行，emit 延续该 Slot 链，执行时限从取得 Slot 后开始执行时计时。
 
 ## 第十一条：Execution 控制必须默认开放
 
@@ -244,7 +248,8 @@ Graph、Node、Output、Runtime、Context、Event
 2. 服务仅通过 Runtime、Execution、冻结 Graph 与公开 GraphCatalog 能力调用和检查图，不读取运行角色私有状态；
    服务的观察与诊断登记以运行期插件安装，随服务关闭或 Runtime 关闭卸载。
 3. HTTP/JSON、JSON-RPC 与图编辑接口共享执行服务和 Execution 契约；协议适配器不实现第二套执行器。服务只提供
-   数据接口，不托管前端页面。
+   数据接口，不托管前端页面。`GraphService(slots=...)` 把调用方的 SlotProvider 传给服务提交的每次执行，
+   服务不拥有或关闭该提供方。
 4. 可编辑节点只能由应用显式登记的工厂与配置模型构建；草稿可不完整，发布必须经过核心冻结校验。
 5. 发布版本不可变，执行记录保存当时的图结构；草稿更新比较修订号。任意 Python 构造代码不隐式转换为编辑文档。
 6. 生命周期观测不携带节点业务输入对象；服务可通过 NODE_INSPECT 独立快照输入、配置和原始输出，并通过
@@ -254,20 +259,36 @@ Graph、Node、Output、Runtime、Context、Event
 8. 项目属于服务管理层，按“项目、逻辑定义、版本与运行实例”组织管理接口；不改变 Runtime 注册名与执行语义。
    已有定义通过数据迁移归入默认项目，移动定义时其草稿、版本与历史保持整体归属，定义标识仍全局唯一。
 
+## 第十七条：指标只观察
+
+1. 指标是观察者：记录、聚合与导出失败按 Notice 隔离，不改变执行结果、`emit()` 结果或执行控制。
+2. 样本是 `Metric`（点分名称、有限值、counter 或 histogram、字符串标签），经 Notice 点 `METRIC` 同步通知；
+   领域代码以 `count()`、`observe()` 经 `Context.hooks` 记录，不新增 Context 能力、全局注册表或专用通道。
+3. `Metrics` 是不提供 capability 的插件，可在启动时或运行期安装，卸载即停止采集；它聚合 METRIC 样本，并把
+   RUNTIME_EVENT 派生的 execution、Node firing、Work 与 Event 指标同样经 METRIC 通知。导出器是登记在聚合之后的
+   METRIC 处理函数。
+4. 标签只携带有界维度，例如 graph、node、queue、status、event_type 与领域分类；execution、Work、Slot 等实例
+   标识与业务值不得进入标签。每个指标名的序列数有上限，超出的新序列样本丢弃并计数。
+5. `interlace.metrics` 零运行时依赖，导入 `interlace` 不加载它；OpenTelemetry 桥接位于 `interlace.metrics.otel`，
+   通过 `interlace-py[otel]` 安装。
+6. 聚合在进程内按 `Metrics` 实例进行，进程重启即清零；不提供跨进程或分布式聚合，不宣称样本投递可靠或精确。
+7. 服务仅在显式传入 `Metrics` 时提供 `GET /metrics` Prometheus 文本，与 API 共用令牌、Host 与同源检查。
+
 ## 验证要求
 
 行为变更应先运行相关测试，并在可行时运行完整检查：
 
 ```bash
 uv run pytest -q
-uv run --extra service mypy interlace
+uv run --extra service --extra otel mypy interlace
 uv run ruff check interlace tests examples
 uv run ruff format --check interlace tests examples
 ```
 
 文档变更还应检查本地链接、Markdown 围栏和发生变化的 Mermaid 图。
 
-服务变更运行 `uv run --extra service pytest tests/service -q`。
+服务变更运行 `uv run --extra service pytest tests/service -q`。CI 另以当前源码运行 Bricks 的非浏览器测试作为
+不阻塞发布的下游契约信号；Bricks 正式依赖仍以已发布版本为准。
 
 发布使用与 `pyproject.toml` 版本一致的 `v<version>` Release 标签，完整 CI 通过后构建并严格检查 wheel/sdist 元数据。
 PyPI 上传通过 `python-publish.yml` 和 `pypi` environment 的 Trusted Publisher 授权，只在上传作业授予 OIDC 权限。

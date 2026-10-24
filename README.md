@@ -93,6 +93,7 @@ with Runtime() as runtime:
 7. [插件、SPI 与适配器开发](https://github.com/KKKKKKKEM/interlace/blob/main/docs/07-plugins.md)
 8. [编排模式](https://github.com/KKKKKKKEM/interlace/blob/main/docs/08-patterns.md)
 9. [RPC 与图服务](https://github.com/KKKKKKKEM/interlace/blob/main/docs/09-service.md)
+10. [指标与监控](https://github.com/KKKKKKKEM/interlace/blob/main/docs/10-metrics.md)
 
 ## 可选 RPC 与图服务
 
@@ -118,6 +119,22 @@ service.serve()
 ```
 
 安装、节点目录、HTTP/JSON-RPC 调用及服务所有权见[第九章](https://github.com/KKKKKKKEM/interlace/blob/main/docs/09-service.md)。
+
+## 可选指标
+
+`interlace.metrics` 零依赖：Node 以 `count(context.hooks, ...)`、`observe(context.hooks, ...)` 记录样本，
+`Metrics().plugin` 汇总样本与执行、节点、Work、事件生命周期指标，提供快照、Prometheus 文本与服务的
+`GET /metrics`；OpenTelemetry 桥接通过 `interlace-py[otel]` 安装。
+
+```python
+from interlace import Runtime
+from interlace.metrics import Metrics
+
+metrics = Metrics()
+runtime = Runtime(plugins=[metrics.plugin])
+```
+
+标签规则、生命周期指标与 OTel 导出见[第十章](https://github.com/KKKKKKKEM/interlace/blob/main/docs/10-metrics.md)。
 
 ## 当前范围
 

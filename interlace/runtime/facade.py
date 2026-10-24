@@ -284,6 +284,7 @@ class Runtime:
         max_queued: int = 0,
         output_buffer: int = 64,
         options: Mapping[str, Any] | None = None,
+        slots: SlotProvider | None = None,
     ) -> tuple[Output, ...]:
         """同步执行已注册 Graph，返回全部 terminal Output。
 
@@ -298,6 +299,7 @@ class Runtime:
             max_queued: Graph 内待消费输入 token 总数上限，0 表示不限制。
             output_buffer: 每个活跃输出流允许积压的 Output 条数。
             options: 本次执行的领域配置，提交前深复制，不随跨图事件继承。
+            slots: 为本次执行申请 Slot 的提供方，None 时不使用 Slot；等待 Slot 不占用直接执行线程。
 
         Returns:
             按产生顺序排列的 terminal Output。
@@ -316,6 +318,7 @@ class Runtime:
             max_queued=max_queued,
             output_buffer=output_buffer,
             options=options,
+            slots=slots,
         ).result()
 
     def iter(
@@ -329,6 +332,7 @@ class Runtime:
         max_queued: int = 0,
         output_buffer: int = 64,
         options: Mapping[str, Any] | None = None,
+        slots: SlotProvider | None = None,
     ) -> Iterator[Output]:
         """启动已注册 Graph，并返回同步 terminal Output 流。
 
@@ -341,6 +345,7 @@ class Runtime:
             max_queued: Graph 内待消费输入 token 总数上限，0 表示不限制。
             output_buffer: 每个活跃输出流允许积压的 Output 条数。
             options: 本次执行的领域配置，提交前深复制，不随跨图事件继承。
+            slots: 为本次执行申请 Slot 的提供方，None 时不使用 Slot；等待 Slot 不占用直接执行线程。
 
         Returns:
             按产生顺序交付 terminal Output 的迭代器。
@@ -359,6 +364,7 @@ class Runtime:
             max_queued=max_queued,
             output_buffer=output_buffer,
             options=options,
+            slots=slots,
         )
 
     def aiter(
@@ -372,6 +378,7 @@ class Runtime:
         max_queued: int = 0,
         output_buffer: int = 64,
         options: Mapping[str, Any] | None = None,
+        slots: SlotProvider | None = None,
     ) -> AsyncIterator[Output]:
         """启动已注册 Graph，并返回异步 terminal Output 流。
 
@@ -384,6 +391,7 @@ class Runtime:
             max_queued: Graph 内待消费输入 token 总数上限，0 表示不限制。
             output_buffer: 每个活跃输出流允许积压的 Output 条数。
             options: 本次执行的领域配置，提交前深复制，不随跨图事件继承。
+            slots: 为本次执行申请 Slot 的提供方，None 时不使用 Slot；等待 Slot 不占用直接执行线程。
 
         Returns:
             按产生顺序交付 terminal Output 的异步迭代器。
@@ -402,6 +410,7 @@ class Runtime:
             max_queued=max_queued,
             output_buffer=output_buffer,
             options=options,
+            slots=slots,
         )
 
     def start(
@@ -415,8 +424,14 @@ class Runtime:
         max_queued: int = 0,
         output_buffer: int = 64,
         options: Mapping[str, Any] | None = None,
+        slots: SlotProvider | None = None,
     ) -> Execution:
         """在后台启动已注册 Graph，并立即返回 Execution。
+
+        给定 slots 时，整次执行在从中租用的 Slot 内串行运行，Node 经 `context.slot` 读取它，跨图事件
+        创建的本地 Work 延续同一 Slot 链。等待 Slot 时 Execution 保持 PENDING 且不占用直接执行线程；
+        此时取消立即结束为 CANCELLED，申请失败（含 SlotProviderClosedError）以该异常结束为 FAILED，
+        不重试。timeout 从取得 Slot 后开始执行时计时。
 
         Args:
             graph: 已注册 Graph 的名称。
@@ -427,11 +442,13 @@ class Runtime:
             max_queued: Graph 内待消费输入 token 总数上限，0 表示不限制。
             output_buffer: 每个活跃输出流允许积压的 Output 条数。
             options: 本次执行的领域配置，提交前深复制，不随跨图事件继承。
+            slots: 为本次执行申请 Slot 的提供方，None 时不使用 Slot；等待 Slot 不占用直接执行线程。
 
         Returns:
             可同步或异步等待、迭代和取消的 Execution。
 
         Raises:
+            TypeError: slots 未实现 SlotProvider。
             RuntimeClosedError: Runtime 已开始关闭。
         """
 
@@ -445,6 +462,7 @@ class Runtime:
             max_queued=max_queued,
             output_buffer=output_buffer,
             options=options,
+            slots=slots,
         )
 
     async def arun(
@@ -458,6 +476,7 @@ class Runtime:
         max_queued: int = 0,
         output_buffer: int = 64,
         options: Mapping[str, Any] | None = None,
+        slots: SlotProvider | None = None,
     ) -> tuple[Output, ...]:
         """异步执行已注册 Graph，等待全部 terminal Output。
 
@@ -470,6 +489,7 @@ class Runtime:
             max_queued: Graph 内待消费输入 token 总数上限，0 表示不限制。
             output_buffer: 每个活跃输出流允许积压的 Output 条数。
             options: 本次执行的领域配置，提交前深复制，不随跨图事件继承。
+            slots: 为本次执行申请 Slot 的提供方，None 时不使用 Slot；等待 Slot 不占用直接执行线程。
 
         Returns:
             按产生顺序排列的 terminal Output。
@@ -488,6 +508,7 @@ class Runtime:
             max_queued=max_queued,
             output_buffer=output_buffer,
             options=options,
+            slots=slots,
         )
 
     def get_execution(self, execution_id: str) -> Execution:

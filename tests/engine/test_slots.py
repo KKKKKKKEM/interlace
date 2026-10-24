@@ -260,3 +260,25 @@ def test_pool_close_wakes_waiters_and_allows_outstanding_references_to_return() 
             operation()
     lease.release()
     assert pool.available == 1
+
+
+def test_pool_close_notifies_availability_subscribers_once() -> None:
+    """关闭池通知一次可用订阅，使不占线程的等待方重试申请并得到关闭错误。"""
+
+    pool = SlotPool(1)
+    lease = pool.acquire()
+    outcomes: list[str] = []
+
+    def retry() -> None:
+        """重试申请并记录结果。"""
+
+        try:
+            pool.try_acquire()
+        except RuntimeError as exc:
+            outcomes.append(str(exc))
+
+    pool.subscribe_available(retry)
+    pool.close()
+    pool.close()
+    assert outcomes == ["slot pool is closed"]
+    lease.release()

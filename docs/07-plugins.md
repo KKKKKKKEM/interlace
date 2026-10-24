@@ -343,7 +343,8 @@ SlotPool，队列此前已由相同配置消费时为空操作。`begin_close()`
 WorkerRole 的基本执行入口是 `start()`，同步 `Runtime.run()` 和异步 `Runtime.arun()` 分别等待它返回的同一个
 Execution。`iter()`、`aiter()` 必须先建立输出订阅再启动执行，保证首批输出也受到背压约束。替换 Worker 仍须在注册时
 以 `hooks.provided()` 冻结 Graph、验证 ExecutionPlan，以 `WORK_DELIVER` 包裹交付、以 `EXECUTION_RUN`
-包裹执行外层，并保持 Work 并发、Slot 链、错误传播和等待关闭的契约。
+包裹执行外层，并保持 Work 并发、Slot 链、错误传播和等待关闭的契约。`start()`、`iter()` 与 `aiter()` 接受
+`slots: SlotProvider | None`，给定时遵守[直接执行使用 Slot](05-execution.md#直接执行使用-slot)的等待、取消与失败语义。
 
 替换执行器可以通过 `graph.spec_for(node_id)` 读取冻结后的端口、输入策略和 timeout，通过 `graph.outgoing_for()`
 读取原图连接；有计划时必须使用 `plan.entrypoint` 绑定输入与启动调度，使用 `plan.nodes` 和 `outgoing_for()`
@@ -390,14 +391,15 @@ ExecutionNotifier 提供单调版本 `version`、`notify()`、`wait(version, tim
 | --- | --- |
 | `slots.try_acquire()` | 立即申请一个根执行链引用，池耗尽时返回 `None`；已关闭时抛 `SlotProviderClosedError` |
 | `slots.acquire(timeout=None)` | 在调度控制线程中等待；超时抛 `TimeoutError`，零秒表示不等待 |
-| `slots.subscribe_available(callback)` | 订阅 Slot 归还通知，返回幂等取消函数；通知不预留资源 |
+| `slots.subscribe_available(callback)` | 订阅 Slot 归还与资源池关闭通知，返回幂等取消函数；通知不预留资源 |
 | `lease.slot` | 读取执行链的 Slot，不转移引用所有权 |
 | `lease.retain()` / `lease.release()` | 增加和释放引用；最后一个引用释放后归还 Slot |
 | `lease.execution()` | 上下文管理器，串行执行同一 Slot 的 Graph，并在执行期间自动保留一个临时引用 |
 
 根 Work 在分配到 lease 后才可占用 Consumer 的执行线程；没有可用 Slot 时保留在待调度队列中，并继续调度已经
 携带 lease 的延续 Work。先注册可用通知，再尝试调度；通知只提示重新调用 `try_acquire()`，其他 Consumer 可能先取得
-资源。回调应快速返回，抛出的普通异常会被记录并隔离，不影响归还和其他订阅者。关闭 Consumer 时取消自己的订阅。
+资源。回调应快速返回，抛出的普通异常会被记录并隔离，不影响归还和其他订阅者。资源池关闭时同样通知一次，使不占线程的
+等待方重试并得到 `SlotProviderClosedError`；替代 SlotProvider 必须提供同样的关闭通知。关闭 Consumer 时取消自己的订阅。
 `try_acquire()` 抛出 `SlotProviderClosedError`（同时是 `RuntimeError`）表示资源池已永久关闭：默认内存后端在通道全部消费者的
 资源池都已关闭时，把无法再分配的队首根 Work 记为失败并移出队列，`wait_idle()` 与关闭不会永久等待；其他异常视为暂时失败，
 Work 保留在队列中等待后续推进。

@@ -94,10 +94,12 @@ class SlotProvider(Protocol):
         ...
 
     def subscribe_available(self, listener: Callable[[], None]) -> Callable[[], None]:
-        """订阅 Slot 归还通知；通知只提示重试申请，不预留 Slot。
+        """订阅 Slot 归还与关闭通知；通知只提示重试申请，不预留 Slot。
+
+        关闭时同样通知一次，使不占线程的等待方重试申请并收到 SlotProviderClosedError。
 
         Args:
-            listener: Slot 归还后调用的无参函数。
+            listener: Slot 归还或池关闭后调用的无参函数。
 
         Returns:
             只注销本次订阅的幂等函数。
@@ -105,7 +107,7 @@ class SlotProvider(Protocol):
         ...
 
     def close(self) -> None:
-        """停止新的申请并唤醒等待方；已租出的 lease 仍可稍后归还。"""
+        """停止新的申请，唤醒阻塞等待方并通知可用订阅；已租出的 lease 仍可稍后归还。"""
         ...
 
 
@@ -260,13 +262,15 @@ class SlotPool:
             return len(self._available)
 
     def close(self) -> None:
-        """关闭池并唤醒等待方；在途 lease 仍可稍后归还，重复调用无作用。"""
+        """关闭池，唤醒阻塞的 acquire 并在锁外通知全部订阅；在途 lease 仍可稍后归还，重复调用无作用。"""
 
         with self._condition:
             if self._closed:
                 return
             self._closed = True
             self._condition.notify_all()
+            listeners = tuple(self._listeners.values())
+        _notify_listeners(listeners)
 
     def try_acquire(self) -> SlotLease | None:
         """立即申请一个根执行链 lease。
@@ -286,10 +290,10 @@ class SlotPool:
             return _SlotLease(self, self._available.popleft())
 
     def subscribe_available(self, listener: Callable[[], None]) -> Callable[[], None]:
-        """订阅 Slot 归还通知；通知不预留 Slot。
+        """订阅 Slot 归还与池关闭通知；通知不预留 Slot。
 
         每次订阅独立登记：同一函数订阅多次会收到多次通知，各自的注销函数只移除对应
-        那一次订阅。通知在归还 Slot 的线程上、释放池锁后调用，抛出的 Exception 被记录。
+        那一次订阅。通知在归还 Slot 或关闭池的线程上、释放池锁后调用，抛出的 Exception 被记录。
 
         Args:
             listener: Slot 归还后调用的无参函数。
@@ -362,11 +366,7 @@ class SlotPool:
             self._available.append(slot)
             self._condition.notify()
             listeners = tuple(self._listeners.values())
-        for listener in listeners:
-            try:
-                listener()
-            except Exception:
-                _LOGGER.exception("slot availability listener failed")
+        _notify_listeners(listeners)
 
 
 class _SlotLease:
@@ -449,3 +449,13 @@ class _SlotLease:
                 slot = self._slot
         if slot is not None:
             self._pool._release(slot)
+
+
+def _notify_listeners(listeners: Iterable[Callable[[], None]]) -> None:
+    """依次调用可用通知；单个订阅抛出的 Exception 记录后继续通知其余订阅。"""
+
+    for listener in listeners:
+        try:
+            listener()
+        except Exception:
+            _LOGGER.exception("slot availability listener failed")

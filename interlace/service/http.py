@@ -8,7 +8,7 @@ import logging
 import secrets
 from collections.abc import AsyncIterator, Iterable
 from contextlib import suppress
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request
@@ -41,6 +41,9 @@ from .models import (
 )
 from .service import LOOPBACK_HOSTS, GraphService, encode
 
+if TYPE_CHECKING:
+    from interlace.metrics import Metrics
+
 _LOGGER = logging.getLogger(__name__)
 
 # 单个输出 SSE 允许积压的未发送条数；客户端落后超过该值即断开，观察端不得背压业务执行。
@@ -66,7 +69,10 @@ _ERROR_STATUS: tuple[tuple[type[Exception], int], ...] = (
 )
 
 # 需要令牌与同源检查的路径前缀，相对于挂载点。
-_PROTECTED = ("/api", "/rpc", "/openapi.json", "/docs", "/redoc")
+_PROTECTED = ("/api", "/rpc", "/metrics", "/openapi.json", "/docs", "/redoc")
+
+# Prometheus 文本格式 0.0.4 的响应类型。
+PROMETHEUS_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
 
 
 def sse(kind: str, value: Any, event_id: int | None = None) -> str:
@@ -265,6 +271,7 @@ def create_app(
     token: str | None = None,
     max_request_bytes: int = 1_048_576,
     allowed_hosts: Iterable[str] | None = None,
+    metrics: Metrics | None = None,
 ) -> FastAPI:
     """创建可独立启动或挂载的官方服务应用；应用不拥有服务的生命周期。
 
@@ -274,6 +281,7 @@ def create_app(
         max_request_bytes: 单个 HTTP 请求体允许的最大字节数，默认 1 MiB。
         allowed_hosts: 允许的 Host 头主机名，None 只允许 127.0.0.1、localhost 与 ::1；
             包含 `*` 时不限制。
+        metrics: 提供 ``GET /metrics`` Prometheus 文本的聚合器；None 时不注册该路径。
 
     Returns:
         带 OpenAPI 与 JSON-RPC 的 FastAPI 应用。
@@ -296,6 +304,8 @@ def create_app(
     _add_execution_routes(app, service)
     _add_stream_routes(app, service)
     _add_rpc_route(app, service)
+    if metrics is not None:
+        _add_metrics_route(app, metrics)
     return app
 
 
@@ -325,6 +335,16 @@ def _add_error_handlers(app: FastAPI) -> None:
     for kind, _ in _ERROR_STATUS:
         app.add_exception_handler(kind, known_failure)
     app.add_exception_handler(Exception, internal_failure)
+
+
+def _add_metrics_route(app: FastAPI, metrics: Metrics) -> None:
+    """注册与 API 共用令牌和 Host 检查的 Prometheus 抓取接口。"""
+
+    @app.get("/metrics", response_class=Response)
+    def scrape() -> Response:
+        """返回聚合器当前的 Prometheus 文本。"""
+
+        return Response(metrics.prometheus(), media_type=PROMETHEUS_CONTENT_TYPE)
 
 
 def _add_project_routes(app: FastAPI, service: GraphService) -> None:
